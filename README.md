@@ -4,7 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg)](https://www.python.org/)
 
-A production-tested monorepo of **6 modular automated intelligence bots** + a **shared runtime & ops layer** that collect, deduplicate, verify, and publish daily briefings across **AI Industry News, X/Twitter Debates, AI Builders, GitHub & Hacker News, US Equities & Crypto, and China A-Share & Hong Kong Markets** to **Feishu (Lark) Card 2.0** and **Notion**.
+🌐 **English** | [简体中文](./README.zh-CN.md)
+
+A production-tested monorepo of **6 modular automated intelligence bots** + a **shared runtime & ops layer** that collect, deduplicate, verify, and publish daily briefings across **AI Industry News, X & Reddit Debates, AI Builders, GitHub & Hacker News, US Equities & Crypto, and China A-Share & Hong Kong Markets** to **Feishu (Lark) Card 2.0** and **Notion**.
 
 > **Zero LLM Vendor Lock-In**: Every Python script (`*_report.py`) performs deterministic `fetch`, deduplication, sanitization, Feishu delivery, and Notion archiving with zero hardcoded LLM SDK calls. AI editorial drafting is cleanly decoupled into Markdown prompts (`prompt*.md`) and agent workflow specs (`shared/scheduled-tasks/*/SKILL.md`), so you can run it with any coding/automation agent or LLM of your choice.
 
@@ -85,7 +87,8 @@ Click any module below to inspect its dedicated **workflow diagram, data sources
 
 ```text
 daily-bots/
-├── README.md                      # You are here
+├── README.md                      # You are here (English)
+├── README.zh-CN.md                # 简体中文主页
 ├── LICENSE                        # MIT License
 ├── CONTRIBUTING.md                # Architecture rules & PR checklist
 ├── requirements.txt               # Unified Python dependencies
@@ -94,7 +97,7 @@ daily-bots/
 ├── docs/
 │   └── launchd-env.plist.example  # Optional macOS LaunchAgent template
 ├── AI Daily News Bot/             # Stage 1: Global AI industry briefing
-├── x-hotspot-bot/                 # Stage 2: X/Twitter AI debates
+├── x-hotspot-bot/                 # Stage 2: X & Reddit AI community debates
 ├── ai-builder-bot/                # Stage 3: Curated AI Builders X List
 ├── github-hn-bot/                 # GitHub Trending + Hacker News Top 8
 ├── us stock bot/                  # US Equities Close + 24h Crypto Dashboard
