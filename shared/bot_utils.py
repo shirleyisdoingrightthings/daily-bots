@@ -352,6 +352,12 @@ def extract_hrefs(html_text: str) -> list[str]:
 X_POST_RE = re.compile(
     r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)")
 
+# Reddit 原帖链接定义：仅认标准 /r/<subreddit>/comments/<id> 帖子直链
+REDDIT_POST_RE = re.compile(
+    r"https?://(?:www\.|old\.)?reddit\.com/r/([A-Za-z0-9_]+)/comments/([A-Za-z0-9]+)(?:/[^\s\"'<>)]*)?",
+    re.I,
+)
+
 
 # ───────────────────────────────────────────────
 # 8) AI 相关性闸门 — 只给泛科技源用
@@ -1075,21 +1081,25 @@ def send_x_linked_report(draft_path, *, log_file, cache_file, fetch_meta, sent_u
     )
     notion_tag = " | Notion ✓" if notion_meta.get("notion_ok") else " | Notion ⚠️"
 
-    # 把 x.com 原帖以及 fetch_meta 记录的主源期刊链接（issue_urls，如 AINews 期次 URL）
-    # 一并记入去重档案，确保同一期 AINews 不会被跨天重复播报。
+    # 把 x.com 原帖、reddit.com 原帖以及 fetch_meta 记录的主源期刊链接（issue_urls）
+    # 一并记入去重档案，确保同一期 AINews 或跨天热门 Reddit 帖不会被重复播报。
+    reddit_links = [u for u in hrefs if REDDIT_POST_RE.search(u)]
     issue_urls = meta.get("metrics", {}).get("issue_urls", []) or []
-    total = record_sent_urls(sent_urls, x_links + list(issue_urls))
+    total = record_sent_urls(sent_urls, x_links + reddit_links + list(issue_urls))
     record_daily_ledger(source_name, report, hrefs, date_str=doc_date)
     print(f"  ✓ 已归档 {len(x_links)} 条{link_label}链接"
+          f"{f' + {len(reddit_links)} 条 Reddit 链接' if reddit_links else ''}"
           f"{f' + {len(issue_urls)} 条期刊链接' if issue_urls else ''}用于跨天去重（档案共 {total} 条）",
           file=sys.stderr)
     duration = round(time.time() - t0, 1)
+    reddit_log = f" / {len(reddit_links)} 条 Reddit" if reddit_links else ""
     write_log("OK",
               f"AI写稿 → {meta.get('log_summary', '')} → 飞书推送成功"
-              f"（{sent} 条 / {len(report)}字 / {len(x_links)} 条{link_label}）{notion_tag}",
+              f"（{sent} 条 / {len(report)}字 / {len(x_links)} 条{link_label}{reddit_log}）{notion_tag}",
               metrics={**meta.get("metrics", {}), **notion_meta, "ai_calls": 0,
                        "duration_s": duration, "report_chars": len(report),
-                       "x_links": len(x_links), "source": "antigravity"})
+                       "x_links": len(x_links), "reddit_links": len(reddit_links),
+                       "source": "antigravity"})
     return 0
 
 
@@ -1112,7 +1122,7 @@ def extract_report_headlines(report_text: str) -> list[str]:
         return []
     headlines: list[str] = []
     skip_prefixes = (
-        "📋", "🔥", "🛠", "🛠️", "🚀", "⚡", "📎", "素材", "数据来源",
+        "📋", "🔥", "🛠", "🛠️", "🚀", "⚡", "📎", "🗣️", "素材", "数据来源",
         "一、", "二、", "今日", "本周",
     )
     for raw_line in report_text.splitlines():

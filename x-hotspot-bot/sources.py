@@ -35,7 +35,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 # X_POST_RE 在 bot_utils 里定义（ai-builder-bot 的出稿闸门也用它）；
 # 这里 re-export，本模块内与 x_report.py 的 sources.X_POST_RE 用法都不变。
-from bot_utils import fetch_rss, parse_entry_date, is_ai_relevant, url_key, X_POST_RE
+from bot_utils import fetch_rss, parse_entry_date, is_ai_relevant, url_key, X_POST_RE, REDDIT_POST_RE
 
 # 随早 09:00 AI 三合一串行流水线运行，时效窗口 48h（跨天已播期刊由 sent_urls 拦截）。
 DEFAULT_WINDOW_H = 48
@@ -57,7 +57,7 @@ _TRACKING_QS = {
 
 
 def _clean_url(url: str) -> str:
-    """去掉追踪参数并归一化 X status 链接。"""
+    """去掉追踪参数并归一化 X status / Reddit 帖子链接。"""
     hit = X_POST_RE.search(url)
     if hit:
         return f"https://x.com/{hit.group(1)}/status/{hit.group(2)}"
@@ -67,6 +67,8 @@ def _clean_url(url: str) -> str:
         drop_keys = set(_TRACKING_QS)
         if "x.com" in host or "twitter.com" in host:
             drop_keys.update({"s", "t"})
+        if "reddit.com" in host:
+            drop_keys.update({"rdt", "share_id", "context"})
         qs = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
               if k.lower() not in drop_keys]
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(qs), ""))
@@ -226,18 +228,110 @@ def _rank_posts(section: str, max_posts: int, ctx_chars: int) -> list:
     return [{k: v for k, v in d.items() if k != "idx"} for d in ranked[:max_posts]]
 
 
+def _reddit_section(body: str) -> str:
+    """截出 AI Reddit Recap 那一段，遇到 Discord Recap 或下一个顶级 h1 即止。取不到返回空串。"""
+    heads = list(HEADING_RE.finditer(body))
+    start = end = None
+    for h in heads:
+        level = h.group(1)
+        title = _plain(h.group(2)).lower()
+        if start is None and "reddit recap" in title:
+            start = h.start()
+            continue
+        if start is not None and (
+            "discord recap" in title
+            or "ai discord" in title
+            or (level == "1" and "reddit" not in title)
+        ):
+            end = h.start()
+            break
+    if start is None:
+        return ""
+    return body[start:end] if end else body[start:]
+
+
+def _reddit_outline(section: str) -> list:
+    """Reddit Recap 段的 h2/h3 提纲，便于写稿方快速定位子版块与话题集群。"""
+    if not section:
+        return []
+    return [_plain(m.group(2)) for m in HEADING_RE.finditer(section)
+            if m.group(1) in ("2", "3")]
+
+
+_REDDIT_ACTIVITY_RE = re.compile(r"\(Activity:\s*([\d,]+)\)", re.I)
+
+
+def _rank_reddit_posts(section: str, max_posts: int = 20, ctx_chars: int = 260) -> list:
+    """提取 AI Reddit Recap 中的 reddit.com 帖子直链，按 AINews 标注的 Activity 活跃度排序。"""
+    if not section:
+        return []
+    order, meta = [], {}
+    for m in REDDIT_POST_RE.finditer(section):
+        sub, pid = m.group(1), m.group(2).lower()
+        full_url = _clean_url(m.group(0))
+        if pid not in meta:
+            meta[pid] = {
+                "subreddit": sub,
+                "url": full_url,
+                "mentions": 0,
+                "activity": 0,
+                "idx": len(order),
+            }
+            order.append(pid)
+        meta[pid]["mentions"] += 1
+
+    if not order:
+        return []
+
+    def _mark_anchor(m):
+        href, inner = m.group(1), m.group(2)
+        hit = REDDIT_POST_RE.search(href)
+        if not hit:
+            return inner
+        return f"{inner} ⟦R{meta[hit.group(2).lower()]['idx']}⟧ "
+
+    marked = ANCHOR_RE.sub(_mark_anchor, section)
+    marked = REDDIT_POST_RE.sub(
+        lambda m: f" ⟦R{meta[m.group(2).lower()]['idx']}⟧ ", marked)
+    text = _plain(marked)
+
+    for pid in order:
+        info = meta[pid]
+        token = f"⟦R{info['idx']}⟧"
+        pos = text.find(token)
+        if pos < 0:
+            info["context"] = ""
+            continue
+        left = max(0, pos - 80)
+        right = min(len(text), pos + len(token) + ctx_chars)
+        snippet = text[left:pos] + text[pos + len(token):right]
+        snippet = re.sub(r"⟦R\d+⟧", "", snippet).strip()
+        act_m = _REDDIT_ACTIVITY_RE.search(snippet)
+        if act_m:
+            try:
+                info["activity"] = int(act_m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+        info["context"] = snippet
+
+    ranked = sorted(meta.values(), key=lambda d: (-d["activity"], -d["mentions"], d["idx"]))
+    return [{k: v for k, v in d.items() if k != "idx"} for d in ranked[:max_posts]]
+
+
 def fetch_ainews(window_h: int = DEFAULT_WINDOW_H, max_issues: int = 2,
                  max_posts: int = 45, recap_chars: int = 65000,
-                 ctx_chars: int = 280, seen_urls: set = None) -> dict:
-    """主力源。返回 {"name","issues","raw_count","note"}。
+                 ctx_chars: int = 280, seen_urls: set = None,
+                 reddit_chars: int = 35000, max_reddit_posts: int = 20) -> dict:
+    """主力源。返回 {"name","issues","raw_count","reddit_raw_count","note"}。
 
-    每期：{title, url, date, outline:[h2...], recap:纯文本, posts:[{handle,url,mentions,context}]}
+    每期：{title, url, date, outline:[h2...], recap:纯文本, posts:[...],
+           reddit_outline:[...], reddit_recap:纯文本, reddit_posts:[...]}
     """
     got = fetch_rss(AINEWS_FEED, limit=max_issues * 6)
     entries = [e for e in got if AINEWS_TAG in (getattr(e, "title", "") or "").lower()]
     if not entries:
         return {"name": "ainews", "issues": [], "raw_count": 0,
-                "note": "RSS 抓取失败"}
+                "reddit_raw_count": 0, "note": "RSS 抓取失败"}
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=window_h)
@@ -256,9 +350,9 @@ def fetch_ainews(window_h: int = DEFAULT_WINDOW_H, max_issues: int = 2,
     # 窗口内无未播新刊时直接返回空列表（触发 NO_TOPICS 停发），避免重播旧期
     if not picked:
         return {"name": "ainews", "issues": [], "raw_count": 0,
-                "note": "窗口内无未播新刊"}
+                "reddit_raw_count": 0, "note": "窗口内无未播新刊"}
 
-    issues, total_posts = [], 0
+    issues, total_posts, total_reddit_posts = [], 0, 0
     for dt, e in picked:
         body = _entry_html(e)
         if not body:
@@ -268,6 +362,9 @@ def fetch_ainews(window_h: int = DEFAULT_WINDOW_H, max_issues: int = 2,
         if not posts:
             continue  # 没有原帖链接的一期对我们没用
         total_posts += len(posts)
+        reddit_sec = _reddit_section(body)
+        reddit_posts = _rank_reddit_posts(reddit_sec, max_reddit_posts, ctx_chars) if reddit_sec else []
+        total_reddit_posts += len(reddit_posts)
         issues.append({
             "title": getattr(e, "title", "") or "AINews",
             "url": getattr(e, "link", "") or "",
@@ -275,10 +372,13 @@ def fetch_ainews(window_h: int = DEFAULT_WINDOW_H, max_issues: int = 2,
             "outline": _outline(section),
             "recap": _condense(section, recap_chars),
             "posts": posts,
+            "reddit_outline": _reddit_outline(reddit_sec),
+            "reddit_recap": _plain(reddit_sec, limit=reddit_chars, preserve_links=True) if reddit_sec else "",
+            "reddit_posts": reddit_posts,
         })
 
     return {"name": "ainews", "issues": issues, "raw_count": total_posts,
-            "note": ""}
+            "reddit_raw_count": total_reddit_posts, "note": ""}
 
 
 def fetch_techmeme(window_h: int = DEFAULT_WINDOW_H, limit: int = 25,

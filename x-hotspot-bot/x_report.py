@@ -86,8 +86,9 @@ def gather() -> tuple:
             r = sources.fetch_ainews(window_h=WINDOW_H, seen_urls=seen)
         except Exception as exc:
             r = {"name": "ainews", "issues": [], "raw_count": 0,
-                 "note": f"异常：{exc}"}
+                 "reddit_raw_count": 0, "note": f"异常：{exc}"}
         kept_posts = 0
+        kept_reddit = 0
         if r["issues"]:
             lines.append("=== AINEWS_BEGIN ===")
             for iss in r["issues"]:
@@ -105,15 +106,33 @@ def gather() -> tuple:
                     lines.append(f"{i}. [{p['mentions']} 次] @{p['handle']} {p['url']} {fresh}")
                     if p["context"]:
                         lines.append(f"   上下文：{p['context']}")
+                if iss.get("reddit_recap"):
+                    lines.append("\n[Reddit Recap 正文 · 供文末「Reddit 实测与吐槽」板块筛选 1–2 条增量议题]")
+                    if iss.get("reddit_outline"):
+                        lines.append("Reddit 覆盖面：" + " / ".join(iss["reddit_outline"]))
+                    lines.append(iss["reddit_recap"])
+                if iss.get("reddit_posts"):
+                    lines.append("\n[Reddit 原帖排行 · 按 AINews 标注活跃度排序]")
+                    for i, rp in enumerate(iss["reddit_posts"], 1):
+                        fresh = "" if url_key(rp["url"]) not in seen else "（已播过，勿作为新料）"
+                        if not fresh:
+                            kept_reddit += 1
+                        act_tag = f"Activity {rp['activity']}" if rp.get("activity") else f"提及 {rp['mentions']} 次"
+                        lines.append(f"{i}. [{act_tag}] r/{rp['subreddit']} {rp['url']} {fresh}")
+                        if rp.get("context"):
+                            lines.append(f"   上下文：{rp['context']}")
             lines.append("=== AINEWS_END ===")
         metrics["ainews_posts"] = r["raw_count"]
         metrics["ainews_fresh"] = kept_posts
+        metrics["ainews_reddit_posts"] = r.get("reddit_raw_count", 0)
+        metrics["ainews_reddit_fresh"] = kept_reddit
         metrics["issue_urls"] = [iss["url"] for iss in r["issues"] if iss.get("url")]
         metrics["issue_dates"] = [iss["date"] for iss in r["issues"] if iss.get("date")]
         if not r["issues"]:
             zero.append("ainews")
-        print(f"  ✓ ainews：{len(r['issues'])} 期 · {r['raw_count']} 条原帖"
-              f"（新 {kept_posts}）{' ' + r['note'] if r['note'] else ''}", file=sys.stderr)
+        print(f"  ✓ ainews：{len(r['issues'])} 期 · X 原帖 {r['raw_count']} 条（新 {kept_posts}）"
+              f" · Reddit {r.get('reddit_raw_count', 0)} 条（新 {kept_reddit}）"
+              f"{' ' + r['note'] if r['note'] else ''}", file=sys.stderr)
 
     # ---------- techmeme（交叉验证）----------
     if "techmeme" in ENABLED:
@@ -171,6 +190,8 @@ def run_fetch() -> int:
 
     log_summary = (f"原帖 {metrics.get('ainews_posts', 0)} 条"
                    f"（新 {metrics.get('ainews_fresh', 0)}）"
+                   f" + Reddit {metrics.get('ainews_reddit_posts', 0)} 条"
+                   f"（新 {metrics.get('ainews_reddit_fresh', 0)}）"
                    f" + Techmeme {metrics.get('techmeme_items', 0)} 条")
     FETCH_META.write_text(json.dumps(
         {"log_summary": log_summary,

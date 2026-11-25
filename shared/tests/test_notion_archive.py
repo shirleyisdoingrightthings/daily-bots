@@ -197,6 +197,42 @@ class TestConvertToBlocksBySource(unittest.TestCase):
         self.assertFalse(any("X 热点" in t for _, t in types_texts))
         self.assertFalse(any("核心争论聚焦" in t for _, t in types_texts))
 
+    def test_x_and_reddit_community_section_hierarchy_and_summary(self):
+        draft = """<b>🔥 X & Reddit 社区热议 · 2026-11-25</b>
+
+今天社区围绕前沿模型实测与本地微调引擎展开讨论。
+
+<b>1. Gemini 4 Neon 基准与实测分歧</b>
+
+正文描述与讨论。
+
+原帖：<a href="https://x.com/foo/status/123456">@foo</a>（当天复盘被引用 3 次）
+
+<b>🗣️ Reddit 实测与吐槽</b>
+
+<b>[r/LocalLLaMA] 1M 上下文内存从 130TB 压到可本地运行</b>
+
+社区拆解了 KV 缓存压缩机制并讨论精度折损。
+
+原帖：<a href="https://www.reddit.com/r/LocalLLaMA/comments/1y4kikk/sample/">r/LocalLLaMA 原帖</a>（AINews 活跃度 1200）
+
+<b>📎 主流媒体同期在报</b>
+
+- <a href="https://techmeme.com/1">Techmeme 报道</a>
+
+<b>素材</b>：AINews 2026-11-25（<a href="https://latent.space/p/sample/">原文</a>）· 扫 544 个 X 账号 + 12 个 Subreddit
+"""
+        blocks = na.convert_to_blocks(draft, source="🐦 X 热点播报")
+        types_texts = [(b["type"], _block_plain(b)) for b in blocks]
+        self.assertEqual(types_texts[0], ("heading_2", "1. Gemini 4 Neon 基准与实测分歧"))
+        self.assertIn(("heading_2", "🗣️ Reddit 实测与吐槽"), types_texts)
+        self.assertIn(("heading_3", "[r/LocalLLaMA] 1M 上下文内存从 130TB 压到可本地运行"), types_texts)
+        self.assertIn(("heading_2", "📎 主流媒体同期在报"), types_texts)
+        self.assertFalse(any("X & Reddit 社区热议" in t for _, t in types_texts))
+        summary = na.extract_summary(draft, source="🐦 X 热点播报")
+        self.assertIn("今天社区围绕前沿模型实测与本地微调引擎展开讨论", summary)
+        self.assertIn("Reddit [r/LocalLLaMA] 1M 上下文内存从 130TB 压到可本地运行", summary)
+
     def test_github_hn_hierarchy_h2_and_h3(self):
         draft = """<b>🐙 GitHub Trending & Hacker News 早报 · 2026年11月14日</b>
 

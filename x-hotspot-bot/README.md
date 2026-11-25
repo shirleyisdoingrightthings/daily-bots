@@ -2,7 +2,7 @@
 
 > [← Back to Daily Bots Root README](../README.md)
 
-**Stage 2 of 3 in the daily `09:00 CST` AI intelligence pipeline.** Tracks the highest-signal AI engineering and product debates on X (Twitter) over a **48-hour window**, distills pro/con technical arguments, and enforces that every topic links directly to the single most-cited primary `x.com` post.
+**Stage 2 of 3 in the daily `09:00 CST` AI intelligence pipeline.** Tracks the highest-signal AI engineering and product debates across **X (Twitter)** and **12 core AI subreddits** over a **48-hour window**, distills pro/con technical arguments plus hands-on Reddit practitioner feedback, and enforces direct primary `x.com` / `reddit.com` links.
 
 ---
 
@@ -12,12 +12,12 @@
 flowchart TD
     A["Trigger: Daily 09:00 CST<br/>(Stage 2/3 · After AI Daily News)"] --> B["claude_report.sh fetch<br/>x_report.py --mode fetch"]
     B --> C["Read Stage 1 daily_topic_ledger.json<br/>+ 7-day sent_urls.json"]
-    C --> D["sources.py Providers (48h Window)<br/>1. Latent Space AINews (content:encoded, 65k budget)<br/>2. Techmeme RSS (AI-filtered cross-check)"]
+    C --> D["sources.py Providers (48h Window)<br/>1. Latent Space AINews (Twitter 65k + Reddit 35k)<br/>2. Techmeme RSS (AI-filtered cross-check)"]
     D --> E{"Unpublished AINews<br/>issue in 48h window?"}
     E -- "No" --> Y["Emit === NO_TOPICS ===<br/>Skip cleanly (never recycle old issues)"]
-    E -- "Yes" --> F["Rank x.com posts by citation count<br/>+ extract surrounding HTML context"]
+    E -- "Yes" --> F["Rank x.com by citations + reddit.com by Activity<br/>+ extract surrounding HTML context"]
     F --> G["Write logs/last_context.txt<br/>Emit === FETCH_OK ==="]
-    G --> H["AI Agent Filters Noise &amp; Drafts<br/>1-4 top debates -&gt; logs/report_draft.txt"]
+    G --> H["AI Agent Filters Noise &amp; Drafts<br/>1-4 X debates + 1-2 Reddit takes -&gt; report_draft.txt"]
     H --> I["claude_report.sh send<br/>bot_utils.send_x_linked_report"]
     I --> J{"Hard Gate:<br/>At least 1 valid x.com status URL?"}
     J -- "No" --> ERR["[FAIL] Reject Send"]
@@ -57,7 +57,7 @@ bash x-hotspot-bot/health_check.sh
 
 ## Key Files & Environment Variables
 
-- `sources.py` — Pluggable provider layer (`fetch_ainews`, `fetch_techmeme`, citation ranking, context extraction)
-- `x_report.py` — CLI orchestration, dual deduplication (issue URL + `x.com` status URLs), and delivery
-- `prompt.md` — Editorial spec (1–4 high-centrality debates, inline attribution links, single most-cited `原帖：` link per topic)
+- `sources.py` — Pluggable provider layer (`fetch_ainews` extracting both `AI Twitter Recap` and `AI Reddit Recap`, `fetch_techmeme`, citation/activity ranking, context extraction)
+- `x_report.py` — CLI orchestration, multi-level deduplication (issue URL + `x.com` status URLs + `reddit.com` thread URLs), and delivery
+- `prompt.md` — Editorial spec (1–4 high-centrality X debates with inline attribution links + single most-cited `原帖：` link, plus 1–2 incremental `🗣️ Reddit 实测与吐槽` items with `reddit.com` links)
 - **Env Vars**: `FEISHU_WEBHOOK` (required), `X_BOT_WINDOW_H` (optional, default `48`), `NOTION_ARCHIVE_API_KEY` & `NOTION_ARCHIVE_DATABASE_ID` (optional), `HTTPS_PROXY` (optional).

@@ -452,18 +452,20 @@ def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
         if joined:
             return joined
 
-    # 3. X 热点播报 & AI Builder：首段导语 + 全部编号主题标题
-    if "X 热点" in source or "AI Builder" in source or re.search(r"^(?:#+\s*)?(?:<b>)?(?:🔥\s*X\s*热点|🛠\uFE0F?\s*AI\s*Builder)", text.strip()):
+    # 3. X 热点播报 & AI Builder：首段导语 + 全部编号主题标题（含 Reddit 实测子话题）
+    if "X 热点" in source or "AI Builder" in source or re.search(r"^(?:#+\s*)?(?:<b>)?(?:🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠\uFE0F?\s*AI\s*Builder)", text.strip()):
         plain_lines = [re.sub(r"^#{1,3}\s*", "", _strip_tags_plain(l)).strip() for l in text.splitlines()]
         plain_lines = [l for l in plain_lines if l]
         overview = ""
         topics: list[str] = []
         for line in plain_lines:
-            if re.match(r"^(?:🔥\s*X\s*热点|🛠\uFE0F?\s*AI\s*Builder)", line):
+            if re.match(r"^(?:🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠\uFE0F?\s*AI\s*Builder)", line):
                 continue
             if re.match(r"^\d+\.\s+", line) and len(line) <= 100:
                 topics.append(line)
-            elif not overview and not line.startswith(("原帖：", "原推：", "长文", "素材：", "📎", "- ", "---")):
+            elif re.match(r"^\[r/[A-Za-z0-9_]+\]\s+\S", line) and len(line) <= 100:
+                topics.append(f"Reddit {line}")
+            elif not overview and not line.startswith(("原帖：", "原推：", "长文", "素材：", "📎", "🗣️", "- ", "---")):
                 overview = line
         if overview:
             overview = re.sub(
@@ -804,7 +806,7 @@ def convert_to_blocks(content: str, source: str = "", *, summary_override: str |
             return True
         return bool(
             re.match(
-                r"^(?:🌅\s*|☀️\s*)?(?:📊\s*美股收盘|📋\s*(?:AI\s*产业日报|美股要闻)|🐙\s*GitHub|🔥\s*X\s*热点|🛠️?\s*AI\s*Builder|🇨🇳\s*A股(?:开盘前瞻|早盘总结|午间复盘|收盘复盘)|🇭🇰\s*港股(?:开盘前瞻|早盘总结|午间复盘|收盘复盘))",
+                r"^(?:🌅\s*|☀️\s*)?(?:📊\s*美股收盘|📋\s*(?:AI\s*产业日报|美股要闻)|🐙\s*GitHub|🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠️?\s*AI\s*Builder|🇨🇳\s*A股(?:开盘前瞻|早盘总结|午间复盘|收盘复盘)|🇭🇰\s*港股(?:开盘前瞻|早盘总结|午间复盘|收盘复盘))",
                 p_no_b,
             )
             and ((raw_l.startswith("<b>") and raw_l.endswith("</b>")) or raw_l.startswith(("📋", "📊", "🌅", "☀️", "🇨🇳", "🇭🇰")))
@@ -844,11 +846,19 @@ def convert_to_blocks(content: str, source: str = "", *, summary_override: str |
 
         # X 热点播报 & AI Builder：删掉 Notion 正文顶部大标题与开篇导语（页面顶部 30秒速览 属性已完整呈现）
         if is_x_or_builder:
-            if re.match(r"^(?:🔥\s*X\s*热点|🛠\uFE0F?\s*AI\s*Builder)", plain_clean):
+            if re.match(r"^(?:🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠\uFE0F?\s*AI\s*Builder)", plain_clean):
                 i += 1
                 continue
             is_topic_h2 = _is_x_builder_topic_heading(line, plain_no_b)
-            if is_topic_h2 or plain_clean.startswith("📎") or line.startswith(("---", "━━━")):
+            is_reddit_h3 = (
+                bool(re.match(r"^\[r/[A-Za-z0-9_]+\]\s+\S", plain_clean))
+                and len(plain_clean) <= 100
+                and (
+                    line.startswith(("# ", "## ", "### "))
+                    or (line.startswith("<b>") and line.endswith("</b>") and line.count("<b>") == 1)
+                )
+            )
+            if is_topic_h2 or is_reddit_h3 or plain_clean.startswith(("📎", "🗣️")) or line.startswith(("---", "━━━")):
                 seen_first_topic = True
             elif has_x_builder_items and not seen_first_topic:
                 i += 1
@@ -856,6 +866,11 @@ def convert_to_blocks(content: str, source: str = "", *, summary_override: str |
             if is_topic_h2:
                 title_for_h2 = re.sub(r"^#{1,3}\s*", "", line).strip()
                 blocks.append(_h_block(2, title_for_h2))
+                i += 1
+                continue
+            if is_reddit_h3:
+                title_for_h3 = re.sub(r"^#{1,3}\s*", "", line).strip()
+                blocks.append(_h_block(3, title_for_h3))
                 i += 1
                 continue
 
@@ -1049,8 +1064,8 @@ def convert_to_blocks(content: str, source: str = "", *, summary_override: str |
             i += 1
             continue
 
-        # HTML 风格板块标题（🚀/🔥/❄️/⚡/🔭/🎯/📰/📎/一、/二、/三、 → heading_2）
-        _H2_PREFIXES = ("🚀", "🔥", "❄️", "⚡", "🔭", "🎯", "📰", "📎", "一、", "二、", "三、", "四、")
+        # HTML 风格板块标题（🚀/🔥/❄️/⚡/🔭/🎯/📰/📎/🗣️/一、/二、/三、 → heading_2）
+        _H2_PREFIXES = ("🚀", "🔥", "❄️", "⚡", "🔭", "🎯", "📰", "📎", "🗣️", "一、", "二、", "三、", "四、")
         if line.startswith("<b>") and line.endswith("</b>") and line.count("<b>") == 1 and any(plain_no_b.startswith(p) for p in _H2_PREFIXES):
             if is_cn_hk or (is_us and not in_us_news):
                 if plain_no_b.startswith(("🔥", "❄️")):
