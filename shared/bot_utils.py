@@ -1,0 +1,1869 @@
+"""
+bot_utils.py — Daily Bots Monorepo（6 个自动化日报 Bot）共用的共享运行时工具库。
+
+各 bot 通过 `sys.path.insert(Path(__file__).resolve().parent.parent / "shared")`
+从脚本自身位置推导本目录，因此整个仓库搬到任何位置都不需要改路径。
+
+导出函数：
+  基础
+  - sanitize_html(text)            把 AI 输出清洗为受控的 HTML 中间格式
+  - with_retry(...)                带退避的重试装饰器工厂
+  - fetch_rss(feed_url, limit)     抓取并解析 RSS，返回 entries 列表（失败返回 []）
+  - parse_entry_date(entry)        解析 RSS 条目时间，返回 UTC tz-aware datetime 或 None
+  - already_ran_today(log_file)    今天是否已成功跑过（日志含当天 [OK] 记录）
+  取材
+  - fetch_article_text(url)        best-effort 抓文章正文全文（零依赖），失败/过短返回 ""
+  跨天去重
+  - url_key(url)                   URL 归一化（去 query/fragment/尾斜杠、转小写）
+  - load_sent_urls(path)           读出最近 N 天已推送过的 URL 键集合
+  - record_sent_urls(path, urls)   记录本次实际推送的 URL 并按保留期裁剪
+  - extract_hrefs(html_text)       从稿件里抽出 <a href="..."> 的 URL
+  选题过滤（泛源闸门，垂直源不过闸）
+  - is_ai_relevant(title, summary)      AI 相关性（X 热点 / 泛源用）
+  推送与监控（飞书自定义机器人 webhook）
+  - html_to_lark_md(text)          HTML 稿件 → 飞书卡片 markdown 行列表
+  - paginate_feishu(lines)         按 20KB 请求体上限切分 + (n/N) 页码
+  - send_feishu(text, ...)         整套推送：转换 → 分页 → POST（直连不走代理）
+  - update_zero_streak(...)        RSS 源连续零产追踪，达阈值返回建议淘汰的源
+  - resolve_proxy(configured)      代理端口自愈，返回 (可用代理, 是否切换)
+  主脚本公共构件（三个 bot 曾各抄一份）
+  - make_logger(log, jsonl)        返回该 bot 的 write_log(status, msg, metrics)
+  - make_pending_saver(cache)      返回该 bot 的 save_pending(messages)
+  - proxy_ok(configured, session)  代理预检 + 端口自愈，返回 (是否放行, 生效代理)
+  - emit_fetch_output(lines, path) fetch 的 stdout 一次性输出并落盘一份
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import html
+import json
+import time
+import functools
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+import feedparser
+
+
+# ───────────────────────────────────────────────
+# 1) sanitize_html — HTML 中间格式的安全清洗
+# ───────────────────────────────────────────────
+# 稿件用一小撮 HTML 标签（实际只有 <b> 和 <a href>）承载格式，正文里出现的裸
+# < > & 必须转义，否则会被后面的标签解析吃掉——"市值 < 10 亿" 这种写法会连着
+# 后面一大段一起被当成标签。策略：先把白名单标签原样暂存，转义其余文本，
+# 再把标签还原回去。send_feishu 那边做的 unescape 正好是本函数的逆运算。
+
+_ALLOWED_TAGS = r"(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|tg-spoiler|blockquote)"
+# 匹配白名单的开/闭标签（属性中不含尖括号，足以覆盖 <a href="...">）
+_TAG_RE = re.compile(rf"</?\s*{_ALLOWED_TAGS}(?:\s+[^<>]*?)?>", re.IGNORECASE)
+_SENTINEL_RE = re.compile("\x00(\\d+)\x00")
+_UNESCAPED_AMP_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
+
+
+def sanitize_html(text: str) -> str:
+    if not text:
+        return ""
+
+    stash: list[str] = []
+
+    def _hold(m: re.Match) -> str:
+        stash.append(m.group(0))
+        return f"\x00{len(stash) - 1}\x00"
+
+    # 1. 暂存白名单标签
+    tmp = _TAG_RE.sub(_hold, text)
+    # 2. 转义剩余文本中的裸 & < >（保留已合法存在的 HTML 实体，避免 &amp; 被二次转义为 &amp;amp;）
+    tmp = _UNESCAPED_AMP_RE.sub("&amp;", tmp).replace("<", "&lt;").replace(">", "&gt;")
+    # 3. 还原标签
+    tmp = _SENTINEL_RE.sub(lambda m: stash[int(m.group(1))], tmp)
+    return tmp
+
+
+# ───────────────────────────────────────────────
+# 2) with_retry — 重试装饰器工厂
+# ───────────────────────────────────────────────
+# 用法：@with_retry(max_retries=2, base_delay=5, exceptions=(Exception,))
+# 首次调用失败后最多再重试 max_retries 次，第 n 次重试前 sleep(base_delay * n)。
+# 全部失败则抛出最后一次异常。
+
+def with_retry(max_retries: int = 3, base_delay: float = 5,
+               exceptions: tuple = (Exception,)):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            while True:
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as exc:  # noqa: F841
+                    attempt += 1
+                    if attempt > max_retries:
+                        raise
+                    time.sleep(base_delay * attempt)
+        return wrapper
+    return decorator
+
+
+# ───────────────────────────────────────────────
+# 3) fetch_rss — 抓取并解析 RSS
+# ───────────────────────────────────────────────
+# requests 默认 trust_env=True，会自动读取 HTTP_PROXY / HTTPS_PROXY 环境变量，
+# 因此代理由调用方（脚本/launchd plist）通过环境变量注入即可。
+# 单个源失败时返回 []，避免一个坏源拖垮整次运行。
+
+_RSS_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+
+def fetch_rss(feed_url: str, limit: int = 10, timeout: int = 30,
+              retries: int = 2) -> list:
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(feed_url, headers={"User-Agent": _RSS_UA},
+                                timeout=timeout)
+            resp.raise_for_status()
+            parsed = feedparser.parse(resp.content)
+            entries = list(parsed.entries or [])
+            return entries[:limit] if limit else entries
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(3 * (attempt + 1))
+    print(f"[bot_utils] fetch_rss 失败：{feed_url} → {last_exc}")
+    return []
+
+
+# ───────────────────────────────────────────────
+# 4) parse_entry_date — 解析条目时间为 UTC datetime
+# ───────────────────────────────────────────────
+# feedparser 的 *_parsed 字段是 UTC 的 time.struct_time。调用方用
+# datetime.now(timezone.utc) 做比较，故这里返回 tz-aware（UTC）datetime。
+
+def parse_entry_date(entry) -> datetime | None:
+    for attr in ("published_parsed", "updated_parsed", "created_parsed"):
+        t = getattr(entry, attr, None)
+        if t:
+            try:
+                return datetime(*t[:6], tzinfo=timezone.utc)
+            except Exception:
+                continue
+    return None
+
+
+# ───────────────────────────────────────────────
+# 5) already_ran_today — 当天幂等检查
+# ───────────────────────────────────────────────
+# write_log 写入格式为 "{%Y-%m-%d %H:%M}  [{status}]  {message}"，
+# 因此「今天已成功」= 日志中存在以今天日期开头且含 [OK] 的行。
+# 环境变量 FORCE_RUN=1 可强制绕过（始终返回 False）。
+
+def already_ran_today(log_file, ok_marker: str = "[OK]") -> bool:
+    if os.getenv("FORCE_RUN") == "1":
+        return False
+    try:
+        path = Path(log_file)
+        if not path.exists():
+            return False
+        today = datetime.now().strftime("%Y-%m-%d")
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(today) and ok_marker in line:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+# ───────────────────────────────────────────────
+# 6) fetch_article_text — best-effort 抓正文全文（零依赖）
+# ───────────────────────────────────────────────
+# 供 build context 用：给写稿提供比 RSS 摘要更丰富的原料。
+# 策略：requests 抓 HTML（trust_env 自动走代理 + 浏览器 UA）→ 优先取 JSON-LD 的
+# articleBody（最干净），退而用 <p> 标签启发式。任何失败/正文过短都返回 ""，
+# 由调用方回退到 RSS 摘要。纯标准库 + requests，不引入 lxml/bs4/trafilatura
+# （系统 python 3.9 装不动，且会增加维护面）。
+
+_ARTICLE_UA = _RSS_UA  # 复用上面的浏览器 UA
+
+_ARTICLE_BLOCK_RE  = re.compile(r"(?is)<(script|style|noscript|nav|header|footer|aside|form)\b.*?</\1>")
+_ARTICLE_P_RE      = re.compile(r"(?is)<p[ >].*?</p>")
+_ARTICLE_TAG_RE    = re.compile(r"(?s)<[^>]+>")
+_ARTICLE_WS_RE     = re.compile(r"\s+")
+_ARTICLE_JSONLD_RE = re.compile(
+    r'(?is)<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>'
+)
+
+
+def _article_norm(text: str) -> str:
+    return _ARTICLE_WS_RE.sub(" ", html.unescape(text)).strip()
+
+
+def _article_from_jsonld(raw_html: str) -> str:
+    """从所有 JSON-LD 块里挖出最长的 articleBody。"""
+    best = ""
+    for block in _ARTICLE_JSONLD_RE.findall(raw_html):
+        try:
+            data = json.loads(block.strip())
+        except Exception:
+            continue
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                body = node.get("articleBody")
+                if isinstance(body, str) and len(body) > len(best):
+                    best = body
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+    return _article_norm(best)
+
+
+def _article_from_paragraphs(raw_html: str) -> str:
+    """去掉脚本/导航等噪声后，拼接有实质长度的 <p> 文本。"""
+    body = _ARTICLE_BLOCK_RE.sub(" ", raw_html)
+    paras = []
+    for p in _ARTICLE_P_RE.findall(body):
+        t = _article_norm(_ARTICLE_TAG_RE.sub(" ", p))
+        if len(t) >= 40:          # 滤掉导航/版权行等短碎片
+            paras.append(t)
+    return " ".join(paras).strip()
+
+
+def fetch_article_text(url: str, timeout: int = 10,
+                       max_chars: int = 1800, min_chars: int = 300) -> str:
+    """best-effort 抓文章正文；失败/被墙/正文过短一律返回 ""（调用方回退 RSS 摘要）。"""
+    if not url:
+        return ""
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": _ARTICLE_UA,
+                     "Accept-Language": "en-US,en;q=0.9"},
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return ""
+        raw = resp.text
+    except Exception:
+        return ""
+
+    text = _article_from_jsonld(raw)
+    if len(text) < min_chars:
+        alt = _article_from_paragraphs(raw)
+        if len(alt) > len(text):
+            text = alt
+    if len(text) < min_chars:
+        return ""
+    return text[:max_chars]
+
+
+# ───────────────────────────────────────────────
+# 7) 跨天去重 — 记住"真正推送过"的 URL
+# ───────────────────────────────────────────────
+# 背景：三个 bot 的时间窗口（AI 24h / Crypto 3 天 / 美股 48h）都可能让同一条新闻在连续
+# 多天进入 context——各脚本内的 seen_urls 只在单次运行内有效，拦不住跨天重复。
+# 策略：send 成功后，从稿件里抽出实际用到的 <a href> 记进 logs/sent_urls.json；
+# 下次 fetch 时据此排除。记录点选在 send 成功之后而不是 fetch 时，这样发送失败
+# 的那一批不会被误标成"已播"。
+
+SENT_URLS_KEEP_DAYS = 7
+
+_HREF_RE = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def url_key(url: str) -> str:
+    """归一化 URL 作为去重键：小写、去 query/fragment、去尾斜杠。
+
+    RSS 里同一篇文章的链接常带 utm_* 参数，且不同源指向同一文章时参数各异，
+    所以只用 scheme+host+path 作为身份。"""
+    if not url:
+        return ""
+    u = url.strip().split("#", 1)[0].split("?", 1)[0]
+    return u.rstrip("/").lower()
+
+
+def load_sent_urls(path, keep_days: int = SENT_URLS_KEEP_DAYS) -> set[str]:
+    """读出保留期内已推送的 URL 键集合；文件不存在/损坏一律返回空集（不阻断出稿）。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    cutoff = _days_ago_str(keep_days)
+    return {k for k, d in data.items() if isinstance(d, str) and d >= cutoff}
+
+
+def record_sent_urls(path, urls, keep_days: int = SENT_URLS_KEEP_DAYS) -> int:
+    """把本次实际推送的 URL 记入档案并裁掉过期条目，返回归档总量。
+
+    写档失败只告警不抛错——去重是增强项，不能让它把已经发成功的流程带崩。"""
+    p = Path(path)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    for u in urls:
+        k = url_key(u)
+        if k:
+            data[k] = today
+
+    cutoff = _days_ago_str(keep_days)
+    data = {k: d for k, d in data.items() if isinstance(d, str) and d >= cutoff}
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=0), encoding="utf-8")
+    except Exception as e:
+        print(f"[WARN] sent_urls 写入失败: {e}")
+    return len(data)
+
+
+def _days_ago_str(days: int) -> str:
+    from datetime import timedelta
+    return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def extract_hrefs(html_text: str) -> list[str]:
+    """从稿件中抽出所有 <a href="..."> 的 URL（只要 http/https）。"""
+    if not html_text:
+        return []
+    return [u for u in _HREF_RE.findall(html_text) if u.lower().startswith("http")]
+
+
+# 原帖链接的唯一权威定义：只认 x.com / twitter.com 的 /<user>/status/<id>。
+# 必须是完整帖子链接——x.com/home、x.com/explore 这类导航页，以及路径里恰好
+# 含 "x.com/" 的第三方 URL 都不算。x-hotspot-bot 与 ai-builder-bot 的出稿硬
+# 闸门共用它：一份没有原帖直链的播报等于二手转述，宁可不发。
+# 2026-09-05 从 x-hotspot-bot/sources.py 提上来——此前 ai-builder-bot 用的是
+# 子串匹配 `"x.com/" in u`，比这里松，会把导航页当原帖放行。
+X_POST_RE = re.compile(
+    r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)")
+
+
+# ───────────────────────────────────────────────
+# 8) AI 相关性闸门 — 只给泛科技源用
+# ───────────────────────────────────────────────
+# 背景：engadget.com/rss.xml 这类全站源里大量条目与 AI 无关（游戏机 demo、
+# Steam 功能更新、影视并购），白白占掉抓取额度并污染写稿素材。垂直 AI 源
+# （theverge AI 频道、the-decoder 等）不过这道闸，避免误伤不含关键词的正当选题。
+
+_AI_KEYWORDS = (
+    "ai", "a.i.", "artificial intelligence", "machine learning", "deep learning",
+    "neural", "llm", "large language model", "chatbot", "generative",
+    "openai", "chatgpt", "gpt", "anthropic", "claude", "gemini", "deepmind",
+    "llama", "mistral", "moonshot", "deepseek", "qwen", "copilot", "midjourney",
+    "stable diffusion", "hugging face", "nvidia", "gpu", "tpu", "data center",
+    "datacenter", "robot", "humanoid", "autonomous", "self-driving",
+    "transformer model", "inference", "training run", "agentic",
+)
+
+# 单独成词才算命中的短词，避免 "ai" 匹配到 "said/certain"、"gpu" 之外的噪音
+_AI_WORD_RE = re.compile(
+    r"\b(?:ai|a\.i\.|llm|gpt|gpu|tpu|robot|robots|robotics|humanoid|neural|agentic)\b",
+    re.IGNORECASE,
+)
+
+
+def is_ai_relevant(title: str, summary: str = "") -> bool:
+    """判断一条泛科技源新闻是否与 AI 相关。标题或摘要命中即通过。"""
+    blob = f"{title or ''} {summary or ''}".lower()
+    if not blob.strip():
+        return False
+    if _AI_WORD_RE.search(blob):
+        return True
+    return any(kw in blob for kw in _AI_KEYWORDS if " " in kw or len(kw) > 4)
+
+
+# ───────────────────────────────────────────────
+# 9) 飞书推送 — HTML 稿件 → 卡片 markdown → 自定义机器人 webhook
+# ───────────────────────────────────────────────
+# 2026-08 从 Telegram 迁过来时踩的坑，按顺序记下来，别再走回头路：
+#
+#   ① 先选了「富文本 post」，理由是文档写着 text/a 标签支持 style:["bold"]，
+#      正好对上稿件里 <a href><b>标题</b></a> 的加粗超链接。真机一发就被拒：
+#      code=19002 "unknown content value"。style 那套是**应用发消息 API** 的能力，
+#      自定义机器人 webhook 不认。post 里的 md 标签同样不认（code=10002）。
+#   ② post 发得出去，但只能出纯文本 + 不加粗的链接，章节标题会全部失去层次。
+#   ③ 最终用「卡片 2.0 + markdown 元素」。真机实测两种嵌套写法只有一种有效：
+#        **[文字](url)**  → 又蓝又粗 ✅   ← 加粗超链接只能这么写
+#        [**文字**](url)  → 不生效 ❌
+#      顺序反了就白写，改这里之前先在真群里发一条对照消息确认。
+#
+# 关于转义：飞书文档说命中 markdown 语法的字符要转成 &#42; 这类实体。真机实测裸
+# 星号、下划线、尖括号、& 全都原样显示；又扫了 14 份真实存档共 8 万字正文，唯一
+# 命中的是 5 处 [#159] 这种方括号（CommonMark 里不跟 (url) 的方括号是字面量，无害）。
+# 加上 prompt 本来就禁止稿件出现 Markdown 符号，所以这里**不做转义**——盲目转义有
+# 反向风险：万一实体不被解码，群里就会出现一串字面的 &#42;。哪天稿件风格真变了，
+# 在 _md_plain 里加一层即可。
+
+# 自定义机器人 webhook 的请求体上限 20KB（比应用发消息的 30KB 更严）。
+# 按 UTF-8 字节算，且 body 用 ensure_ascii=False 序列化后手动编码发送：
+# requests 的 json= 参数默认 ensure_ascii=True，一个汉字会膨胀成 \uXXXX 六个 ASCII
+# 字节，同一份稿子要多切一倍的消息。
+FEISHU_BODY_LIMIT = 20 * 1024
+# 给卡片外壳、页码行和 JSON 转义留的余量
+_FEISHU_ENVELOPE_BUDGET = 2048
+
+FEISHU_WEBHOOK_ENV = "FEISHU_WEBHOOK"
+# 飞书限频 5 次/秒；页与页之间歇一下，顺便躲开整点前后突发的 11232 限流
+_FEISHU_PAGE_GAP_S = 0.5
+
+_A_RE          = re.compile(r'<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</a\s*>', re.I | re.S)
+_B_RE          = re.compile(r'<\s*(b|strong)\s*>(.*?)</\s*\1\s*>', re.I | re.S)
+_STRIP_TAGS_RE = re.compile(r"<[^>]+>")
+
+
+def _md_plain(fragment: str) -> str:
+    """去掉残留标签、还原实体，得到可直接进 markdown 的文本。
+
+    sanitize_html 把白名单之外的裸 < > & 转成了实体，这里 unescape 回来，
+    二者互为逆运算——"市值 < 10 亿" 这类正文不会被当成标签吃掉。"""
+    return html.unescape(_STRIP_TAGS_RE.sub("", fragment))
+
+
+def _md_wrap(inner: str, left: str, right: str) -> str:
+    """用 markdown 标记包住文本，但把首尾空白留在标记外面。
+
+    CommonMark 要求标记必须紧贴非空白字符：`** 文字 **` 不会加粗，`**文字**` 才会。
+    稿件里出现 <b> 文字 </b> 这种带空格的写法时，靠这一步救回来。"""
+    core = inner.strip()
+    if not core:
+        return inner
+    lead  = inner[:len(inner) - len(inner.lstrip())]
+    trail = inner[len(inner.rstrip()):]
+    return f"{lead}{left}{core}{right}{trail}"
+
+
+def _md_bold_runs(fragment: str) -> str:
+    """把不含链接的片段转成 markdown：<b>x</b> → **x**，其余原样。"""
+    out, pos = [], 0
+    for m in _B_RE.finditer(fragment):
+        if m.start() > pos:
+            out.append(_md_plain(fragment[pos:m.start()]))
+        out.append(_md_wrap(_md_plain(m.group(2)), "**", "**"))
+        pos = m.end()
+    if pos < len(fragment):
+        out.append(_md_plain(fragment[pos:]))
+    return "".join(out)
+
+
+def html_to_lark_md(text: str) -> list:
+    """把 <b>/<a href> 方言的稿件转成飞书卡片 markdown 的行列表（一行一个元素）。
+
+    href 只认 http/https，其余（javascript: 之类）连同标签一起降级成纯文本。"""
+    lines = []
+    for line in (text or "").split("\n"):
+        # 预处理：修复 <b>1. <a href="...">repo</a></b> 结构，避免 <b> 与 <a> 嵌套时链接失去加粗
+        line = re.sub(
+            r"<b>(\d+\.)\s*(<a\s+[^>]+>)(?:<b>)?(.*?)(?:</b>)?</a>\s*</b>",
+            r"<b>\1</b> \2<b>\3</b></a>",
+            line,
+            flags=re.I,
+        )
+        line = re.sub(r"<b>(\d+\.)\s*(<a\s+[^>]+>)", r"<b>\1</b> \2", line)
+        buf, pos = [], 0
+        for m in _A_RE.finditer(line):
+            if m.start() > pos:
+                buf.append(_md_bold_runs(line[pos:m.start()]))
+            href  = html.unescape(m.group(1)).strip()
+            inner = m.group(2)
+            label = _md_plain(inner).strip()
+            if label and href.lower().startswith(("http://", "https://")):
+                link = f"[{label}]({href})"
+                # 加粗超链接只有 **[文字](url)** 这一种写法有效，见本节开头
+                buf.append(f"**{link}**" if _B_RE.search(inner) else link)
+            elif label:
+                buf.append(_md_bold_runs(inner))
+            pos = m.end()
+        if pos < len(line):
+            buf.append(_md_bold_runs(line[pos:]))
+        res_line = "".join(buf)
+        # 关键防护 1：如果行首为 '1. ' 等纯数字编号，转为 '**1.** '，防止飞书 Card 2.0 识别为有序列表进而吞掉后续提行
+        res_line = re.sub(r"^(\d+\.)\s+", r"**\1** ", res_line)
+        # 关键防护 2：如果行首为 '· '、'• ' 等 unicode 点状符号，转为 markdown 标准列表符 '- '，确保飞书渲染为独立无序列表项
+        res_line = re.sub(r"^[·•●▪]\s*", "- ", res_line)
+
+        # 关键防护 3：全局飞书排版美学与防断流引擎（解决大板块间隔、条目归属性与条目内紧凑提行）
+        _SECTION_HEADERS = (
+            "🔥 今日领涨", "🔥 早盘领涨", "🔥 领涨", "🔥 持续霸榜",
+            "❄️ 今日领跌", "❄️ 早盘领跌", "❄️ 领跌",
+            "⚡ 焦点异动",
+            "🔭 盘面核心叙事", "🔭 早盘核心叙事", "🔭 核心叙事",
+            "🎯 决策仪表盘", "🎯 早盘决策仪表盘", "🎯 港股早盘决策仪表盘", "🎯 午间决策仪表盘",
+            "⚡ 30秒速览", "📋 30秒速览",
+            "🚀 一、", "🚀 二、", "🔥 一、", "🔥 二、", "📰 一、", "📰 二、", "▍",
+            "⚡ 早盘三大", "⚡ 今早港股", "⚡ 本周 5 件事",
+        )
+        _HEADER_METRICS = (
+            "📊 **核心指数", "📈 **核心指数", "📊 核心指数", "📈 核心指数",
+            "🧭 **市场宽度", "🧭 市场宽度",
+            "📐 **趋势与乖离", "📐 趋势与乖离",
+            "💰 **两市量能", "💰 两市量能", "💰 **早盘半日量能", "💰 早盘半日量能",
+            "🌍 **外围与流动性", "🌍 外围与流动性", "🌍 **隔夜外围", "🌍 隔夜外围", "🌍 **隔夜映射兑现", "🌍 隔夜映射兑现",
+            "📐 **前日收盘", "📐 前日收盘", "📐 **前日港股", "📐 前日港股",
+            "🇺🇸 **隔夜中概", "🇺🇸 隔夜中概",
+            "🌡 **宏观指标", "🌡 宏观指标",
+            "🪙 **加密", "🪙 加密",
+            "🧭 **加密情绪", "🧭 加密情绪",
+        )
+        _ITEM_INTERNAL_PREFIXES = (
+            "🏷️", "🛠️", "Original:", "⭐",
+            "- **它是干嘛的", "- **个人 Build", "- **个人 build",
+            "- **这帖在聊啥", "- **评论区交锋", "- **评论区热议", "- **核心要点",
+            "- **板块内领涨", "- **板块内涨幅", "- **板块内领跌", "- **板块内跌幅",
+            "- **领涨原因", "- **领跌原因",
+            "- **信号灯状态", "- **早盘信号灯", "- **午间信号灯", "- **👀", "- **🚨", "- **💡 分析师",
+        )
+        _BREAK_PREFIXES = (
+            "原帖：", "原推：", "长文：", "**素材**：", "📎 **主流媒体", "📈 本周数字", "📄 The Details"
+        )
+
+        clean_curr = res_line.lstrip("*# ").strip()
+        clean_bullet_curr = res_line.lstrip("-•·*# \t").strip()
+        curr_is_sec_header = any(clean_curr.startswith(h) for h in _SECTION_HEADERS)
+        curr_is_metric = any(clean_curr.startswith(m.lstrip("*# ")) for m in _HEADER_METRICS)
+        curr_is_internal = any(clean_bullet_curr.startswith(p.lstrip("-•·*# \t")) for p in _ITEM_INTERNAL_PREFIXES)
+
+        # 检查上一非空行是否为大标题或指标项
+        prev_non_empty = ""
+        for prev in reversed(lines):
+            if prev.strip():
+                prev_non_empty = prev.strip()
+                break
+        clean_prev = prev_non_empty.lstrip("*# ").strip()
+        prev_is_sec_header = any(clean_prev.startswith(h) for h in _SECTION_HEADERS)
+        prev_is_metric = any(clean_prev.startswith(m.lstrip("*# ")) for m in _HEADER_METRICS)
+
+        # 处理空行输入
+        if not res_line:
+            # 只有当上一行不是空行、且上一行不是大标题时，才保留空行占位（后续若遇内部字段会自动剥除）
+            if lines and lines[-1].strip() and not prev_is_sec_header:
+                lines.append("")
+            continue
+
+        # 规则 1：大板块标题（🔥领涨、❄️领跌、⚡焦点异动、🔭核心叙事、🎯决策仪表盘、⚡30秒速览、🚀一、GitHub、🔥二、HN 等）
+        # 上方必须有且仅有一个空行（彻底拉开大板块之间的距离）
+        if curr_is_sec_header:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(res_line)
+            continue
+
+        # 规则 2：紧跟大标题之后的第一行内容，坚决不留空行，紧贴大标题
+        if prev_is_sec_header:
+            if lines and not lines[-1].strip():
+                lines.pop()
+            lines.append(res_line)
+            continue
+
+        # 规则 3：条目内部细项（场景定位、适用建议、Original、它是干嘛的、评论区交锋等），坚决不留空行，紧凑提行
+        if curr_is_internal:
+            if lines and not lines[-1].strip():
+                lines.pop()
+            lines.append(res_line)
+            continue
+
+        # 规则 4：顶部核心指标卡各行之间坚决不留空行，紧凑提行
+        if curr_is_metric and prev_is_metric:
+            if lines and not lines[-1].strip():
+                lines.pop()
+            lines.append(res_line)
+            continue
+
+        # 规则 5：独立条目编号（如 **2.**, **3.** 等后续项目/帖子/板块），上方必须空一行隔开不同条目
+        if re.match(r"^\*\*(?:[2-9]|\d{2,})\.", res_line):
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(res_line)
+            continue
+
+        # 规则 6：其余特殊前缀（原帖、原推等）
+        if any(res_line.startswith(p) for p in _BREAK_PREFIXES) and lines and lines[-1].strip():
+            lines.append("")
+
+        lines.append(res_line)
+    return lines
+
+
+def _card_payload(md: str) -> dict:
+    return {"msg_type": "interactive",
+            "card": {"schema": "2.0",
+                     "config": {"update_multi": True},
+                     "body": {"elements": [{"tag": "markdown", "content": md}]}}}
+
+
+def _payload_bytes(md: str) -> int:
+    """整条请求体的实际字节数。"""
+    return len(json.dumps(_card_payload(md), ensure_ascii=False).encode("utf-8"))
+
+
+def _line_cost(line: str) -> int:
+    """单行进 JSON 后的字节数。json.dumps 带的两个引号正好抵掉换行转义成 \\n 的开销。"""
+    return len(json.dumps(line, ensure_ascii=False).encode("utf-8"))
+
+
+def _greedy_pages(lines: list, budget: int) -> list:
+    """按预算顺序塞行；切分点只落在行边界，保证单条新闻不会被腰斩。
+
+    单行本身就超预算时不再细分，让它单独成页——宁可让飞书退这一条，
+    也不要把一条新闻从中间劈开。"""
+    pages, current, size = [], [], 0
+    for line in lines:
+        cost = _line_cost(line)
+        if current and size + cost > budget:
+            pages.append(current)
+            current, size = [line], cost
+        else:
+            current.append(line)
+            size += cost
+    if current:
+        pages.append(current)
+    return pages
+
+
+def paginate_feishu(lines: list, max_bytes: int = 0) -> list:
+    """把 markdown 行切成若干条消息，返回每条的 markdown 正文。
+
+    超过一条时每条顶部加加粗的 (n/N) 页码。分页做二次均衡：直接贪心塞满会留下一个
+    很短的尾页（实测某天的 AI 日报切成 18.8KB + 0.5KB，第二条只有两行），所以先用
+    上限求出最少页数 n，再从 总量/n 起步收紧预算，找出仍能装进 n 页的最小预算。
+    最后按真实请求体大小复核一遍，超了就收紧重切——估算口径出偏差也不会发到飞书才发现。"""
+    if not lines:
+        return []
+    if max_bytes <= 0:
+        max_bytes = FEISHU_BODY_LIMIT - _FEISHU_ENVELOPE_BUDGET
+
+    for _ in range(6):
+        pages = _greedy_pages(lines, max_bytes)
+
+        if len(pages) > 1:
+            target = -(-sum(_line_cost(x) for x in lines) // len(pages))   # 向上取整
+            while target <= max_bytes:
+                balanced = _greedy_pages(lines, target)
+                if len(balanced) <= len(pages):
+                    pages = balanced
+                    break
+                target = int(target * 1.05) + 1   # 均分装不下（长行挤兑），放宽再试
+
+        total = len(pages)
+        out = ["\n".join(pg) for pg in pages] if total == 1 else \
+              [f"**（{i}/{total}）**\n\n" + "\n".join(pg) for i, pg in enumerate(pages, 1)]
+
+        if all(_payload_bytes(md) <= FEISHU_BODY_LIMIT for md in out):
+            return out
+        max_bytes = int(max_bytes * 0.9)          # 复核没过，收紧 10% 重来
+
+    raise ValueError("分页失败：单行内容超出飞书 20KB 请求体上限，无法再切分")
+
+
+# 发送走独立 Session 并显式关掉 trust_env：三个 bot 为了抓墙外 RSS 会把
+# HTTP_PROXY/HTTPS_PROXY 写进 os.environ，而飞书本来就直连可达，绕代理只是
+# 平白多一个故障点——代理挂掉的日子不该连播报一起停摆。
+_FEISHU_SESSION = requests.Session()
+_FEISHU_SESSION.trust_env = False
+_FEISHU_SESSION.proxies = {}
+
+
+@with_retry(max_retries=3, base_delay=5, exceptions=(requests.RequestException,))
+def _feishu_send_card(webhook: str, md: str) -> None:
+    # 手动序列化：ensure_ascii=False 让汉字按 UTF-8 占 3 字节而不是 \uXXXX 的 6 字节，
+    # 与分页的字节预算保持同一口径
+    body = json.dumps(_card_payload(md), ensure_ascii=False).encode("utf-8")
+    resp = _FEISHU_SESSION.post(
+        webhook, data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        timeout=30,
+    )
+    if not resp.ok:
+        raise requests.RequestException(f"飞书 HTTP {resp.status_code}: {resp.text[:300]}")
+    # 飞书失败时照样返回 HTTP 200，成败只看响应体里的 code/StatusCode
+    try:
+        data = resp.json()
+    except Exception:
+        raise requests.RequestException(f"飞书返回非 JSON：{resp.text[:300]}")
+    code = data.get("code", data.get("StatusCode", 0))
+    if code not in (0, "0"):
+        msg = data.get("msg") or data.get("StatusMessage") or resp.text[:300]
+        raise requests.RequestException(f"飞书返回错误 code={code}：{msg}")
+
+
+def send_feishu(text: str, webhook: str = "") -> int:
+    """把一份（已 sanitize_html 的）稿件推送到飞书自定义机器人，返回实际发出的条数。
+
+    webhook 缺省从环境变量 FEISHU_WEBHOOK 读取。
+    没配 webhook 直接抛错、绝不静默吞掉——静默成功会让 health_check 也看不出问题。"""
+    # 空稿直接返回：三个 bot 的 run_send 都已挡过一道，这里是兜底——
+    # 宁可不发，也不要推一条空白消息出去。
+    if not (text or "").strip():
+        return 0
+
+    hook = webhook or os.getenv(FEISHU_WEBHOOK_ENV, "")
+    if not hook.startswith("http"):
+        raise ValueError(
+            f"未配置飞书 webhook（环境变量 {FEISHU_WEBHOOK_ENV}）——"
+            "请在飞书群「设置 → 群机器人 → 添加机器人 → 自定义机器人」里取得地址")
+
+    pages = paginate_feishu(html_to_lark_md(text))
+    for i, md in enumerate(pages):
+        if i:
+            time.sleep(_FEISHU_PAGE_GAP_S)
+        _feishu_send_card(hook, md)
+    return len(pages)
+
+
+# ───────────────────────────────────────────────
+# 10) update_zero_streak — RSS 源连续零产追踪
+# ───────────────────────────────────────────────
+# "零产" = 该源当天抓到了条目、但过滤后一条都没进正文（过期/重复/已播/不相关）。
+# 单日零产是慢更新源的常态，连续多日零产才说明这个源该换掉了。
+# 本函数是 .zero_streak.json 的唯一写入方（fetch 阶段调用），health_check 只读不写，
+# 避免两处各加一次导致天数翻倍。
+
+def update_zero_streak(path, zero_sources, all_sources, threshold: int = 3) -> dict:
+    """更新各源连续零产天数，返回达到阈值的 {源: 天数}（建议移除的源）。
+
+    zero_sources 里的源天数 +1；本次有产出的源清零并移出档案。"""
+    p = Path(path)
+    try:
+        streak = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(streak, dict):
+            streak = {}
+    except Exception:
+        streak = {}
+
+    zero = set(zero_sources)
+    for s in zero:
+        streak[s] = int(streak.get(s, 0)) + 1
+    # 只保留本次仍然零产的源：有产出的清零，已从配置里删掉的也随之消失
+    # （zero_sources 必然是 all_sources 的子集，故一个判断就够）
+    streak = {s: n for s, n in streak.items() if s in zero}
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(streak, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[WARN] zero_streak 写入失败: {e}")
+
+    return {s: n for s, n in sorted(streak.items()) if n >= threshold}
+
+
+# ───────────────────────────────────────────────
+# 11) resolve_proxy — 代理端口自愈
+# ───────────────────────────────────────────────
+# 背景：代理端口写死在 plist 里，用户换代理软件（Shadowrocket / Clash 等）
+# 端口就变。历史上发生过三次（7897 → 7892 → 1082 → 12450），最近一次让两个 bot
+# 静默停摆 3 天——脚本只知道"配置的端口不通"，不会尝试任何替代。
+#
+# 策略：先试配置端口；不通则依次探测候选端口，命中即改用并告警。
+# 探测用 gstatic 的 204 端点（轻量、无内容、境外可达性可靠）。
+
+# 探测顺序即优先级：优先 1082，其次 12450（已移除 7897）。
+PROXY_CANDIDATES = ("1082", "12450")
+_PROBE_URL = "https://www.gstatic.com/generate_204"
+
+
+def _probe(proxy_url: str | None, timeout: int = 5) -> bool:
+    try:
+        if proxy_url:
+            requests.get(_PROBE_URL, proxies={"http": proxy_url, "https": proxy_url},
+                         timeout=timeout)
+        else:
+            # TUN 模式 / 海外直连兜底：显式关闭 trust_env 绕过环境变量中的旧代理端口
+            s = requests.Session()
+            s.trust_env = False
+            s.proxies = {}
+            s.get(_PROBE_URL, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_proxy(configured: str | None, candidates=PROXY_CANDIDATES,
+                  timeout: int = 5) -> tuple[str | None, bool]:
+    """返回 (可用代理 URL, 是否发生了端口切换)。
+
+    - configured 为空 → (None, False)，调用方视为直连放行
+    - 按 candidates 优先级（1082 → 12450）依次探测，命中即返回 (该候选, 是否与原配置不同)
+    - 本地端口全不通但 TUN/直连可达 → ("", True)，调用方清空代理环境变量改走直连
+    - 全都不通 → (None, False)，调用方按代理不可用处理"""
+    if not configured:
+        return None, False
+
+    # 从配置值里拆出 scheme 与 host，严格按 candidates 优先级（1082 → 12450）探测
+    m = re.match(r"^(https?://)([^:/]+)(?::(\d+))?", configured.strip())
+    scheme = m.group(1) if m else "http://"
+    host = m.group(2) if m else "127.0.0.1"
+    cur_port = m.group(3) if m else None
+
+    ports_to_try = list(candidates)
+    if cur_port and cur_port not in ports_to_try:
+        ports_to_try.append(cur_port)
+
+    for port in ports_to_try:
+        alt = f"{scheme}{host}:{port}"
+        if _probe(alt, timeout):
+            switched = (port != cur_port)
+            if switched:
+                print(f"[bot_utils] 已按优先级自动选用代理 {alt}（原配置 {configured}）")
+            return alt, switched
+
+    # 本地代理端口均不通时，尝试 TUN 模式 / 全局直连兜底
+    if _probe(None, timeout):
+        print(f"[bot_utils] 本地代理端口（{', '.join(ports_to_try)}）均不通，但直连(TUN模式)可达，已自动切换为直连")
+        return "", True
+
+    return None, False
+
+
+# ───────────────────────────────────────────────
+# 13) 主脚本公共构件 — 三个 bot 逐字重复的那几块
+# ───────────────────────────────────────────────
+# 背景：write_log / save_pending / _proxy_ok 三份逐字相同（_proxy_ok 已经开始漂移：
+# us stock 版与另两份不一致），run_fetch 的收尾也是同构的。每加一个 bot 就再抄一遍，
+# 且抄完各自演化。这里把它们收进共享层，各 bot 只留一行绑定。
+#
+# 用工厂函数而不是"多传两个路径参数"，是为了让各 bot 的调用点一个字都不用改
+# ——write_log("WARN", ...) 在三个脚本里共有 22 处。
+
+def make_logger(log_file, jsonl_file):
+    """返回绑定到指定路径的 write_log(status, message, metrics=None)。
+
+    行格式 "{%Y-%m-%d %H:%M}  [{status}]  {message}"，与 already_ran_today 的
+    当天幂等判断相互约定，不要改。metrics 非空时额外追加一行 JSONL 供 health_check 读。
+    注意 print(line) 走 stdout：fetch 模式下这会混进 marker 流，属既有行为，
+    routine 靠 marker 解析不受影响，这里保持原样不动。"""
+    log_file, jsonl_file = Path(log_file), Path(jsonl_file)
+
+    def write_log(status: str, message: str, metrics: dict = None) -> None:
+        ts   = datetime.now().strftime("%Y-%m-%d %H:%M")
+        line = f"{ts}  [{status}]  {message}\n"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(line)
+        print(line, end="")
+        if metrics:
+            record = {"ts": ts, "status": status, "msg": message, **metrics}
+            with open(jsonl_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return write_log
+
+
+def make_pending_saver(cache_file):
+    """返回绑定到指定路径的 save_pending(messages)。
+
+    推送失败时的兜底副本，**不做自动重发**——跨天重发旧稿比丢一次更糟，
+    当天补救由 health_check → claude_catchup 重走完整流程负责。"""
+    cache_file = Path(cache_file)
+
+    def save_pending(messages: list) -> None:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump({"ts": datetime.now().isoformat(), "messages": messages},
+                      f, ensure_ascii=False)
+
+    return save_pending
+
+
+def proxy_ok(configured: str | None, session=None) -> tuple[bool, str | None]:
+    """代理预检 + 端口自愈，返回 (是否放行, 此后应使用的代理)。
+
+    - 没配代理 → (True, None)，视为直连放行
+    - 配了且通 → (True, 该代理)
+    - 配了不通但候选端口通 → 就地改写环境变量与 session.proxies，返回 (True, 新代理)
+    - 本地端口均不通但 TUN/直连可达 → 清空环境变量与 session.proxies，返回 (True, None)
+    - 全都不通 → (False, 原配置值)，保留原值是为了让调用方能打进 SKIP_PROXY 的报错里
+
+    session 传 requests.Session 时一并改其 proxies；AI bot 不持有自己的 Session，
+    传 None 即可（抓取侧走 bot_utils 的 requests + feedparser，两者都只认环境变量）。
+
+    ⚠️ 未来若加国内数据源的 bot（如 A 股），不要照抄这个前置闸门：
+    国内接口不需要代理，代理挂了反而会让 bot 误判为"不可用"而整体跳过。"""
+    resolved, switched = resolve_proxy(configured)
+    if resolved is None:
+        return (not configured), configured
+    if switched:
+        if resolved == "":
+            if session is not None:
+                session.proxies = {}
+            for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+                os.environ.pop(k, None)
+            return True, None
+        if session is not None:
+            session.proxies = {"http": resolved, "https": resolved}
+        # feedparser 走 urllib，必须同步环境变量（用赋值而非 setdefault）
+        os.environ["HTTP_PROXY"]  = resolved
+        os.environ["HTTPS_PROXY"] = resolved
+    return True, resolved
+
+
+def emit_fetch_output(lines, save_to=None) -> str:
+    """把 fetch 阶段要给 routine 的全部 stdout 一次性打出去，同时落盘一份。
+
+    起因：fetch 的 context 此前只走 stdout，调用方一旦截断（tail/head）或进程
+    中途断掉，这一轮抓来的素材就没了，只能重打一遍外部 API。落盘之后，写稿失败
+    重写、auto_repair 复现、事后复盘都能直接读文件。
+
+    落盘失败只在 stderr 抱怨一句，绝不影响正常输出——它是附带品，不是主路径。"""
+    payload = "\n".join(str(x) for x in lines)
+    print(payload)
+    if save_to:
+        try:
+            path = Path(save_to)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            path.write_text(f"# fetch 生成于 {stamp}\n{payload}\n", encoding="utf-8")
+        except Exception as e:
+            print(f"  ⚠️ context 落盘失败（不影响本次输出）：{e}", file=sys.stderr)
+    return payload
+
+
+# ───────────────────────────────────────────────
+# 13) 单条稿件 + 原帖闸门的通用 send
+# ───────────────────────────────────────────────
+# x-hotspot-bot 与 ai-builder-bot 的 send 流程本来是两份 ~47 行的复制粘贴，
+# 结构 91% 相同，差异只有措辞。它们各自演化的结果是**闸门实现不一致**：
+# x-hotspot 用 X_POST_RE，builder 用子串 `"x.com/" in u`，后者会把 x.com/home
+# 这类导航页当原帖放行。2026-09-05 合并到这里，闸门统一走 X_POST_RE。
+#
+# 只服务「一条消息 + 必须带原帖直链」这一种形态。crypto/美股/AI 日报是多条消息、
+# 没有原帖闸门，不要硬套过来。
+
+def extract_report_date(report_text: str, default: str | None = None) -> str | None:
+    """从稿件标题/开头提取 YYYY-MM-DD 业务日期（跳过 AI Builder 正文 UTC 范围行）"""
+    if not report_text:
+        return default
+    non_empty = [line.strip() for line in report_text.splitlines() if line.strip()]
+    date_re = re.compile(
+        r"(?P<y1>(?<!\d)\d{4})-(?P<m1>\d{1,2})-(?P<d1>\d{1,2})(?!\d)"
+        r"|(?P<y2>\d{4})年(?P<m2>\d{1,2})月(?P<d2>\d{1,2})日"
+    )
+    for idx, raw_line in enumerate(non_empty[:3]):
+        plain = html.unescape(re.sub(r"<[^>]+>", "", raw_line)).strip()
+        if idx > 0 and plain.startswith("这批推文"):
+            continue
+        for m in date_re.finditer(plain):
+            y = int(m.group("y1") or m.group("y2"))
+            mo = int(m.group("m1") or m.group("m2"))
+            d = int(m.group("d1") or m.group("d2"))
+            try:
+                return datetime(y, mo, d).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    return default
+
+
+def archive_and_sync_notion(
+    report_text: str,
+    source: str,
+    *,
+    date_str: str,
+    archive_dir: Path | None = None,
+    archive_filename: str | None = None,
+    report_type: str = "日报",
+    title_override: str | None = None,
+) -> dict:
+    """落盘本地归档并同步至 Notion 数据库，返回可合入 run.jsonl 的状态指标。"""
+    if archive_dir is not None:
+        try:
+            adir = Path(archive_dir)
+            adir.mkdir(parents=True, exist_ok=True)
+            fname = archive_filename or f"{date_str}.txt"
+            (adir / fname).write_text(report_text, encoding="utf-8")
+        except Exception as e:
+            print(f"  [WARN] 本地归档写入失败: {e}", file=sys.stderr)
+
+    try:
+        from notion_archive import archive_to_notion
+        ok, res = archive_to_notion(
+            report_text,
+            source,
+            date_str=date_str,
+            report_type=report_type,
+            title_override=title_override,
+        )
+        if ok:
+            print(f"  ✓ 已同步归档至 Notion: {res}", file=sys.stderr)
+        else:
+            print(f"  [WARN] Notion 归档未完成: {res}", file=sys.stderr)
+    except Exception as e:
+        ok, res = False, str(e)
+        print(f"  [WARN] Notion 归档调用失败: {e}", file=sys.stderr)
+
+    meta = {
+        "notion_ok": bool(ok),
+        "notion_url": res if ok else "",
+        "notion_date": date_str,
+    }
+    if not ok:
+        meta["notion_err"] = str(res)[:200]
+    return meta
+
+
+def send_x_linked_report(draft_path, *, log_file, cache_file, fetch_meta, sent_urls,
+                         webhook, write_log, save_pending,
+                         link_label: str = "原帖",
+                         date_str: str | None = None) -> int:
+    """读取 Claude 写好的单份稿件 → 原帖闸门 → 推飞书 → 归档去重 → 写日志。
+
+    link_label 只影响日志与 stderr 的措辞（x-hotspot 说「原帖」、builder 说「原推」），
+    不参与任何判定。返回值即进程退出码：0 成功或当天已跑过，1 失败。
+    """
+    t0 = time.time()
+
+    if already_ran_today(log_file):
+        print("今天已成功运行过，跳过发送。如需强制请设置 FORCE_RUN=1。", file=sys.stderr)
+        return 0
+
+    draft_path = Path(draft_path)
+    if not draft_path.exists():
+        write_log("FAIL", f"稿子文件不存在：{draft_path}")
+        return 1
+    report = draft_path.read_text(encoding="utf-8").strip()
+    if not report:
+        write_log("FAIL", f"稿子文件为空：{draft_path}")
+        return 1
+
+    report = sanitize_html(report)
+
+    # 出稿硬约束：一份没有原帖直链的播报等于二手转述，宁可不发也不发一份只有
+    # 转述的。这条闸门是这两个 bot 存在的理由，别为了"至少发出去"而放宽。
+    hrefs = extract_hrefs(report)
+    x_links = [u for u in hrefs if X_POST_RE.search(u)]
+    if not x_links:
+        write_log("FAIL",
+                  f"稿件里没有任何 x.com {link_label}链接，拒绝发送（见 prompt.md 的硬性要求）")
+        return 1
+
+    save_pending([report])
+    print("📨 推送到飞书...", file=sys.stderr)
+    sent = send_feishu(report, webhook)
+    print(f"  ✓ 推送成功（{sent} 条）", file=sys.stderr)
+    Path(cache_file).unlink(missing_ok=True)
+
+    try:
+        meta = json.loads(Path(fetch_meta).read_text(encoding="utf-8"))
+    except Exception:
+        meta = {"log_summary": "", "metrics": {}}
+
+    doc_date = (
+        date_str
+        or extract_report_date(report)
+        or meta.get("fetch_date")
+        or datetime.now().strftime("%Y-%m-%d")
+    )
+
+    # 自动同步归档到 Notion「每日情报归档与决策看板」数据库，并保留本地日期归档
+    source_name = "🐦 X 热点播报" if link_label == "原帖" else "🛠️ AI Builder"
+    notion_meta = archive_and_sync_notion(
+        report,
+        source_name,
+        date_str=doc_date,
+        archive_dir=draft_path.parent / "archive",
+        archive_filename=f"{doc_date}.txt",
+    )
+    notion_tag = " | Notion ✓" if notion_meta.get("notion_ok") else " | Notion ⚠️"
+
+    # 把 x.com 原帖以及 fetch_meta 记录的主源期刊链接（issue_urls，如 AINews 期次 URL）
+    # 一并记入去重档案，确保同一期 AINews 不会被跨天重复播报。
+    issue_urls = meta.get("metrics", {}).get("issue_urls", []) or []
+    total = record_sent_urls(sent_urls, x_links + list(issue_urls))
+    record_daily_ledger(source_name, report, hrefs, date_str=doc_date)
+    print(f"  ✓ 已归档 {len(x_links)} 条{link_label}链接"
+          f"{f' + {len(issue_urls)} 条期刊链接' if issue_urls else ''}用于跨天去重（档案共 {total} 条）",
+          file=sys.stderr)
+    duration = round(time.time() - t0, 1)
+    write_log("OK",
+              f"AI写稿 → {meta.get('log_summary', '')} → 飞书推送成功"
+              f"（{sent} 条 / {len(report)}字 / {len(x_links)} 条{link_label}）{notion_tag}",
+              metrics={**meta.get("metrics", {}), **notion_meta, "ai_calls": 0,
+                       "duration_s": duration, "report_chars": len(report),
+                       "x_links": len(x_links), "source": "antigravity"})
+    return 0
+
+
+# ───────────────────────────────────────────────
+# 14) 跨 Bot 当日去重账本 (daily_topic_ledger.json)
+# ───────────────────────────────────────────────
+# 服务于 09:00 三合一串行流水线（1. AI 产业日报 → 2. X 热点播报 → 3. AI Builder）
+# 及 09:30（4. GitHub Trending & Hacker News）：
+# 前序 Bot 在 send / archive-only 成功后将当日已播标题、外链 URL、x.com status ID
+# 写入 shared/logs/daily_topic_ledger.json；后序 Bot 在 fetch 阶段自动读取，
+# 实现 URL/推文级硬过滤与标题级上下文提醒。
+
+DAILY_LEDGER_FILE = Path(__file__).resolve().parent / "logs" / "daily_topic_ledger.json"
+DAILY_LEDGER_KEEP_DAYS = 7
+
+
+def extract_report_headlines(report_text: str) -> list[str]:
+    """从 HTML 稿件中提取各条目的小标题，供跨 Bot 账本展示今日已播话题。"""
+    if not report_text:
+        return []
+    headlines: list[str] = []
+    skip_prefixes = (
+        "📋", "🔥", "🛠", "🛠️", "🚀", "⚡", "📎", "素材", "数据来源",
+        "一、", "二、", "今日", "本周",
+    )
+    for raw_line in report_text.splitlines():
+        line = raw_line.strip()
+        if not line or "<b>" not in line:
+            continue
+        if line.startswith(("原推：", "原帖：", "长文：", "- ", "• ")):
+            continue
+        plain = html.unescape(re.sub(r"<[^>]+>", "", line)).strip()
+        if not plain or len(plain) > 90:
+            continue
+        if any(plain.startswith(p) for p in skip_prefixes):
+            continue
+        if re.match(r"^\d+\.\s+\S+", plain) or ("<a href=" in line and "<b>" in line):
+            headlines.append(plain)
+    return headlines
+
+
+def record_daily_ledger(
+    bot_name: str,
+    report_text: str,
+    urls: list[str] | None = None,
+    *,
+    date_str: str | None = None,
+    ledger_path: Path = DAILY_LEDGER_FILE,
+) -> None:
+    """将某 Bot 当日已发布/归档的稿件条目与 URL 记入共享当日账本。"""
+    try:
+        doc_date = (
+            date_str
+            or extract_report_date(report_text)
+            or datetime.now().strftime("%Y-%m-%d")
+        )
+        all_hrefs = list(extract_hrefs(report_text)) + list(urls or [])
+        norm_urls: set[str] = set()
+        x_ids: set[str] = set()
+        for u in all_hrefs:
+            k = url_key(u)
+            if k:
+                norm_urls.add(k)
+            m = X_POST_RE.search(u or "")
+            if m:
+                x_ids.add(m.group(2))
+
+        headlines = extract_report_headlines(report_text)
+
+        data: dict = {}
+        if ledger_path.exists():
+            try:
+                raw = json.loads(ledger_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    data = raw
+            except Exception:
+                data = {}
+
+        cutoff = _days_ago_str(DAILY_LEDGER_KEEP_DAYS)
+        data = {d: v for d, v in data.items() if isinstance(d, str) and d >= cutoff and isinstance(v, dict)}
+
+        day_bucket = data.setdefault(doc_date, {})
+        day_bucket[bot_name] = {
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "headlines": headlines,
+            "urls": sorted(norm_urls),
+            "x_status_ids": sorted(x_ids),
+        }
+
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"  [WARN] 写入跨 Bot 账本失败（不影响主流程）: {e}", file=sys.stderr)
+
+
+def load_daily_ledger(
+    date_str: str | None = None,
+    *,
+    exclude_bot: str | None = None,
+    ledger_path: Path = DAILY_LEDGER_FILE,
+) -> dict:
+    """读取指定日期（默认今天或 REPORT_DATE）前序 Bot 已播出的 URL 集合、X status ID 集合与标题明细。"""
+    doc_date = date_str or os.getenv("REPORT_DATE") or datetime.now().strftime("%Y-%m-%d")
+    empty = {"date": doc_date, "urls": set(), "x_status_ids": set(), "entries": []}
+    if not ledger_path.exists():
+        return empty
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except Exception:
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    day_bucket = data.get(doc_date)
+    if not isinstance(day_bucket, dict):
+        return empty
+
+    urls: set[str] = set()
+    x_ids: set[str] = set()
+    entries: list[dict] = []
+    for bot_name, info in day_bucket.items():
+        if exclude_bot and bot_name == exclude_bot:
+            continue
+        if not isinstance(info, dict):
+            continue
+        b_urls = [u for u in (info.get("urls") or []) if isinstance(u, str)]
+        b_xids = [x for x in (info.get("x_status_ids") or []) if isinstance(x, str)]
+        b_heads = [h for h in (info.get("headlines") or []) if isinstance(h, str)]
+        urls.update(b_urls)
+        x_ids.update(b_xids)
+        entries.append({
+            "bot": bot_name,
+            "ts": info.get("ts", ""),
+            "headlines": b_heads,
+            "urls": b_urls,
+            "x_status_ids": b_xids,
+        })
+    return {"date": doc_date, "urls": urls, "x_status_ids": x_ids, "entries": entries}
+
+
+def format_ledger_context(
+    date_str: str | None = None,
+    *,
+    exclude_bot: str | None = None,
+    ledger_path: Path = DAILY_LEDGER_FILE,
+) -> str:
+    """生成注入到后序 Bot last_context.txt 顶部的前序已播清单。"""
+    ledger = load_daily_ledger(date_str=date_str, exclude_bot=exclude_bot, ledger_path=ledger_path)
+    entries = ledger.get("entries") or []
+    if not entries:
+        return ""
+    lines = [
+        "=== TODAY_LEDGER_BEGIN ===",
+        f"【今日（{ledger['date']}）前序 Bot 已播账本 —— 写稿时请主动去重】",
+        "说明：以下话题与链接已由今日前序 Bot 播报。若本轮素材出现同一事件：",
+        "1) 若无新的核心技术增量或社区正反方交锋，请直接跳过，优先选用其他未播素材；",
+        "2) 若确有本板块独有视角（如 X 热点的正反方吵架、Builder 本人深度长文拆解），只写独有增量，绝不重复复述前序已播的通稿背景。",
+    ]
+    for item in entries:
+        heads = item.get("headlines") or []
+        head_str = " ； ".join(heads) if heads else "（无标题明细）"
+        lines.append(f"- [{item['bot']}] 已播 {len(heads)} 条：{head_str}")
+    lines.append("=== TODAY_LEDGER_END ===")
+    return "\n".join(lines)
+
+
+# ───────────────────────────────────────────────
+# 15) Exa 定向补盲层（Exa Agent 结构化归因 + 轻量 Search/Contents）
+# ───────────────────────────────────────────────
+# 设计原则：
+# - 零新增依赖：全部基于 requests 直调 https://api.exa.ai REST 接口；
+# - 成本护栏：强制限制在固定档位 (minimal / low / medium / high)，默认 medium，
+#   严禁在定时 Bot 中放行 auto / ultra（防止 $5-$20 失控账单）；
+# - 防幻觉护栏：Exa Agent 的 outputSchema 强制采用 verified/absent/cannot_verify
+#   三态枚举 + 可空字段，只向 last_context.txt 注入 confirmed 的真实催化；
+# - 平滑降级：超时/网络异常/额度异常全部只打 stderr 告警并回退空结果，绝不阻断发稿。
+
+EXA_API_BASE = "https://api.exa.ai"
+EXA_ALLOWED_EFFORTS = ("minimal", "low", "medium", "high")
+_EXA_DEFAULT_EFFORT = "medium"
+_EXA_MCP_CONFIG_PATH = Path.home() / ".gemini" / "config" / "mcp_config.json"
+
+
+def get_exa_api_key() -> str:
+    """获取 Exa API Key：优先读环境变量 EXA_API_KEY，本地调试时回退读 mcp_config.json。"""
+    key = (os.getenv("EXA_API_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        if _EXA_MCP_CONFIG_PATH.exists():
+            cfg = json.loads(_EXA_MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+            exa = (cfg.get("mcpServers") or {}).get("exa") or {}
+            hdr_key = ((exa.get("headers") or {}).get("x-api-key") or "").strip()
+            if hdr_key:
+                return hdr_key
+            raw_url = exa.get("serverUrl") or exa.get("url") or ""
+            m = re.search(r"[?&]exaApiKey=([^&]+)", raw_url)
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def exa_enrich_enabled(default_enabled: bool = True) -> bool:
+    """判断当前运行是否启用 Exa 定向补盲（需同时满足开关开启且存在 API Key）。"""
+    flag = os.getenv("ENABLE_EXA_ENRICH")
+    if flag is not None:
+        if flag.strip().lower() in ("0", "false", "no", "off", ""):
+            return False
+    elif not default_enabled:
+        return False
+    return bool(get_exa_api_key())
+
+
+def _normalize_exa_effort(effort: str | None = None) -> str:
+    """将 effort 收敛到固定预算档位，禁止定时脚本误用 auto/ultra。"""
+    raw = (effort or os.getenv("EXA_AGENT_EFFORT") or _EXA_DEFAULT_EFFORT).strip().lower()
+    if raw in EXA_ALLOWED_EFFORTS:
+        return raw
+    print(
+        f"[bot_utils] Exa effort={raw!r} 不在安全固定档位 {EXA_ALLOWED_EFFORTS} 内，回退为 {_EXA_DEFAULT_EFFORT}",
+        file=sys.stderr,
+    )
+    return _EXA_DEFAULT_EFFORT
+
+
+def _build_session_for_proxy(proxy_url: str | None) -> requests.Session:
+    """按指定代理构建独立 Session（不继承环境变量残留，避免污染连接池）。"""
+    s = requests.Session()
+    s.trust_env = False
+    if proxy_url:
+        s.proxies = {"http": proxy_url, "https": proxy_url}
+    else:
+        s.proxies = {}
+    return s
+
+
+def _resolve_exa_proxy_candidates() -> list[str | None]:
+    """返回访问海外 api.exa.ai 的候选链路列表（按优先级排序：优先可用代理，次选直连互备）。
+
+    背景：macOS 系统 Python 3.9（LibreSSL 2.8.3）在国内直连 Cloudflare/api.exa.ai 时易遇
+    SSLEOFError(8, EOF occurred in violation of protocol)；优先走稳定本地代理并在 SSL/连接异常时
+    自动切换备选链路重试，可根治单次握手抖动导致的补盲丢失。"""
+    candidates: list[str | None] = []
+    configured = (os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
+    if configured:
+        resolved, _ = resolve_proxy(configured, timeout=4)
+        if resolved:
+            candidates.append(resolved)
+        candidates.append(None)
+    else:
+        # 未配置代理环境变量（如 cn_hk_report.py）时：优先探测本地候选代理（1082 → 12450），
+        # 命中即走代理为主、直连兜底；未命中再尝试直连。
+        resolved, _ = resolve_proxy("http://127.0.0.1:1082", timeout=4)
+        if resolved:
+            candidates.append(resolved)
+            candidates.append(None)
+        else:
+            candidates.append(None)
+
+    dedup: list[str | None] = []
+    for c in candidates:
+        if c not in dedup:
+            dedup.append(c)
+    return dedup
+
+
+def _make_exa_session() -> requests.Session:
+    """构建面向海外 api.exa.ai 的默认 Session（优先走可用本地代理，回退直连）。"""
+    cands = _resolve_exa_proxy_candidates()
+    return _build_session_for_proxy(cands[0] if cands else None)
+
+
+def _exa_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "x-api-key": api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _exa_request(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    json_body: dict | None = None,
+    timeout: int = 25,
+    session: requests.Session | None = None,
+    retries: int = 2,
+    op_name: str = "Exa",
+) -> requests.Response | None:
+    """统一执行 Exa HTTP 请求：自动处理 SSLEOFError / 网络抖动重试与代理↔直连互切，
+    并对 401/402/400/429 给出明确分类告警（非可恢复错误不盲目重试）。"""
+    if session is not None:
+        proxy_cands: list[str | None] = [
+            session.proxies.get("https") or session.proxies.get("http") or None
+        ]
+        # 若调用方传入的是固定 Session，仍追加另一条链路作为 SSL/连接故障兜底
+        fallback = None if proxy_cands[0] else (
+            resolve_proxy("http://127.0.0.1:1082", timeout=3)[0] or None
+        )
+        if fallback != proxy_cands[0]:
+            proxy_cands.append(fallback)
+    else:
+        proxy_cands = _resolve_exa_proxy_candidates()
+
+    cur_idx = 0
+    cur_sess = session if session is not None else _build_session_for_proxy(proxy_cands[0])
+    owned_sess = session is None
+    last_exc: Exception | None = None
+
+    try:
+        for attempt in range(retries + 1):
+            try:
+                resp = cur_sess.request(
+                    method,
+                    url,
+                    headers=headers,
+                    json=json_body,
+                    timeout=timeout,
+                )
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                last_exc = exc
+                if attempt < retries:
+                    # 发生 SSL/连接异常时重建干净 Session，并在代理与直连间切换一次
+                    if owned_sess:
+                        try:
+                            cur_sess.close()
+                        except Exception:
+                            pass
+                    cur_idx = (cur_idx + 1) % len(proxy_cands)
+                    cur_sess = _build_session_for_proxy(proxy_cands[cur_idx])
+                    owned_sess = True
+                    wait_s = 1.5 * (attempt + 1)
+                    via = proxy_cands[cur_idx] or "直连"
+                    print(
+                        f"[WARN] {op_name} 第 {attempt + 1} 次连接异常 ({type(exc).__name__})，"
+                        f"{wait_s:.1f}s 后切至 {via} 重试...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait_s)
+                    continue
+                print(f"[WARN] {op_name} 请求失败（已重试 {retries} 次）: {exc}", file=sys.stderr)
+                return None
+            except Exception as exc:
+                print(f"[WARN] {op_name} 请求异常: {exc}", file=sys.stderr)
+                return None
+
+            code = resp.status_code
+            if 200 <= code < 300:
+                return resp
+            if code in (401, 403):
+                print(
+                    f"[ERR] {op_name} 鉴权失败 (HTTP {code})：请检查 EXA_API_KEY 是否有效 — {resp.text[:180]}",
+                    file=sys.stderr,
+                )
+                return None
+            if code == 402:
+                print(
+                    f"[ERR] {op_name} 额度/余额不足 (HTTP 402)：请检查 Exa 账户余额 — {resp.text[:180]}",
+                    file=sys.stderr,
+                )
+                return None
+            if code == 400:
+                print(
+                    f"[WARN] {op_name} 参数或 Schema 校验失败 (HTTP 400): {resp.text[:240]}",
+                    file=sys.stderr,
+                )
+                return None
+            if code in (429, 500, 502, 503, 504):
+                if attempt < retries:
+                    wait_s = 2.0 * (attempt + 1)
+                    print(
+                        f"[WARN] {op_name} 服务端限流/临时错误 (HTTP {code})，{wait_s:.1f}s 后重试...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait_s)
+                    continue
+                print(
+                    f"[WARN] {op_name} 服务端错误 (HTTP {code}，已重试 {retries} 次): {resp.text[:180]}",
+                    file=sys.stderr,
+                )
+                return None
+
+            print(f"[WARN] {op_name} 返回异常状态 (HTTP {code}): {resp.text[:180]}", file=sys.stderr)
+            return None
+
+        if last_exc:
+            print(f"[WARN] {op_name} 最终失败: {last_exc}", file=sys.stderr)
+        return None
+    finally:
+        if owned_sess and cur_sess is not None:
+            try:
+                cur_sess.close()
+            except Exception:
+                pass
+
+
+def exa_fetch_contents(
+    urls: list[str],
+    *,
+    max_chars: int = 1600,
+    timeout: int = 25,
+    session: requests.Session | None = None,
+) -> dict[str, str]:
+    """批量调用 Exa /contents 补全抓不到正文的 URL（如短摘要/反爬页）。
+
+    返回 {url_key(url): 正文文本}，任意异常返回 {}，不中断主流程。"""
+    api_key = get_exa_api_key()
+    clean_urls = [u.strip() for u in (urls or []) if isinstance(u, str) and u.strip().startswith("http")]
+    clean_urls = list(dict.fromkeys(clean_urls))
+    if not api_key or not clean_urls:
+        return {}
+
+    payload = {
+        "urls": clean_urls,
+        "text": {"maxCharacters": int(max_chars)},
+    }
+    resp = _exa_request(
+        "POST",
+        f"{EXA_API_BASE}/contents",
+        headers=_exa_headers(api_key),
+        json_body=payload,
+        timeout=timeout,
+        session=session,
+        retries=2,
+        op_name="Exa /contents",
+    )
+    if resp is None:
+        return {}
+    try:
+        data = resp.json() or {}
+    except Exception as exc:
+        print(f"[WARN] Exa /contents JSON 解析失败: {exc}", file=sys.stderr)
+        return {}
+
+    out: dict[str, str] = {}
+    for row in (data.get("results") or []):
+        if not isinstance(row, dict):
+            continue
+        raw_url = (row.get("url") or row.get("id") or "").strip()
+        txt = _ARTICLE_WS_RE.sub(" ", (row.get("text") or "").strip())
+        if raw_url and len(txt) >= 120:
+            out[url_key(raw_url)] = txt[:max_chars]
+    return out
+
+
+def exa_search_fallback(
+    query: str,
+    *,
+    num_results: int = 3,
+    max_chars: int = 1000,
+    category: str | None = None,
+    start_published_date: str | None = None,
+    include_domains: list[str] | None = None,
+    timeout: int = 20,
+    session: requests.Session | None = None,
+) -> list[dict]:
+    """轻量调用 Exa /search（含正文摘录），用于补齐付费墙短摘要、财报/公告原文或缺失的当日宏观日程结果。
+
+    支持可选 category（如 Exa Financial Markets 的 'financial report' 或 'news'）。"""
+    api_key = get_exa_api_key()
+    q = (query or "").strip()
+    if not api_key or not q:
+        return []
+
+    payload: dict = {
+        "query": q,
+        "numResults": max(1, min(int(num_results), 5)),
+        "type": "auto",
+        "contents": {"text": {"maxCharacters": int(max_chars)}},
+    }
+    if category:
+        payload["category"] = str(category).strip()
+    if start_published_date:
+        payload["startPublishedDate"] = start_published_date
+    if include_domains:
+        payload["includeDomains"] = list(include_domains)
+
+    op = f"Exa /search[{category}]" if category else "Exa /search"
+    resp = _exa_request(
+        "POST",
+        f"{EXA_API_BASE}/search",
+        headers=_exa_headers(api_key),
+        json_body=payload,
+        timeout=timeout,
+        session=session,
+        retries=2,
+        op_name=f"{op}({q[:32]})",
+    )
+    if resp is None:
+        return []
+    try:
+        data = resp.json() or {}
+    except Exception as exc:
+        print(f"[WARN] {op} JSON 解析失败 ({q[:40]}): {exc}", file=sys.stderr)
+        return []
+
+    results: list[dict] = []
+    for row in (data.get("results") or []):
+        if not isinstance(row, dict):
+            continue
+        txt = _ARTICLE_WS_RE.sub(" ", (row.get("text") or "").strip())
+        title = (row.get("title") or "").strip()
+        url = (row.get("url") or "").strip()
+        if txt or title:
+            results.append({
+                "title": title,
+                "url": url,
+                "published_date": (row.get("publishedDate") or "").strip(),
+                "text": txt[:max_chars],
+            })
+    return results
+
+
+def _build_catalyst_output_schema(max_items: int) -> dict:
+    """构建带三态 verdict 与可空字段的防幻觉 JSON Schema（遵循 Exa Agent 官方验证规范）。"""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "maxItems": max(1, int(max_items)),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["symbol", "name", "verdict"],
+                    "properties": {
+                        "symbol": {"type": "string"},
+                        "name": {"type": "string"},
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["confirmed", "absent", "cannot_verify"],
+                        },
+                        "catalyst_type": {
+                            "type": ["string", "null"],
+                            "enum": [
+                                "earnings",
+                                "guidance",
+                                "rating",
+                                "m_and_a",
+                                "regulation",
+                                "product_or_deal",
+                                "filing_or_offering",
+                                "macro_or_sector",
+                                "other",
+                                None,
+                            ],
+                        },
+                        "catalyst_summary": {
+                            "type": ["string", "null"],
+                            "maxLength": 280,
+                        },
+                        "source_title": {"type": ["string", "null"]},
+                        "source_url": {"type": ["string", "null"]},
+                    },
+                },
+            }
+        },
+    }
+
+
+def exa_agent_verify_catalysts(
+    entities: list[dict],
+    *,
+    market_label: str,
+    session_date: str,
+    effort: str | None = None,
+    max_entities: int = 6,
+    timeout_sec: int = 180,
+    poll_interval: float = 3.0,
+    session: requests.Session | None = None,
+) -> list[dict]:
+    """调用 Exa Agent 批量核查无新闻覆盖的异动股真实催化，仅返回 verdict == 'confirmed' 的条目。
+
+    entities 每项建议含: {"symbol": "...", "name": "...", "pct_change": "...", "sector": "..."}。
+    超时或接口错误时静默降级返回 []，绝不阻断 fetch 主流程。
+    """
+    api_key = get_exa_api_key()
+    batch = [e for e in (entities or []) if isinstance(e, dict) and (e.get("symbol") or e.get("name"))][:max_entities]
+    if not api_key or not batch:
+        return []
+
+    eff = _normalize_exa_effort(effort)
+    headers = _exa_headers(api_key)
+
+    entity_desc = ", ".join(
+        f"{e.get('name', '')}({e.get('symbol', '')} {e.get('pct_change', '')})"
+        for e in batch
+    )
+    query = (
+        f"Verify whether there is a concrete, verifiable news catalyst explaining the stock price movement "
+        f"for each listed company in input.data around trading date {session_date} ({market_label}, within +/- 36 hours). "
+        f"Companies to check: {entity_desc}. "
+        f"Prioritize authoritative financial reports, earnings releases & earnings call transcripts, "
+        f"SEC/HKEX/exchange filings (8-K/6-K/10-Q), guidance revisions, analyst upgrades/downgrades or price target changes, "
+        f"M&A/divestitures, share offerings/buybacks, regulatory/legal actions, major contracts/product launches, "
+        f"or direct commodity/macro shocks affecting the specific company."
+    )
+    system_prompt = (
+        "You are a strict financial fact-verification agent. Evaluate ONLY the companies in input.data "
+        f"for news published around {session_date} (within 36 hours). "
+        "Use verdict='confirmed' ONLY when an authoritative financial news report, exchange filing (SEC/HKEX/SSE/SZSE), "
+        "earnings release or earnings call transcript, or broker research report directly explains the stock's move, "
+        "and write catalyst_summary in concise Simplified Chinese (<= 110 Chinese characters) including concrete "
+        "numbers/dates/entities from the source. "
+        "Use verdict='absent' when you checked recent financial news and filings and found no company-specific catalyst "
+        "(e.g., pure broad-market or sector rotation). "
+        "Use verdict='cannot_verify' when sources are inaccessible or inconclusive. "
+        "NEVER fabricate numbers, rumors, or outdated news from prior weeks. Leave optional fields null when verdict != 'confirmed'."
+    )
+
+    payload = {
+        "query": query,
+        "systemPrompt": system_prompt,
+        "effort": eff,
+        "input": {"data": batch},
+        "outputSchema": _build_catalyst_output_schema(len(batch)),
+    }
+
+    create_resp = _exa_request(
+        "POST",
+        f"{EXA_API_BASE}/agent/runs",
+        headers=headers,
+        json_body=payload,
+        timeout=30,
+        session=session,
+        retries=2,
+        op_name="Exa Agent 创建任务",
+    )
+    if create_resp is None:
+        return []
+    try:
+        run_obj = create_resp.json() or {}
+    except Exception as exc:
+        print(f"[WARN] Exa Agent 创建响应 JSON 解析失败: {exc}", file=sys.stderr)
+        return []
+
+    run_id = run_obj.get("id")
+    status = run_obj.get("status")
+    if not run_id:
+        print(f"[WARN] Exa Agent 未返回 run id: {str(run_obj)[:200]}", file=sys.stderr)
+        return []
+
+    print(
+        f"  🤖 Exa Agent 已启动 (id={run_id}, effort={eff}, 标的={len(batch)} 只)...",
+        file=sys.stderr,
+    )
+
+    deadline = time.monotonic() + max(20, int(timeout_sec))
+    consecutive_poll_errs = 0
+    while status not in ("completed", "failed", "cancelled"):
+        if time.monotonic() >= deadline:
+            print(f"[WARN] Exa Agent 轮询超时 ({timeout_sec}s, id={run_id})，平滑降级跳过", file=sys.stderr)
+            return []
+        time.sleep(poll_interval)
+        poll_resp = _exa_request(
+            "GET",
+            f"{EXA_API_BASE}/agent/runs/{run_id}",
+            headers=headers,
+            timeout=20,
+            session=session,
+            retries=1,
+            op_name=f"Exa Agent 轮询({run_id[:8]})",
+        )
+        if poll_resp is None:
+            consecutive_poll_errs += 1
+            if consecutive_poll_errs >= 3:
+                print(f"[WARN] Exa Agent 连续 3 次轮询失败 (id={run_id})，平滑降级跳过", file=sys.stderr)
+                return []
+            continue
+        try:
+            run_obj = poll_resp.json() or {}
+            status = run_obj.get("status")
+            consecutive_poll_errs = 0
+        except Exception as exc:
+            consecutive_poll_errs += 1
+            print(f"[WARN] Exa Agent 轮询 JSON 解析异常 (id={run_id}): {exc}", file=sys.stderr)
+            if consecutive_poll_errs >= 3:
+                return []
+
+    cost = run_obj.get("costDollars")
+    cost_str = ""
+    if isinstance(cost, dict) and cost.get("total") is not None:
+        cost_str = f", cost=${cost['total']}"
+    elif isinstance(cost, (int, float)):
+        cost_str = f", cost=${cost:.4f}"
+
+    if status != "completed":
+        err = run_obj.get("error") or {}
+        print(f"[WARN] Exa Agent 未完成 (status={status}{cost_str}): {err}", file=sys.stderr)
+        return []
+
+    output = run_obj.get("output") or {}
+    structured = output.get("structured") or {}
+    raw_items = structured.get("items") if isinstance(structured, dict) else []
+    if not isinstance(raw_items, list):
+        return []
+
+    meta_by_sym = {
+        str(e.get("symbol") or "").upper(): e for e in batch if e.get("symbol")
+    }
+    confirmed: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("verdict") != "confirmed":
+            continue
+        summary = _ARTICLE_WS_RE.sub(" ", str(item.get("catalyst_summary") or "").strip())
+        if len(summary) < 8:
+            continue
+        sym = str(item.get("symbol") or "").strip()
+        orig = meta_by_sym.get(sym.upper(), {})
+        confirmed.append({
+            "symbol": sym or orig.get("symbol", ""),
+            "name": str(item.get("name") or orig.get("name") or "").strip(),
+            "pct_change": str(orig.get("pct_change") or "").strip(),
+            "sector": str(orig.get("sector") or "").strip(),
+            "catalyst_type": str(item.get("catalyst_type") or "other").strip(),
+            "catalyst_summary": summary,
+            "source_title": str(item.get("source_title") or "").strip(),
+            "source_url": str(item.get("source_url") or "").strip(),
+        })
+
+    print(
+        f"  ✓ Exa Agent 核查完成 (id={run_id}{cost_str})：核查 {len(batch)} 只 → 确认真实催化 {len(confirmed)} 只",
+        file=sys.stderr,
+    )
+    return confirmed
+
+
+_CATALYST_TYPE_CN = {
+    "earnings": "财报业绩",
+    "guidance": "业绩指引",
+    "rating": "评级/目标价",
+    "m_and_a": "并购/剥离",
+    "regulation": "监管/诉讼",
+    "product_or_deal": "产品/订单",
+    "filing_or_offering": "公告/增发回购",
+    "macro_or_sector": "宏观/大宗催化",
+    "other": "公司动态",
+}
+
+
+def format_exa_catalyst_block(
+    items: list[dict],
+    title: str = "【🔍 Exa Agent 异动个股定向催化核查（仅保留经交叉验证的真实催化）】",
+) -> str:
+    """将 Exa Agent 核实后的异动催化格式化为可注入 last_context.txt 的文本块。"""
+    if not items:
+        return ""
+    lines = [
+        title,
+        "（写稿说明：以下条目由 Exa Agent 定向交叉核实并确认，可直接作为对应板块与焦点异动股的催化归因；未列于此且 RSS/电报亦无提及的个股，继续按规范写「未见明确催化」。）",
+    ]
+    for it in items:
+        sym = it.get("symbol", "")
+        name = it.get("name", "")
+        pct = it.get("pct_change", "")
+        ctype = _CATALYST_TYPE_CN.get(it.get("catalyst_type", ""), "公司动态")
+        summary = it.get("catalyst_summary", "")
+        src_title = it.get("source_title", "")
+        src_url = it.get("source_url", "")
+        head = f"{name}({sym} {pct})" if pct else f"{name}({sym})"
+        src_part = ""
+        if src_title and src_url:
+            src_part = f" [来源: {src_title} | {src_url}]"
+        elif src_url:
+            src_part = f" [来源: {src_url}]"
+        elif src_title:
+            src_part = f" [来源: {src_title}]"
+        lines.append(f"· {head} [{ctype}]：{summary}{src_part}")
+    return "\n".join(lines)

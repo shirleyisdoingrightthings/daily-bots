@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Syntax check all Python modules
+        run: |
+          python3 -m py_compile \
+            shared/bot_utils.py \
+            shared/notion_archive.py \
+            shared/notion_reconcile.py \
+            "AI Daily News Bot/daily_report.py" \
+            x-hotspot-bot/sources.py \
+            x-hotspot-bot/x_report.py \
+            ai-builder-bot/builder_report.py \
+            github-hn-bot/sources.py \
+            github-hn-bot/github_hn_report.py \
+            "us stock bot/stock_report.py" \
+            cn-hk-stock-bot/cn_hk_report.py
+
+      - name: Syntax check all shell scripts
+        run: |
+          for f in shared/*.sh */claude_report.sh */health_check.sh */auto_repair.sh; do
+            bash -n "$f"
+          done
+
+      - name: Run offline unit tests
+        run: python3 -m unittest discover -s shared/tests -v

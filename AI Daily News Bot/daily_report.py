@@ -1,0 +1,552 @@
+#!/usr/bin/python3
+"""
+AI 产业日报
+从多个 RSS 源抓取新闻（best-effort 抓正文全文，失败回退 RSS 摘要），
+由 AI 定时任务写稿后推送到飞书。本脚本只负责抓取与推送，不含写稿用的第三方大模型 API。
+
+两种运行模式（--mode，均零 API 成本）：
+- fetch：抓取 + 抓正文 → 把新闻 context 打到 stdout（并落盘 logs/last_context.txt）
+- send ：读取写好的稿子文件 → 清洗 HTML → 推送飞书 + 同步 Notion + 写日志
+
+注：每日（含周日）统一输出当日客观新闻日报；写稿规范存放于同目录 prompt.md。
+"""
+
+import os
+import re
+import sys
+import html
+import time
+import json
+import argparse
+import traceback
+import requests
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# 共享工具库
+# 从脚本自身位置推导共享层（bot 目录的同级 shared/），
+# 这样整个 bots 文件夹搬到任何位置都不用改路径
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
+from bot_utils import (sanitize_html, fetch_rss, parse_entry_date,
+                       already_ran_today, fetch_article_text,
+                       url_key, load_sent_urls, record_sent_urls, extract_hrefs,
+                       extract_report_date, archive_and_sync_notion,
+                       send_feishu, update_zero_streak,
+                       make_logger, make_pending_saver, proxy_ok,
+                       emit_fetch_output, record_daily_ledger)
+
+LOG_FILE    = Path(__file__).parent / "logs" / "run.log"
+JSONL_FILE  = Path(__file__).parent / "logs" / "run.jsonl"
+LOG_FILE.parent.mkdir(exist_ok=True)
+CACHE_FILE  = Path(__file__).parent / "pending_messages.json"
+# Claude routine 把写好的稿子存到这里，再用 --mode send 发送
+DRAFT_FILE  = Path(__file__).parent / "logs" / "report_draft.txt"
+# fetch 模式写出、send 模式读回的边车：承载 OK 日志摘要与 health_check 所需 metrics
+FETCH_META  = Path(__file__).parent / "logs" / "fetch_meta.json"
+# fetch 抓来的完整 stdout（marker + context）落盘一份：调用方截断、进程中断、
+# 或写稿失败要重来时，不必再打一遍外部 API。每次 fetch 覆盖写，只留最近一次。
+LAST_CONTEXT = Path(__file__).parent / "logs" / "last_context.txt"
+# 跨天去重档案：send 成功后记录稿件里实际用到的链接，fetch 时据此排除
+SENT_URLS   = Path(__file__).parent / "logs" / "sent_urls.json"
+# RSS 源连续零产计数（fetch 阶段唯一写入，health_check 只读）
+ZERO_STREAK = Path(__file__).parent / "logs" / ".zero_streak.json"
+# 连续零产多少天就判定该源可以移除
+ZERO_STREAK_THRESHOLD = 3
+# 默认时效窗口（小时）。个别发文节奏慢的源可在 RSS_SOURCES 里单独放宽，
+# 上限受 sent_urls 的 7 天保留期约束——超过 7 天的窗口会让旧条目重新入选。
+DEFAULT_WINDOW_H = 24
+
+# ===== P0: 显式代理配置 =====
+_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+# 抓取一律走 bot_utils 里的 requests（trust_env 默认开），feedparser 内部用 urllib，
+# 两者都只认环境变量，所以代理在这里注入即可。
+# 本脚本不再持有自己的 Session：改用飞书后推送不经代理，由 bot_utils 的专用直连
+# Session 负责（见 bot_utils 第 9 节）。
+os.environ.setdefault("HTTP_PROXY",  _PROXY or "")
+os.environ.setdefault("HTTPS_PROXY", _PROXY or "")
+
+
+# ===== P1: 结构化日志（实现见 shared/bot_utils.make_logger）=====
+write_log = make_logger(LOG_FILE, JSONL_FILE)
+
+
+
+# ===== 配置（优先读取环境变量）=====
+# 飞书自定义机器人：webhook 地址在群「设置 → 群机器人 → 添加机器人 → 自定义机器人」
+# 里取得。
+FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
+
+# (feed_url, limit, is_general[, window_h])
+# is_general=True 表示这是泛科技源而非 AI 垂直源，条目要过 is_ai_relevant 闸门。
+# 垂直源不过闸，避免误伤标题里不含关键词的正当 AI 选题。
+# window_h 可选，缺省用 DEFAULT_WINDOW_H；只给发文慢的源单独放宽。
+RSS_SOURCES = [
+    ("https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",    5, False),
+    ("https://techcrunch.com/category/artificial-intelligence/feed/",        5, False),
+    ("https://www.wired.com/feed/tag/ai/latest/rss",                         3, False),
+    # 2026-11-06：移除 SemiAnalysis（newsletter.semianalysis.com/feed）。
+    # 原因：它是 Substack 周更深度长文，放入日更产业日报会导致发稿次日起连续 4-6 天零产并反复触发告警。
+    ("https://the-decoder.com/feed/",                                        3, False),
+    ("https://arstechnica.com/ai/feed/",                                     4, False),
+    # 2026-08-06：移除全部厂商官方博客（openai.com/blog、blog.google/technology/ai，
+    # 更早还有 deepmind.google）。这类源发文稀疏、软文占比高，长期零产；真正重要的
+    # 官宣一定会被上面的垂直媒体源当天覆盖，留着只是白占抓取额度。不要再加回来。
+    # 2026-09-04：撤掉两个泛科技源（Engadget、Tom's Hardware 全站）。
+    # 它们的定位是"用抓取额度换覆盖面，再靠 is_ai_relevant + _LOW_VALUE_RE 两道
+    # 闸门收敛"，但闸门本身很吃力——Tom's Hardware 全站日发 30+ 条，游戏硬件评测
+    # 和显卡促销占大头，而闸门关键词里恰好有 nvidia/gpu，促销稿会直接骗过去。
+    # TLDR（见下面的 fetch_tldr）是人工精选、已经做过一轮筛选，用它替代这种
+    # "广撒网 + 硬过滤"的路子。不要再把这两个源加回来。
+    # ── 机器人 / 具身智能 ──────────────────────────────────────────
+    # 2026-09-03：查 14 天存档发现 #机器人 标签只用过 8 次，且 Figure、Unitree、宇树、
+    # 波士顿动力、世界模型、具身智能一次都没出现过——抓到的都是泛科技媒体顺带写的
+    # 消费级机器人，机器人产业本身是空白。加垂直源补这块。
+    #
+    # The Robot Report：产业向（人形、具身智能、融资、量产），日更，24h 窗口稳定有货。
+    # 但它同时是 RoboBusiness 大会的主办方媒体，feed 里常年混着"Learn why … at
+    # RoboBusiness"这类会议引流稿——实测 24h 内 3 条里有 2 条是——全靠 _LOW_VALUE_RE
+    # 拦，所以那道闸门改成了对垂直源也生效，别再改回只管泛科技源。
+    ("https://www.therobotreport.com/feed/",                                 6, False),
+    # 2026-09-07：移除 TechCrunch 机器人分类（techcrunch.com/category/robotics/feed/，
+    # 曾配 limit 4 / 48h 窗口）。加它是想补「机器人作为生意」这个角度（车企转产机器人、
+    # 无人机管制），但实际发文一天 0-2 条，且与已有的 TechCrunch AI 分类源大量重叠，
+    # 重叠条目在单次运行内就被 seen_urls 挡掉，48h 窗口也没救回来——连续 5 天零产后撤掉。
+    # 机器人这条线由 The Robot Report 单独承担。不要再加回来。
+    # 试过但没加的：IEEE Spectrum 机器人（spectrum.ieee.org/feeds/topic/robotics.rss）。
+    # 质量最高，但发文成簇、周更节奏——2026-09-03 实测最新一条已是 133 小时前，
+    # 给到 120h 窗口仍然零产。当日报源会天天触发"连续 3 天零产"告警，反成噪音。
+]
+
+# ===== TLDR：人工精选源（最高优先级）=====
+# 2026-09-04 加入。RSS 只给标题和落地页链接，正文全在落地页里，所以是两跳：
+#   tldr.tech/api/rss/<slug>  →  拿到当期落地页 URL（形如 tldr.tech/ai/2026-09-03）
+#   → 抓那个页面 → 解析 <article> 容器
+# 落地页结构：<article> 里是 <a href="原始源站"><h3>标题 (N minute read)</h3></a> + 摘要段。
+# **链接直接指向一手源**（研究博客、substack、testingcatalog 等），这些站现有 RSS
+# 源基本覆盖不到，这是加它的主要理由。
+#
+# 两个必须处理的点：
+#   1. 广告条目标题里带 "(Sponsor)"，必须滤掉（实测每期 2 条左右）。
+#   2. TLDR 是每日邮件，一期就是一天；周末不发。所以窗口给 48h，
+#      否则周一那轮会因为"最近一期是周五的"而整个零产。
+TLDR_SLUGS = ["ai", "tech"]
+TLDR_WINDOW_H = 48
+TLDR_MAX_PER_ISSUE = 12
+_TLDR_ART_RE = re.compile(r"(?is)<article[^>]*>(.*?)</article>")
+_TLDR_HREF_RE = re.compile(r'(?is)href="([^"]+)"')
+_TLDR_H3_RE = re.compile(r"(?is)<h3[^>]*>(.*?)</h3>")
+
+
+def _tldr_text(fragment: str) -> str:
+    txt = re.sub(r"(?is)<(script|style).*?</\1>", " ", fragment)
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    txt = html.unescape(txt)
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+def fetch_tldr() -> list:
+    """抓 TLDR 落地页，返回与 fetch_rss 同形的条目列表（供主循环统一处理）。
+
+    任何一步失败都只影响 TLDR 自己：返回已拿到的部分，不抛异常、不影响其它源。
+    """
+    import feedparser
+    now = datetime.now(timezone.utc)
+    out = []
+    for slug in TLDR_SLUGS:
+        try:
+            issues = fetch_rss(f"https://tldr.tech/api/rss/{slug}", limit=5)
+        except Exception as exc:
+            print(f"  ✗ TLDR/{slug} RSS 失败：{exc}", file=sys.stderr)
+            continue
+        for issue in issues:
+            dt = parse_entry_date(issue)
+            if not dt or dt < now - timedelta(hours=TLDR_WINDOW_H):
+                continue
+            page_url = getattr(issue, "link", "") or ""
+            if not page_url:
+                continue
+            try:
+                resp = requests.get(page_url, headers={"User-Agent": _TLDR_UA}, timeout=30)
+                resp.raise_for_status()
+            except Exception as exc:
+                print(f"  ✗ TLDR 落地页 {page_url} 失败：{exc}", file=sys.stderr)
+                continue
+            n = 0
+            for art in _TLDR_ART_RE.findall(resp.text):
+                h3 = _TLDR_H3_RE.search(art)
+                href = _TLDR_HREF_RE.search(art)
+                if not (h3 and href):
+                    continue
+                title = _tldr_text(h3.group(1))
+                # 广告条目：标题里带 (Sponsor)
+                if not title or "(sponsor)" in title.lower():
+                    continue
+                link = href.group(1).split("?")[0]
+                if not link.startswith("http"):
+                    continue
+                body = _tldr_text(art)
+                # 摘要 = 去掉标题后的剩余正文
+                snippet = body.replace(title, "", 1).strip()
+                e = feedparser.util.FeedParserDict({
+                    "title": title,
+                    "link": link,
+                    "summary": snippet[:1200],
+                    # 用当期的发布时间，落地页里没有逐条时间
+                    "published_parsed": getattr(issue, "published_parsed", None),
+                })
+                out.append(e)
+                n += 1
+                if n >= TLDR_MAX_PER_ISSUE:
+                    break
+            print(f"  ✓ {n} 条  TLDR/{slug} {page_url}", file=sys.stderr)
+    return out
+
+
+def _source_label(feed_url: str) -> str:
+    """RSS 源在统计与零产告警里的显示名。
+
+    2026-09-03：加机器人源后同一域名下出现了两个 feed
+    （techcrunch.com 的 artificial-intelligence 与 robotics 分类）。原来直接拿
+    `feed_url.split("/")[2]` 当键，两个源会被合并成一条统计，零产告警也就说不清
+    是哪个 feed 死了。故：域名在 RSS_SOURCES 里出现多次时，追加最具区分度的那段
+    路径；只出现一次的源保持原样，不改既有的 .zero_streak.json 键名。"""
+    domain = feed_url.split("/")[2]
+    same = [s[0] for s in RSS_SOURCES if s[0].split("/")[2] == domain]
+    if len(same) < 2:
+        return domain
+    generic = {"feed", "rss", "index.xml", "category", "tag", "feeds", "", "rss.xml"}
+    segs = [p for p in feed_url.split("/")[3:] if p and p not in generic]
+    return f"{domain}/{segs[-1]}" if segs else domain
+
+
+# 低价值条目闸门：促销 / 评测 / 会议推广。**对所有源生效，不分垂直源与泛科技源。**
+#
+# 两批不同的噪音，都得拦：
+#  ① 促销与硬件评测——is_ai_relevant 只看"提没提 AI"，而 Tom's Hardware 这类硬件站
+#     的促销稿必带 RTX/GPU/Nvidia，天然能过关键词闸门（实测 40 条里 15 条"AI 相关"，
+#     其中 4 条是显卡笔记本打折和机箱评测）。
+#  ② 会议/网络研讨会推广——2026-09-03 加机器人源时发现的：The Robot Report 24h 窗口
+#     里 3 条有 2 条是 "Learn why … at RoboBusiness" 这种会议引流稿；TechCrunch 各分类
+#     feed 里同样常年飘着 "… to TechCrunch Disrupt 2026"。这类稿子没有事实、只有议程，
+#     进了 context 纯属挤占名额。垂直源一样会发，所以闸门不能只对泛科技源开。
+#
+# ⚠️ 只匹配标题，不匹配摘要——正当报道的正文里出现价格、"register" 都很正常。
+# TLDR 落地页是普通网页，需要浏览器 UA（和 CNBC quote 同类防爬）
+_TLDR_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36")
+
+_LOW_VALUE_RE = re.compile(
+    # ① 促销与评测
+    r"(?:^|\s)(?:save \$|save \d+%|\$\d[\d,.]*\s+(?:buys|gets)|now just \$|"
+    r"drops? (?:back )?(?:under|to) \$|\d+% (?:off|discount)|deal of the|"
+    r"best deals?|labor day sale|prime day|black friday|cyber monday|coupon)"
+    r"|\breview:|\breview\b\s*[—-]|hands[- ]on review"
+    # ② 会议 / 研讨会 / 榜单回顾
+    r"|\bRoboBusiness\b|\bTechCrunch Disrupt\b|\bDisrupt 20\d\d\b"
+    r"|\bwebinar\b|\bregister (?:now|today)\b|\bjoin us\b|\bsave the date\b"
+    r"|\bspeakers? (?:announced|lineup)\b"
+    r"|\bTop \d+ .{0,40}\b(?:stories|moments|robots) of\b",
+    re.IGNORECASE,
+)
+
+# ===== P2: 消息缓存（降级策略）=====
+# 飞书推送失败时把稿件存到 pending_messages.json，避免内容丢失。
+# 注意：**不做自动重发**——重发要判断"这稿子还是今天的吗"，跨天重发旧稿比丢一次
+# 更糟。当天补救由 health_check → claude_catchup 重走完整流程负责，缓存只作为
+# 人工恢复的兜底副本。（2026-08 删除了定义后从未被调用的 flush_pending。）
+save_pending = make_pending_saver(CACHE_FILE)
+
+
+
+# ===== 整理新闻数据 =====
+def build_ai_context(all_entries: list) -> tuple:
+    """整理素材，返回 (context, kept_per_source, drop_stats)。
+
+    过滤顺序：标题/URL 缺失 → 单次运行内 URL 去重 → 跨天已播去重 →
+    时间窗（按源，见 RSS_SOURCES 的 window_h）→ 泛科技源的 AI 相关性闸门
+    → 全源的低价值闸门（_LOW_VALUE_RE，促销/评测/会议推广）。"""
+    now = datetime.now(timezone.utc)
+    seen_urls: set = set()
+    sent_before    = load_sent_urls(SENT_URLS)
+    lines: list = []
+
+    kept_per_source: dict = {}
+    drops = {"dup": 0, "already_sent": 0, "stale": 0, "off_topic": 0, "promo": 0}
+
+    picked: list = []   # (title, url, url_lower, snippet)
+    for entry in all_entries:
+        title = getattr(entry, "title", None)
+        if not title:
+            continue
+        original_url = getattr(entry, "link", "") or getattr(entry, "id", "")
+        url_lower    = original_url.lower()
+        if not url_lower or url_lower in seen_urls:
+            drops["dup"] += 1
+            continue
+        seen_urls.add(url_lower)
+        # 跨天去重：前几天已经播出去的条目不再重复入选
+        if url_key(original_url) in sent_before:
+            drops["already_sent"] += 1
+            continue
+        # 时间窗按源取，缺省 24h；放宽的源靠上面的跨天去重兜住重复
+        window_h = getattr(entry, "__window_h", DEFAULT_WINDOW_H)
+        pub_date = parse_entry_date(entry)
+        if not pub_date or pub_date < now - timedelta(hours=window_h):
+            drops["stale"] += 1
+            continue
+        snippet = getattr(entry, "summary", "") or ""
+        # 低价值闸门（促销/评测/会议推广）对所有源生效，只看标题
+        if _LOW_VALUE_RE.search(title):
+            drops["promo"] += 1
+            continue
+        src = getattr(entry, "__src", "?")
+        kept_per_source[src] = kept_per_source.get(src, 0) + 1
+        picked.append((title, original_url, url_lower, snippet))
+
+    # best-effort 并发抓正文全文；抓到用正文，失败/被墙/过短则回退 RSS 摘要。
+    # 全程零 API、纯 HTTP，抓不到不影响出稿。
+    def _material(item):
+        title, url, url_lower, snippet = item
+        body = fetch_article_text(url)          # "" 表示失败/过短
+        text = body if body else snippet[:500]
+        src  = "正文" if body else "摘要"
+        return f"[原始英文标题] {title}\n[链接] {url}\n[来源域名] {url_lower}\n[正文/摘要（{src}）] {text}\n----"
+
+    if picked:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            lines = list(ex.map(_material, picked))
+
+    return "\n".join(lines), kept_per_source, drops
+
+
+# ===== P0: 推送飞书 =====
+# HTML → 富文本 post 的转换、20KB 分页、失败重试统一在 bot_utils.send_feishu 里做
+# （三个 bot 共用同一实现）。
+def send_report(text: str) -> int:
+    """推送稿件，返回实际发出的消息条数。调用方须已完成 sanitize_html。"""
+    return send_feishu(text, FEISHU_WEBHOOK)
+
+
+# ===== 抓取阶段（fetch 模式用）=====
+def _proxy_ok() -> bool:
+    """代理预检 + 端口自愈，实现见 shared/bot_utils.proxy_ok。"""
+    global _PROXY
+    ok, _PROXY = proxy_ok(_PROXY, None)
+    return ok
+
+
+
+def fetch_news() -> tuple:
+    """抓 RSS + 整理去重，返回 (ai_context, rss_fetched, entry_count, zero_sources, source_stats)。
+    进度打到 stderr，让 fetch 模式的 stdout 只保留干净的 context。"""
+    print("📡 抓取 RSS 源...", file=sys.stderr)
+    all_entries = []
+    fetched_counts: dict = {}
+
+    # TLDR 排在最前：它是人工精选，且 build_ai_context 的单次运行内 URL 去重
+    # 是"先到先得"——同一条新闻若 TLDR 和别的源都收了，先入列的这份会被保留，
+    # 后面重复的直接丢。所以放最前 = 优先用 TLDR 那份（它指向一手源、带精选摘要）。
+    tldr_entries = fetch_tldr()
+    for e in tldr_entries:
+        e["__src"] = "tldr.tech"
+        e["__general"] = False        # 已人工精选，不再过 AI 相关性闸门
+        e["__window_h"] = TLDR_WINDOW_H
+    all_entries.extend(tldr_entries)
+    fetched_counts["tldr.tech"] = len(tldr_entries)
+
+    for src in RSS_SOURCES:
+        feed_url, limit, is_general = src[:3]
+        window_h = src[3] if len(src) > 3 else DEFAULT_WINDOW_H
+        entries = fetch_rss(feed_url, limit)
+        domain  = _source_label(feed_url)
+        # 给条目打上来源标记，供后续统计"过滤后每个源还剩几条"与相关性闸门判定
+        for e in entries:
+            e["__src"]      = domain
+            e["__general"]  = is_general
+            e["__window_h"] = window_h
+        all_entries.extend(entries)
+        fetched_counts[domain] = fetched_counts.get(domain, 0) + len(entries)
+        note = "" if window_h == DEFAULT_WINDOW_H else f"（窗口 {window_h}h）"
+        print(f"  ✓ {len(entries)} 条  {feed_url}{note}", file=sys.stderr)
+
+    print(f"\n📰 共抓取 {len(all_entries)} 条，整理过滤中...", file=sys.stderr)
+    ai_context, kept_per_source, drops = build_ai_context(all_entries)
+    # 条目数按标记计数，不再数 "----"：正文里出现连字符串会把计数撑爆
+    entry_count = ai_context.count("[原始英文标题]") if ai_context else 0
+
+    # 零产源 = 过滤后一条都没剩的源（而非"RSS 拉到 0 条"）。
+    # 一个源可能天天拉得到、却条条过期，旧口径永远发现不了。
+    source_stats = {d: {"fetched": n, "kept": kept_per_source.get(d, 0)}
+                    for d, n in fetched_counts.items()}
+    zero_sources = [d for d, s in source_stats.items() if s["kept"] == 0]
+
+    # 连续零产追踪：本处是 .zero_streak.json 的唯一写入方，health_check 只读不写
+    stale_sources = update_zero_streak(ZERO_STREAK, zero_sources, list(source_stats),
+                                       threshold=ZERO_STREAK_THRESHOLD)
+
+    print(f"   过滤明细：重复 {drops['dup']} · 已播过 {drops['already_sent']} · "
+          f"超时效窗 {drops['stale']} · 非 AI {drops['off_topic']} · "
+          f"促销/评测 {drops['promo']} → 保留 {entry_count}",
+          file=sys.stderr)
+    streak_now = _load_streak()
+    for d, s in sorted(source_stats.items(), key=lambda kv: -kv[1]["kept"]):
+        n = streak_now.get(d, 0)
+        flag = f"  ⚠️ 零产（连续 {n} 天）" if s["kept"] == 0 else ""
+        print(f"   {d:26s} 抓{s['fetched']:>2} → 留{s['kept']:>2}{flag}", file=sys.stderr)
+
+    return ai_context, len(all_entries), entry_count, zero_sources, source_stats, stale_sources
+
+
+def _load_streak() -> dict:
+    """只读地取一份当前连续零产计数，供 stderr 明细展示。"""
+    try:
+        return json.loads(ZERO_STREAK.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+# ===== 模式 1：fetch — 抓取并输出 context（零 API 成本，供 Claude 写稿）=====
+def run_fetch() -> int:
+    # 防重复：今天已成功则让 routine 停手（FORCE_RUN=1 可绕过）
+    if already_ran_today(LOG_FILE):
+        print("=== SKIP_ALREADY_RAN ===")
+        return 0
+
+    if not _proxy_ok():
+        print(f"=== SKIP_PROXY === {_PROXY}")
+        return 0
+
+    ai_context, rss_fetched, entry_count, zero_sources, source_stats, stale_sources = fetch_news()
+
+    if not ai_context:
+        print("=== NO_NEWS ===")
+        write_log("WARN", "过去24小时无有效新闻，未发送")
+        return 0
+
+    # 写边车：OK 日志摘要 + metrics，供 send 模式回填（保持 health_check 监控存活）
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_summary = f"抓取{rss_fetched}条 → 保留{entry_count}条"
+    FETCH_META.write_text(
+        json.dumps(
+            {"log_summary": log_summary,
+             "kind": "daily",
+             "fetch_date": today,
+             "metrics": {"rss_fetched": rss_fetched, "rss_kept": entry_count,
+                         "rss_zero_sources": zero_sources,
+                         "rss_source_stats": source_stats,
+                         "rss_stale_sources": stale_sources,
+                         "report_kind": "daily"}},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # stdout 只输出结构化标记 + context，供定时任务稳定解析。
+    # 先攒成一个列表再一次性交给 emit_fetch_output，顺带落盘 logs/last_context.txt。
+    out = ["=== FETCH_OK ===",
+           f"今天日期：{today}",
+           f"保留 {entry_count} 条有效新闻（共抓取 {rss_fetched} 条）"]
+    if zero_sources:
+        out.append(f"零产源：{', '.join(zero_sources)}")
+    # 连续零产达阈值 → 结构化告警块，供定时任务在日报汇报里转述给用户
+    if stale_sources:
+        out.append("=== SOURCE_ALERT ===")
+        for d, n in stale_sources.items():
+            out.append(f"{d} 已连续 {n} 天零产，建议从 RSS_SOURCES 移除或更换")
+        out.append("=== SOURCE_ALERT_END ===")
+    out += ["=== CONTEXT_BEGIN ===", ai_context, "=== CONTEXT_END ==="]
+    emit_fetch_output(out, LAST_CONTEXT)
+    return 0
+
+
+# ===== 模式 2：send — 读取写好的稿子并发送（零 API 成本）=====
+def run_send(draft_path: Path) -> int:
+    t0 = time.time()
+
+    if already_ran_today(LOG_FILE):
+        print("今天已成功运行过，跳过发送。如需强制请设置 FORCE_RUN=1。", file=sys.stderr)
+        return 0
+
+    if not draft_path.exists():
+        write_log("FAIL", f"稿子文件不存在：{draft_path}")
+        return 1
+    report = draft_path.read_text(encoding="utf-8").strip()
+    if not report:
+        write_log("FAIL", f"稿子文件为空：{draft_path}")
+        return 1
+
+    # HTML 白名单清洗：这里的 HTML 只是内部中间格式，send_report 会把它翻译成
+    # 飞书的富文本结构；清洗保证正文里的裸 < > & 不会被后面的标签解析吃掉。
+    report = sanitize_html(report)
+
+    # P2: 先持久化缓存，防止推送失败时内容丢失
+    # 这里不再做代理预检：飞书直连可达，推送阶段本来就不需要翻墙代理。
+    # （Telegram 时代代理一挂当天就整个不播，现在只有抓取阶段依赖它。）
+    save_pending([report])
+    print("📨 推送到飞书...", file=sys.stderr)
+    sent = send_report(report)
+    print(f"  ✓ 推送成功（{sent} 条）", file=sys.stderr)
+    CACHE_FILE.unlink(missing_ok=True)
+
+    # 归档本次真正播出去的链接，供后续 fetch 跨天去重。
+    # 记在发送成功之后：发失败的那批不该被标成"已播"。
+    hrefs = extract_hrefs(report)
+    if hrefs:
+        total = record_sent_urls(SENT_URLS, hrefs)
+        print(f"  ✓ 已归档 {len(hrefs)} 条链接用于跨天去重（档案共 {total} 条）",
+              file=sys.stderr)
+
+    # OK 日志/Notion 边车：提前读取 fetch_meta 以复用 fetch_date 兜底
+    try:
+        meta = json.loads(FETCH_META.read_text(encoding="utf-8"))
+    except Exception:
+        meta = {"log_summary": "", "metrics": {}}
+
+    # 自动同步归档到 Notion「每日情报归档与决策看板」数据库，并留存每日历史文稿
+    report_date = (
+        extract_report_date(report)
+        or meta.get("fetch_date")
+        or datetime.now().strftime("%Y-%m-%d")
+    )
+    notion_meta = archive_and_sync_notion(
+        report,
+        "🤖 AI 产业日报",
+        date_str=report_date,
+        archive_dir=draft_path.parent / "archive",
+        archive_filename=f"{report_date}.txt",
+    )
+    record_daily_ledger("🤖 AI 产业日报", report, hrefs, date_str=report_date)
+    notion_tag = " | Notion ✓" if notion_meta.get("notion_ok") else " | Notion ⚠️"
+
+    duration = round(time.time() - t0, 1)
+    write_log(
+        "OK",
+        f"AI写稿 → {meta.get('log_summary', '')} → 飞书推送成功（{sent} 条 / {len(report)}字）{notion_tag}",
+        metrics={**meta.get("metrics", {}), **notion_meta, "ai_calls": 0, "duration_s": duration,
+                 "report_chars": len(report), "source": "antigravity"},
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AI 产业日报")
+    parser.add_argument(
+        "--mode", choices=["fetch", "send"], required=True,
+        help="fetch=抓取并输出 context（零 API）/ send=发送写好的稿子",
+    )
+    parser.add_argument(
+        "--file", type=Path, default=DRAFT_FILE,
+        help="send 模式读取的稿子文件（默认 logs/report_draft.txt）",
+    )
+    parsed = parser.parse_args()
+
+    try:
+        if parsed.mode == "fetch":
+            sys.exit(run_fetch())
+        else:
+            sys.exit(run_send(parsed.file))
+    except Exception:
+        err = traceback.format_exc().strip().splitlines()[-1]
+        write_log("FAIL", err)
+        raise

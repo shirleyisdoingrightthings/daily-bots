@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Generic macOS LaunchAgent environment store template.
+  Optional: On Linux, Docker, or standard local runs, simply use `.env` instead.
+
+  Usage on macOS:
+    1. Copy to ~/Library/LaunchAgents/com.example.<bot-id>.plist
+       (bot-ids: ai-daily-news-bot, x-hotspot-bot, ai-builder-bot,
+                 github-hn-bot, us-stock-bot, cn-hk-stock-bot)
+    2. Set BOT_PLIST_PREFIX=com.example in your local shared/.env
+    3. Fill in your secrets below (NEVER commit real *.plist files).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.ai-daily-news-bot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/true</string>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FEISHU_WEBHOOK</key>
+        <string>https://open.feishu.cn/open-apis/bot/v2/hook/REPLACE_ME</string>
+        <key>HTTP_PROXY</key>
+        <string>http://127.0.0.1:1082</string>
+        <key>HTTPS_PROXY</key>
+        <string>http://127.0.0.1:1082</string>
+    </dict>
+</dict>
+</plist>
