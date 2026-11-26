@@ -241,5 +241,32 @@ class TestUsUncoveredSelection(unittest.TestCase):
         self.assertEqual(len([m for m in res["macro"] if m["date"] == "2026-11-26"]), 1)
 
 
+class TestAShareBotHelpers(unittest.TestCase):
+    def test_a_share_losing_sector_excludes_positive_stocks_and_wilder_rsi(self):
+        sys.path.insert(0, str(ROOT / "a-share-bot"))
+        import a_share_report as asr
+
+        pool = {
+            "领涨板块": [("sh600001", "甲股"), ("sh600002", "乙股")],
+            "领跌板块": [("sh600003", "丙股"), ("sh600004", "丁股"), ("sh600005", "戊股")],
+        }
+        quotes = {
+            "sh600001": {"name": "甲股", "last": 10.0, "pct": 3.5, "amount_yi": 5.0, "turnover_rate": 2.0},
+            "sh600002": {"name": "乙股", "last": 20.0, "pct": 1.2, "amount_yi": 4.0, "turnover_rate": 1.5},
+            "sh600003": {"name": "丙股", "last": 15.0, "pct": -4.2, "amount_yi": 8.0, "turnover_rate": 3.0},
+            "sh600004": {"name": "丁股", "last": 12.0, "pct": -1.5, "amount_yi": 3.0, "turnover_rate": 1.0},
+            "sh600005": {"name": "戊股", "last": 30.0, "pct": 0.8, "amount_yi": 6.0, "turnover_rate": 1.2},
+        }
+        res = asr.compute_pool_sectors_top3(pool, quotes)
+        loser_sec = next(s for s in res["losers"] if s["name"] == "领跌板块")
+        loser_names = [st["name"] for st in loser_sec["stocks"]]
+        self.assertEqual(loser_names, ["丙股", "丁股"])
+        self.assertNotIn("戊股", loser_names)
+
+        # Wilder RSI(14) 连续上涨应接近 100
+        rsi_up = asr._calc_wilder_rsi([float(100 + i) for i in range(30)], 14)
+        self.assertEqual(rsi_up, 100.0)
+
+
 if __name__ == "__main__":
     unittest.main()

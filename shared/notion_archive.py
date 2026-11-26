@@ -622,6 +622,72 @@ def _extract_summary_bullets(section_text: str) -> list[str]:
 
 def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
     """从稿件中抽取 30 秒速览或完整结构化要点（金融市场报告首部直出信号灯，保证绝不半句截断）"""
+    # 0.9 独立 A 股（🇨🇳 A股，已剥离港股）：对齐美股圆圈序号 ①②③④ 分行 30 秒速览
+    if "A股" in source and "港股" not in source:
+        head_lines = "\n".join(l.strip() for l in text.splitlines()[:4] if l.strip())
+        is_pre = (report_type == "开盘前瞻") or (report_type != "收盘复盘" and "A股开盘前瞻" in head_lines)
+        plain_lines = [re.sub(r"^#{1,3}\s*", "", _strip_tags_plain(l)).strip() for l in text.splitlines()]
+        plain_lines = [l for l in plain_lines if l]
+        sig_cn = extract_market_signal(text, source=source)
+        overseas_line, prev_or_idx_line, width_line, vol_line, ev_line = "", "", "", "", ""
+        watch_heads, gainers, losers = [], [], []
+        mode_sec = ""
+        for line in plain_lines:
+            clean_l = re.sub(r"^(?:[\U0001F1E6-\U0001F1FF]{2}|[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\s])+", "", line).strip()
+            if line.startswith("🌍") and "：" in clean_l:
+                overseas_line = clean_l.split("：", 1)[1].strip()
+            elif line.startswith(("📊", "📈")) and "：" in clean_l and not prev_or_idx_line:
+                prev_or_idx_line = clean_l.split("：", 1)[1].strip()
+            elif line.startswith("🧭") and "：" in clean_l:
+                width_line = clean_l.split("：", 1)[1].strip()
+            elif line.startswith("💰") and "：" in clean_l:
+                vol_line = clean_l.split("：", 1)[1].strip()
+            elif line.startswith("📅") and "：" in clean_l:
+                ev_line = clean_l.split("：", 1)[1].strip()
+            elif line.startswith("⚡"):
+                mode_sec = "watch"
+            elif line.startswith("🔥"):
+                mode_sec = "gain"
+            elif line.startswith("❄️"):
+                mode_sec = "loss"
+            elif line.startswith(("🔭", "🎯")):
+                mode_sec = ""
+            elif mode_sec == "watch" and re.match(r"^\d+\.\s+", line):
+                watch_heads.append(re.sub(r"^\d+\.\s+", "", line).split("：", 1)[0].strip())
+            elif mode_sec == "gain" and re.match(r"^\d+\.\s+", line) and len(gainers) < 3:
+                gainers.append(re.sub(r"^\d+\.\s+", "", line).strip())
+            elif mode_sec == "loss" and re.match(r"^\d+\.\s+", line) and len(losers) < 3:
+                losers.append(re.sub(r"^\d+\.\s+", "", line).strip())
+
+        segs: list[str] = []
+        if sig_cn:
+            segs.append(f"{'早盘信号灯' if is_pre else '信号灯'}：{sig_cn}")
+        if is_pre:
+            if overseas_line:
+                segs.append("海外映射：" + " ｜ ".join(p.strip() for p in overseas_line.split("|") if p.strip())[:160])
+            if prev_or_idx_line:
+                segs.append("前日收盘：" + " ｜ ".join(p.strip() for p in prev_or_idx_line.split("|") if p.strip())[:160])
+            if watch_heads:
+                segs.append("盘前看点：" + " ｜ ".join(watch_heads[:3]))
+            if ev_line and "暂无" not in ev_line:
+                segs.append(f"盘前事件：{ev_line[:110]}")
+        else:
+            if prev_or_idx_line:
+                segs.append("核心指数：" + " ｜ ".join(p.strip() for p in prev_or_idx_line.split("|") if p.strip())[:160])
+            if vol_line or width_line:
+                wv = " ｜ ".join(x for x in (vol_line.split("—", 1)[0].strip(), width_line.split("—", 1)[0].strip()) if x)
+                if wv:
+                    segs.append(f"量能与宽度：{wv[:150]}")
+            if gainers or losers:
+                gl = []
+                if gainers:
+                    gl.append("领涨 " + "、".join(gainers))
+                if losers:
+                    gl.append("领跌 " + "、".join(losers))
+                segs.append("板块轮动：" + " ｜ ".join(gl))
+        if segs:
+            return add_cjk_spacing("\n".join(f"{_circled(i)} {s}" for i, s in enumerate(segs)))
+
     # 1. A股与港股：信号灯置于 30 秒速览最开头，随后分别呈现 A股 + 港股 核心数据与看点
     if "A股与港股" in source or any(k in text for k in ("A股开盘前瞻", "A股早盘总结", "A股午间复盘", "A股收盘复盘")):
         secs = re.split(r"\n\s*---+\s*\n", text, maxsplit=1)
@@ -770,7 +836,7 @@ def _classify_signal_line(s: str) -> str | None:
 
 def extract_market_signal(text: str, source: str = "") -> str | None:
     """仅对金融信源提取市场信号灯状态（🟢 偏多 / 🟡 震荡分化 / 🔴 防守承压）"""
-    if "美股" not in source and "A股与港股" not in source:
+    if "美股" not in source and "A股" not in source:
         return None
 
     sections = re.split(r"\n\s*---+\s*\n", text, maxsplit=1) if "A股与港股" in source else [text]
@@ -818,6 +884,9 @@ def build_clean_title(source: str, date_str: str, report_type: str = "日报") -
         return f"{date_str} GitHub & HN 本周趋势榜" if report_type == "周盘点" else f"{date_str} GitHub & HN 早报"
     if "美股" in source:
         return f"{date_str} 美股收盘 & 加密行情"
+    if "A股" in source and "港股" not in source:
+        suffix = report_type if report_type in ("开盘前瞻", "收盘复盘") else "决策复盘"
+        return f"{date_str} A股{suffix}"
     if "A股与港股" in source:
         suffix = report_type if report_type in ("开盘前瞻", "午间复盘", "收盘复盘") else "决策复盘"
         return f"{date_str} A股&港股 {suffix}"
@@ -1112,6 +1181,75 @@ def _format_us_metric_cell(label: str, val: str) -> str:
     return val
 
 
+def _format_a_share_metric_cell(label: str, val: str) -> str:
+    """将独立 A 股指标表右侧单元格按语义拆分为圆圈序号 ①②③ 分区，对齐美股 Notion 表格阅读体验。"""
+    if not val or "\n" in val:
+        return val
+
+    def _num_lines(raw_lines: list[str]) -> str:
+        return "\n".join(f"{_circled(i)} {ln}" for i, ln in enumerate(raw_lines))
+
+    if "海外市场映射" in label or "隔夜" in label:
+        parts = [p.strip() for p in val.split("|") if p.strip()]
+        if len(parts) >= 4:
+            eq, cn_ext, macro = [], [], []
+            for p in parts:
+                if any(k in p for k in ("中概", "KWEB", "FXI", "阿里", "拼多多", "京东")):
+                    cn_ext.append(p)
+                elif any(k in p for k in ("美债", "VIX", "美元", "伦敦金", "黄金", "原油", "布油", "比特币", "BTC")):
+                    macro.append(p)
+                else:
+                    eq.append(p)
+            lines = []
+            if eq:
+                lines.append("美股指数：" + " | ".join(eq))
+            if cn_ext:
+                lines.append("中概资产：" + " | ".join(cn_ext))
+            if macro:
+                lines.append("利率与跨资产：" + " | ".join(macro))
+            if len(lines) >= 2:
+                return _num_lines(lines)
+
+    if "前日 A 股收盘" in label or "前日A股收盘" in label or "核心指数" in label:
+        parts = [p.strip() for p in val.split("|") if p.strip()]
+        if len(parts) >= 4:
+            idx_p, extra_p = [], []
+            for p in parts:
+                if any(k in p for k in ("成交", "主线", "宽度", "涨")):
+                    extra_p.append(p)
+                else:
+                    idx_p.append(p)
+            lines = []
+            if idx_p:
+                lines.append("指数：" + " | ".join(idx_p))
+            if extra_p:
+                lines.append("量能与宽度：" + " | ".join(extra_p))
+            if len(lines) >= 2:
+                return _num_lines(lines)
+
+    if "量化技术" in label or "趋势" in label or "乖离率" in label:
+        head, judge = (val.split("—", 1)[0].strip(), val.split("—", 1)[1].strip()) if "—" in val else (val, "")
+        parts = [p.strip() for p in head.split("|") if p.strip()]
+        lines = []
+        for p in parts:
+            m_idx = re.match(r"^(上证(?:指数)?|深证(?:成指)?|创业板(?:指)?|科创\s*50|沪深\s*300)\s+(.+)$", p)
+            if m_idx:
+                lines.append(f"{m_idx.group(1)}：{m_idx.group(2)}")
+            else:
+                lines.append(p)
+        if judge:
+            lines.append(f"技术判定：{judge}")
+        if len(lines) >= 2:
+            return _num_lines(lines)
+
+    if "市场宽度" in label or "两市量能" in label:
+        if "—" in val:
+            head, diag = val.split("—", 1)
+            return _num_lines([head.strip(), f"诊断：{diag.strip()}"])
+
+    return val
+
+
 def _split_watchlist_row(raw_line: str) -> tuple[str, str] | None:
     """将美股独立自选股区块中的单层行（⚡/🔌/🏗️/🧠/🚀）拆分为 2 列 (层级, 成分股收盘表现)"""
     plain = _strip_tags_plain(raw_line).lstrip("·•-* ").strip()
@@ -1179,7 +1317,8 @@ def convert_to_blocks(
     is_gh = ("GitHub & HN" in source)
     is_ai_daily = ("AI 产业日报" in source)
     is_us = ("美股" in source)
-    is_cn_hk = ("A股与港股" in source)
+    is_cn_hk = ("A股" in source)
+    is_a_share_only = ("A股" in source and "港股" not in source)
     is_x_or_builder = ("X 热点" in source or "AI Builder" in source)
     resolved_us_embed = (get_us_embed_url() if us_embed_url is None else (us_embed_url or "")) if is_us else ""
     inserted_us_embed = False
@@ -1317,6 +1456,8 @@ def convert_to_blocks(
                 if len(metric_rows) >= 2:
                     if is_us and not in_us_news:
                         metric_rows = [(k, _format_us_metric_cell(k, v)) for k, v in metric_rows]
+                    elif is_a_share_only:
+                        metric_rows = [(k, _format_a_share_metric_cell(k, v)) for k, v in metric_rows]
                     blocks.append(_table_block(metric_rows))
                     i = j
                     continue
@@ -1652,6 +1793,7 @@ def archive_to_notion(
     icon_map = {
         "🐙 GitHub & HN": "🐙",
         "🗽 美股与加密": "🗽",
+        "🇨🇳 A股": "🇨🇳",
         "📈 A股与港股": "📈",
         "🤖 AI 产业日报": "🤖",
         "🐦 X 热点播报": "🐦",

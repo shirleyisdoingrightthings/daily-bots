@@ -612,6 +612,49 @@ class TestExtractSummaryBySource(unittest.TestCase):
         self.assertIn("\n④ 近期预告：11-26 美国核心 PCE、美国 GDP ｜ 12-01 BHP、盘后 ★MRVL、12-02 盘后 ★CRM", us_sum)
         self.assertIn("\n⑤ 核心要闻：美国拟对 14 个经济体加征新关税 ｜ 纳指深 V 反弹收跌 0.62%", us_sum)
 
+    def test_a_share_only_premarket_table_and_circled_summary(self):
+        cn_pre = """<b>🌅 🇨🇳 A股开盘前瞻 · 2026-11-27</b>
+
+🌍 <b>海外市场映射</b>：标普 500 (-0.25%) | 纳斯达克 (-0.62%) | 10 年期美债 4.864% (-3.8bp) | VIX 28.29 | 中概互联 (KWEB) (+0.85%) | 伦敦金 (24h 实时) 3,573.28 (-0.22%)
+📊 <b>前日 A 股收盘</b>：上证指数 3,520.10 (+0.45%) | 深证成指 10,820.50 (+0.62%) | 创业板指 2,210.30 (+0.88%) | 两市成交 16,200.5 亿元 | 12 大主线 8 涨 4 跌
+📐 <b>量化技术锚点</b>：上证 🟡 均线缠绕 · MA5 乖离率 +0.35% · MA200 3,410.0 (+3.2%/站上年线) · RSI(14)=52.1 · 布林 %B=0.58 | 创业板 🟢 多头排列 · RSI(14)=58.4 — 站稳年线偏强震荡
+📅 <b>盘前宏观与事件</b>：今日 09:30 中国工业企业利润数据公布
+
+<b>⚡ 开盘前瞻三大核心看点</b>
+<b>1. 前日 A 股收盘复盘与主线延续性</b>
+· 前日放量修复，AI 算力与机器人领涨。
+
+<b>2. 收盘后至开盘前宏观政策与行业催化</b>
+· 央行开展逆回购呵护流动性。
+
+<b>3. 海外市场与产业链映射</b>
+· 美股应用软件抗跌而芯片承压，关注 A 股应用与国产替代分化。
+
+<b>🎯 早盘决策仪表盘 & 💡 策略师观点（09:15–10:00 盯盘）</b>
+· <b>早盘信号灯</b>：🟡 平开分化 — 海外科技偏弱但国内量能支撑
+· <b>👀 早盘重点关注</b>：AI 应用与国产半导体设备
+"""
+        blocks = na.convert_to_blocks(cn_pre, source="🇨🇳 A股")
+        self.assertEqual(blocks[0]["type"], "heading_1")
+        tables = [b for b in blocks if b["type"] == "table"]
+        self.assertEqual(len(tables), 1)
+        rows = tables[0]["table"]["children"]
+        self.assertEqual(len(rows), 5)
+        overseas_cell = "".join(rt["text"]["content"] for rt in rows[1]["table_row"]["cells"][1])
+        self.assertIn("① 美股指数：", overseas_cell)
+        self.assertIn("\n② 中概资产：", overseas_cell)
+        self.assertIn("\n③ 利率与跨资产：", overseas_cell)
+        tech_cell = "".join(rt["text"]["content"] for rt in rows[3]["table_row"]["cells"][1])
+        self.assertIn("① 上证：", tech_cell)
+        self.assertIn("\n② 创业板：", tech_cell)
+        self.assertIn("\n③ 技术判定：", tech_cell)
+
+        summary = na.extract_summary(cn_pre, source="🇨🇳 A股", report_type="开盘前瞻")
+        self.assertTrue(summary.startswith("① 早盘信号灯：🟡 震荡分化\n② 海外映射："))
+        self.assertIn("\n③ 前日收盘：", summary)
+        self.assertIn("\n④ 盘前看点：前日 A 股收盘复盘与主线延续性 ｜ 收盘后至开盘前宏观政策与行业催化 ｜ 海外市场与产业链映射", summary)
+        self.assertEqual(na.build_clean_title("🇨🇳 A股", "2026-11-27", "开盘前瞻"), "2026-11-27 A股开盘前瞻")
+
 
 class TestArchiveToNotionHttp(unittest.TestCase):
     def test_missing_api_key_returns_false_without_network(self):
