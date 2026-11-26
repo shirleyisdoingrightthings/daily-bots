@@ -489,7 +489,10 @@ def _extract_us_market_brief(market_text: str) -> str:
 
         def _pick_pct(label_re: str, alias: str) -> str:
             m = re.search(rf"{label_re}(?:\s*[\(（][^()（）]{{1,16}}[\)）])?\s+[\d,.$%]+\s*\(([^)]+)\)", idx_body)
-            return f"{alias} {m.group(1)}" if m else ""
+            if not m:
+                return ""
+            pct_only = m.group(1).split("·", 1)[0].strip()
+            return f"{alias} {pct_only}" if pct_only else ""
 
         def _pick_val(label_re: str, alias: str) -> str:
             m = re.search(rf"{label_re}\s+([\d,.]+%?)", idx_body)
@@ -634,16 +637,16 @@ def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
         mode_sec = ""
         for line in plain_lines:
             clean_l = re.sub(r"^(?:[\U0001F1E6-\U0001F1FF]{2}|[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\s])+", "", line).strip()
-            if line.startswith("🌍") and "：" in clean_l:
-                overseas_line = clean_l.split("：", 1)[1].strip()
-            elif line.startswith(("📊", "📈")) and "：" in clean_l and not prev_or_idx_line:
-                prev_or_idx_line = clean_l.split("：", 1)[1].strip()
-            elif line.startswith("🧭") and "：" in clean_l:
-                width_line = clean_l.split("：", 1)[1].strip()
-            elif line.startswith("💰") and "：" in clean_l:
-                vol_line = clean_l.split("：", 1)[1].strip()
-            elif line.startswith("📅") and "：" in clean_l:
-                ev_line = clean_l.split("：", 1)[1].strip()
+            if line.startswith("🌍") and re.search(r"[:：]", clean_l):
+                overseas_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
+            elif line.startswith(("📊", "📈")) and re.search(r"[:：]", clean_l) and not prev_or_idx_line:
+                prev_or_idx_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
+            elif line.startswith("🧭") and re.search(r"[:：]", clean_l):
+                width_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
+            elif line.startswith("💰") and re.search(r"[:：]", clean_l):
+                vol_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
+            elif line.startswith("📅") and re.search(r"[:：]", clean_l):
+                ev_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
             elif line.startswith("⚡"):
                 mode_sec = "watch"
             elif line.startswith("🔥"):
@@ -853,7 +856,7 @@ def extract_market_signal(text: str, source: str = "") -> str | None:
                 continue
             if plain.startswith(("💡", "👀", "🚨")):
                 continue
-            if re.match(r"^(?:(?:🟢|🟡|🔴|🚦)\s*)?(?:早盘|午间)?信号灯(?:状态)?[:：\s]", plain):
+            if re.match(r"^(?:(?:🟢|🟡|🔴|🚦)\s*)?(?:早盘|午间)?信号灯(?:状态|与\s*Regime)?[:：\s]", plain, re.I):
                 sec_sig = _classify_signal_line(plain)
                 if sec_sig:
                     break
@@ -1079,7 +1082,7 @@ def _format_us_metric_cell(label: str, val: str) -> str:
             for p in parts:
                 if any(k in p for k in ("标普", "纳斯达克", "纳指", "道琼斯", "道指", "罗素")):
                     eq.append(p)
-                elif any(k in p for k in ("美债", "VIX", "美元")):
+                elif any(k in p for k in ("美债", "2s10s", "VIX", "美元")):
                     rates.append(p)
                 elif any(k in p for k in ("伦敦金", "黄金", "原油", "布油", "比特币", "BTC")):
                     comm.append(p)
@@ -1097,13 +1100,13 @@ def _format_us_metric_cell(label: str, val: str) -> str:
             if len(lines) >= 2:
                 return _num_lines(lines)
 
-    # 2. 市场宽度：广度 / 风向标 / 诊断
-    if "市场宽度" in label:
+    # 2. 市场宽度 / 宽度与信用：广度 / 风向标与信用 / 诊断
+    if "市场宽度" in label or "宽度与信用" in label:
         head, diag = (val.split("—", 1)[0].strip(), val.split("—", 1)[1].strip()) if "—" in val else (val, "")
         parts = [p.strip() for p in head.split("|") if p.strip()]
         breadth, gauges = [], []
         for p in parts:
-            if any(k in p for k in ("半导体", "SOX", "高收益债", "HYG")):
+            if any(k in p for k in ("半导体", "SOX", "高收益债", "HYG", "IEI", "信用")):
                 gauges.append(p)
             else:
                 breadth.append(p)
@@ -1117,13 +1120,13 @@ def _format_us_metric_cell(label: str, val: str) -> str:
         if len(lines) >= 2:
             return _num_lines(lines)
 
-    # 3. 趋势与乖离率：逐指数分行 + 短线判定
+    # 3. 趋势与乖离率 / 趋势与波动率：逐指数分行 + 短线判定
     if "趋势" in label or "乖离率" in label:
         head, judge = (val.split("—", 1)[0].strip(), val.split("—", 1)[1].strip()) if "—" in val else (val, "")
         parts = [p.strip() for p in head.split("|") if p.strip()]
         lines = []
         for p in parts:
-            m_idx = re.match(r"^(标普\s*500|纳斯达克|纳指|道琼斯|道指)\s+(.+)$", p)
+            m_idx = re.match(r"^(标普\s*500|纳斯达克|纳指|道琼斯|道指|罗素\s*2000(?:\s*\(IWM\))?)\s+(.+)$", p)
             if m_idx:
                 lines.append(f"{m_idx.group(1)}：{m_idx.group(2)}")
             else:
@@ -1133,28 +1136,36 @@ def _format_us_metric_cell(label: str, val: str) -> str:
         if len(lines) >= 2:
             return _num_lines(lines)
 
-    # 4. 加密货币：情绪与结构 / 主流币（全部币种统一合并为一行）
+    # 4. 加密货币：情绪与结构 / 永续杠杆（如有）/ 主流币（全部币种统一合并为一行）
     if "加密货币" in label:
         parts = [p.strip() for p in val.split("|") if p.strip()]
-        mood, coins = [], []
+        mood, perp_p, coins = [], [], []
         for p in parts:
-            if any(k in p for k in ("恐贪", "总市值", "市占率")):
+            if any(k in p for k in ("永续杠杆", "资金费率", "费率", "OI 24h", "币本位OI")):
+                perp_p.append(re.sub(r"^永续杠杆[:：\s]*", "", p))
+            elif any(k in p for k in ("恐贪", "总市值", "市占率")):
                 mood.append(p)
             else:
                 coins.append(p)
         lines = []
         if mood:
             lines.append("情绪与结构：" + " | ".join(mood))
+        if perp_p:
+            lines.append("永续杠杆：" + " | ".join(perp_p))
         if coins:
             lines.append("主流币 (24h)：" + " | ".join(coins))
         if len(lines) >= 2:
             return _num_lines(lines)
 
-    # 5. Financial Events：按日期从近到远排序、合并同日重复日期，且时间更早的分区排在前面
+    # 5. Financial Events：当日宏观实际与休市提醒 + 宏观日程 + 财报预告（按日期排序、合并同日重复日期）
     if "Financial Events" in label or "事件" in label:
-        earn_m = re.search(r"财报预告[:：]\s*(.+?)(?=\s*\|\s*宏观日程[:：]|$)", val)
-        macro_m = re.search(r"宏观日程[:：]\s*(.+?)(?=\s*\|\s*财报预告[:：]|$)", val)
+        _ev_next = r"(?=\s*\|\s*(?:当日宏观实际|宏观日程|财报预告)[:：]|$)"
+        act_m = re.search(rf"当日宏观实际[:：]\s*(.+?){_ev_next}", val)
+        earn_m = re.search(rf"财报预告[:：]\s*(.+?){_ev_next}", val)
+        macro_m = re.search(rf"宏观日程[:：]\s*(.+?){_ev_next}", val)
         blocks_dated: list[tuple[tuple[int, int], str]] = []
+        if act_m:
+            blocks_dated.append(((0, 0), f"当日实际与休市：{act_m.group(1).strip()}"))
         if macro_m:
             m_items = [x.strip() for x in macro_m.group(1).split("|") if x.strip()]
             m_str = _merge_same_day_events(m_items, inner_sep="、", group_sep=" | ")
@@ -1215,7 +1226,7 @@ def _format_a_share_metric_cell(label: str, val: str) -> str:
         if len(parts) >= 4:
             idx_p, extra_p = [], []
             for p in parts:
-                if any(k in p for k in ("成交", "主线", "宽度", "涨")):
+                if any(k in p for k in ("成交", "主线", "宽度")) or re.search(r"\d+\s*涨", p):
                     extra_p.append(p)
                 else:
                     idx_p.append(p)
@@ -1651,8 +1662,15 @@ def convert_to_blocks(
             i += 1
             continue
 
-        # 领涨 / 领跌 Top 3 板块条目提升为 heading_3，方便目录锚点定位
-        if in_sector_section and (is_cn_hk or (is_us and not in_us_news)) and re.match(r"^\d+\\?\.\s+\S", plain_clean):
+        # 领涨 / 领跌 Top 3 板块纯短标题提升为 heading_3（单行紧凑点评如含“—”或超长正文保持普通段落不污染目录）
+        if (
+            in_sector_section
+            and (is_cn_hk or (is_us and not in_us_news))
+            and re.match(r"^\d+\\?\.\s+\S", plain_clean)
+            and len(plain_clean) <= 45
+            and "—" not in plain_clean
+            and not re.search(r"[:：]\s*\S{8,}", plain_clean)
+        ):
             blocks.append(_h_block(3, re.sub(r"^#{1,3}\s*", "", line).strip()))
             i += 1
             continue

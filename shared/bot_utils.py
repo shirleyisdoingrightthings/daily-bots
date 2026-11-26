@@ -507,31 +507,38 @@ def html_to_lark_md(text: str) -> list:
             "🔥 今日领涨", "🔥 早盘领涨", "🔥 领涨", "🔥 持续霸榜",
             "❄️ 今日领跌", "❄️ 早盘领跌", "❄️ 领跌",
             "⚡ 焦点异动",
-            "🔭 盘面核心叙事", "🔭 早盘核心叙事", "🔭 核心叙事",
-            "🎯 决策仪表盘", "🎯 早盘决策仪表盘", "🎯 港股早盘决策仪表盘", "🎯 午间决策仪表盘",
+            "🔭 盘面核心叙事", "🔭 盘面核心定性", "🔭 早盘核心叙事", "🔭 核心叙事",
+            "🎯 决策仪表盘", "🎯 交易台风控", "🎯 早盘决策仪表盘", "🎯 港股早盘决策仪表盘", "🎯 午间决策仪表盘",
+            "🍰 AI 自选股明细",
             "⚡ 30秒速览", "📋 30秒速览",
             "🚀 一、", "🚀 二、", "🔥 一、", "🔥 二、", "📰 一、", "📰 二、", "▍",
-            "⚡ 早盘三大", "⚡ 今早港股", "⚡ 本周 5 件事",
+            "⚡ 早盘三大", "⚡ 开盘前瞻三大", "⚡ 今早港股", "⚡ 本周 5 件事",
         )
         _HEADER_METRICS = (
             "📊 **核心指数", "📈 **核心指数", "📊 核心指数", "📈 核心指数",
-            "🧭 **市场宽度", "🧭 市场宽度",
-            "📐 **趋势与乖离", "📐 趋势与乖离",
+            "📊 **前日 A 股收盘", "📊 前日 A 股收盘", "📊 **前日A股收盘", "📊 前日A股收盘",
+            "🧭 **市场宽度", "🧭 市场宽度", "🧭 **宽度与信用", "🧭 宽度与信用",
+            "📐 **趋势与乖离", "📐 趋势与乖离", "📐 **趋势与波动", "📐 趋势与波动",
+            "📐 **量化技术锚点", "📐 量化技术锚点",
             "💰 **两市量能", "💰 两市量能", "💰 **早盘半日量能", "💰 早盘半日量能",
+            "🌍 **海外市场映射", "🌍 海外市场映射",
             "🌍 **外围与流动性", "🌍 外围与流动性", "🌍 **隔夜外围", "🌍 隔夜外围", "🌍 **隔夜映射兑现", "🌍 隔夜映射兑现",
             "📐 **前日收盘", "📐 前日收盘", "📐 **前日港股", "📐 前日港股",
             "🇺🇸 **隔夜中概", "🇺🇸 隔夜中概",
             "🌡 **宏观指标", "🌡 宏观指标",
             "🪙 **加密", "🪙 加密",
             "🧭 **加密情绪", "🧭 加密情绪",
+            "📅 **Financial Events", "📅 Financial Events", "📅 **盘前宏观与事件", "📅 盘前宏观与事件",
+            "🍰 **AI 自选股", "🍰 AI 自选股",
         )
         _ITEM_INTERNAL_PREFIXES = (
             "🏷️", "🛠️", "Original:", "⭐",
             "- **它是干嘛的", "- **个人 Build", "- **个人 build",
             "- **这帖在聊啥", "- **评论区交锋", "- **评论区热议", "- **核心要点",
             "- **板块内领涨", "- **板块内涨幅", "- **板块内领跌", "- **板块内跌幅",
-            "- **领涨原因", "- **领跌原因",
-            "- **信号灯状态", "- **早盘信号灯", "- **午间信号灯", "- **👀", "- **🚨", "- **💡 分析师",
+            "- **领涨原因", "- **领跌原因", "- **领涨 Top", "- **领跌 Top", "- **驱动催化",
+            "- **信号灯状态", "- **信号灯与 Regime", "- **早盘信号灯", "- **午间信号灯",
+            "- **⚖️", "- **📏", "- **👀", "- **🚨", "- **💡 分析师", "- **💡 策略师",
         )
         _BREAK_PREFIXES = (
             "原帖：", "原推：", "长文：", "**素材**：", "📎 **主流媒体", "📈 本周数字", "📄 The Details"
@@ -1557,12 +1564,13 @@ def exa_search_fallback(
     category: str | None = None,
     start_published_date: str | None = None,
     include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
     timeout: int = 20,
     session: requests.Session | None = None,
 ) -> list[dict]:
     """轻量调用 Exa /search（含正文摘录），用于补齐付费墙短摘要、财报/公告原文或缺失的当日宏观日程结果。
 
-    支持可选 category（如 Exa Financial Markets 的 'financial report' 或 'news'）。"""
+    支持可选 category（如 Exa Financial Markets 的 'financial report' 或 'news'）与 exclude_domains。"""
     api_key = get_exa_api_key()
     q = (query or "").strip()
     if not api_key or not q:
@@ -1580,6 +1588,8 @@ def exa_search_fallback(
         payload["startPublishedDate"] = start_published_date
     if include_domains:
         payload["includeDomains"] = list(include_domains)
+    if exclude_domains:
+        payload["excludeDomains"] = list(exclude_domains)
 
     op = f"Exa /search[{category}]" if category else "Exa /search"
     resp = _exa_request(
@@ -1695,23 +1705,23 @@ def exa_agent_verify_catalysts(
         for e in batch
     )
     query = (
-        f"Verify whether there is a concrete, verifiable news catalyst explaining the stock price movement "
+        f"Verify whether there is a concrete, verifiable company-specific news catalyst explaining the stock price movement "
         f"for each listed company in input.data around trading date {session_date} ({market_label}, within +/- 36 hours). "
         f"Companies to check: {entity_desc}. "
         f"Prioritize authoritative financial reports, earnings releases & earnings call transcripts, "
-        f"SEC/HKEX/exchange filings (8-K/6-K/10-Q), guidance revisions, analyst upgrades/downgrades or price target changes, "
-        f"M&A/divestitures, share offerings/buybacks, regulatory/legal actions, major contracts/product launches, "
-        f"or direct commodity/macro shocks affecting the specific company."
+        f"SEC/HKEX/exchange filings (8-K/6-K/10-Q), credit rating agency actions (S&P/Moody's/Fitch CreditWatch) or CDS spread spikes / bond debt concerns, "
+        f"guidance revisions, analyst upgrades/downgrades, M&A/divestitures, share offerings/buybacks, regulatory/legal actions, "
+        f"or major contracts/product launches. Ignore routine small 10b5-1 insider sales (<$5M for mega-caps) and generic broad-market sector selloffs."
     )
     system_prompt = (
         "You are a strict financial fact-verification agent. Evaluate ONLY the companies in input.data "
         f"for news published around {session_date} (within 36 hours). "
         "Use verdict='confirmed' ONLY when an authoritative financial news report, exchange filing (SEC/HKEX/SSE/SZSE), "
-        "earnings release or earnings call transcript, or broker research report directly explains the stock's move, "
+        "credit rating/CDS alert, earnings release/transcript, or broker research report directly explains the SPECIFIC company's move, "
         "and write catalyst_summary in concise Simplified Chinese (<= 110 Chinese characters) including concrete "
         "numbers/dates/entities from the source. "
-        "Use verdict='absent' when you checked recent financial news and filings and found no company-specific catalyst "
-        "(e.g., pure broad-market or sector rotation). "
+        "Use verdict='absent' when you found ONLY broad-market or generic sector moves (e.g., 'tech stocks fell on inflation/AI worries' with no company-specific news) "
+        "or routine immaterial 10b5-1 executive sales. "
         "Use verdict='cannot_verify' when sources are inaccessible or inconclusive. "
         "NEVER fabricate numbers, rumors, or outdated news from prior weeks. Leave optional fields null when verdict != 'confirmed'."
     )
@@ -1814,6 +1824,13 @@ def exa_agent_verify_catalysts(
             continue
         summary = _ARTICLE_WS_RE.sub(" ", str(item.get("catalyst_summary") or "").strip())
         if len(summary) < 8:
+            continue
+        ctype_raw = str(item.get("catalyst_type") or "other").strip()
+        # 过滤假阳性：摘要自身承认无公司个别公告/纯属板块跟随的 macro_or_sector 条目直接丢弃
+        if ctype_raw == "macro_or_sector" and re.search(
+            r"未指向(?:当日)?公司个别公告|无公司(?:独立|个别)(?:消息|公告)|仅属(?:大盘|板块)(?:抛售|跟随|轮动)",
+            summary,
+        ):
             continue
         sym = str(item.get("symbol") or "").strip()
         orig = meta_by_sym.get(sym.upper(), {})

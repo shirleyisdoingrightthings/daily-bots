@@ -6,7 +6,7 @@
 
 🌐 [English](./README.md) | **简体中文**
 
-一个经过生产环境长期验证的 Monorepo，包含 **5 个模块化自动情报机器人**（编排为 **3 条定时流水线**：早间 AI 三合一、GitHub & Hacker News、美股与加密行情）与一套 **共享运行时及运维层**，每日自动完成抓取、去重、事实核验，并推送至 **飞书（Lark）卡片 2.0** 与 **Notion 知识库**。
+一个经过生产环境长期验证的 Monorepo，包含 **6 个模块化自动情报机器人**（编排为 **4 条定时流水线**：早间 AI 三合一、美股收盘 → A 股盘前、GitHub & Hacker News、A 股收盘复盘）与一套 **共享运行时及运维层**，每日自动完成抓取、去重、事实核验，并推送至 **飞书（Lark）卡片 2.0** 与 **Notion 知识库**。
 
 > **零大模型厂商锁定（Zero LLM Vendor Lock-In）**：所有 Python 脚本（`*_report.py`）均只负责确定性的 `fetch` 抓取、去重、HTML 清洗、飞书推送与 Notion 归档，不硬编码任何第三方大模型 SDK。AI 写稿完全解耦为 Markdown 规范（`prompt*.md`）与定时调度说明书（`shared/scheduled-tasks/*/SKILL.md`），可自由搭配任意编程/自动化 Agent 与模型运行。
 
@@ -17,16 +17,17 @@
 ```mermaid
 flowchart LR
     subgraph Sched["AI Agent 定时调度（北京时间 Asia/Shanghai）"]
-        S1["每日 09:00<br/>AI 三合一串行流水线"]
-        S2["每日 09:30<br/>GitHub &amp; Hacker News"]
-        S3["周二至周六 10:00<br/>美股收盘与加密行情"]
+        S1["每日 09:00 (ai-daily)<br/>AI 三合一串行流水线"]
+        S2["周一至周六 09:05<br/>美股收盘 -&gt; 09:30 前 A 股开盘前瞻"]
+        S3["每日 09:30<br/>GitHub &amp; Hacker News"]
+        S4["周一至周五 16:15<br/>A 股收盘复盘"]
     end
 
-    subgraph Bots["5 个模块化 Bot（fetch -&gt; Agent 写稿 -&gt; send）"]
+    subgraph Bots["6 个模块化 Bot（fetch -&gt; Agent 写稿 -&gt; send）"]
         direction TB
         B1["1. AI 产业日报"] --> B2["2. X &amp; Reddit 社区热议"] --> B3["3. AI Builder 日报"]
         B4["4. GitHub &amp; HN 早报"]
-        B5["5. 美股与加密日报"]
+        B5["5. 美股与加密日报"] --> B6["6. A 股开盘前瞻与收盘复盘"]
     end
 
     subgraph Shared["shared/ 共享运行时与运维层"]
@@ -38,14 +39,15 @@ flowchart LR
 
     subgraph Out["多端投递与归档"]
         F["飞书卡片 2.0 Webhook<br/>（20KB 均衡自动分页）"]
-        ND["Notion 数据库<br/>（表格自动适配页面宽度）"]
+        ND["Notion 数据库<br/>（自适应表格 &amp; 折叠实时看板）"]
     end
 
     S1 --> B1
-    S2 --> B4
-    S3 --> B5
-    B1 & B2 & B3 & B4 <--> L
-    B1 & B2 & B3 & B4 & B5 --> U
+    S2 --> B5
+    S3 --> B4
+    S4 --> B6
+    B1 & B2 & B3 & B4 & B5 <--> L
+    B1 & B2 & B3 & B4 & B5 & B6 --> U
     U --> F
     U --> N --> ND
     H -.-> Bots
@@ -59,12 +61,13 @@ flowchart LR
 
 | 模块 | 定时节奏（北京时间） | 覆盖范围与核心机制 | 工作流文档 |
 | :--- | :--- | :--- | :--- |
-| 🤖 **AI 产业日报** | 每日 `09:00`（第 1/3 棒） | TLDR AI + 6 个垂直 AI 媒体 RSS + 正文全文提取，覆盖全球大模型、算力基建、政策与机器人；负责播种当日跨 Bot 去重账本。 | [目录](./AI%20Daily%20News%20Bot/) · [工作流文档](./AI%20Daily%20News%20Bot/README.md) |
-| 🐦 **X & Reddit 社区热议** | 每日 `09:00`（第 2/3 棒） | 48 小时窗口，完整提取 Latent Space `[AINews]` 的 Twitter Recap + Reddit Recap（12 个核心 AI subreddit）与 Techmeme 交叉验证；保留正反技术交锋、一线实测吐槽与原帖直链。 | [目录](./x-hotspot-bot/) · [工作流文档](./x-hotspot-bot/README.md) |
-| 🛠️ **AI Builder 日报** | 每日 `09:00`（第 3/3 棒） | 通过 `twitterapi.io` 直连抓取公开自建 X List（零浏览器/Cookie 封号风险）+ 自动拉取 X Article 长文与外链博客正文；自动过滤前序已播原推。 | [目录](./ai-builder-bot/) · [工作流文档](./ai-builder-bot/README.md) |
+| 🤖 **AI 产业日报** | 每日 `09:00`（`ai-daily` 第 1/3 棒） | TLDR AI + 6 个垂直 AI 媒体 RSS + 正文全文提取，覆盖全球大模型、算力基建、政策与机器人；负责播种当日跨 Bot 去重账本。 | [目录](./AI%20Daily%20News%20Bot/) · [工作流文档](./AI%20Daily%20News%20Bot/README.md) |
+| 🐦 **X & Reddit 社区热议** | 每日 `09:00`（`ai-daily` 第 2/3 棒） | 48 小时窗口，完整提取 Latent Space `[AINews]` 的 Twitter Recap + Reddit Recap（12 个核心 AI subreddit）与 Techmeme 交叉验证；保留正反技术交锋、一线实测吐槽与原帖直链。 | [目录](./x-hotspot-bot/) · [工作流文档](./x-hotspot-bot/README.md) |
+| 🛠️ **AI Builder 日报** | 每日 `09:00`（`ai-daily` 第 3/3 棒） | 通过 `twitterapi.io` 直连抓取公开自建 X List（零浏览器/Cookie 封号风险）+ 自动拉取 X Article 长文与外链博客正文；自动过滤前序已播原推。 | [目录](./ai-builder-bot/) · [工作流文档](./ai-builder-bot/README.md) |
 | 🐙 **GitHub & HN 早报** | 每日 `09:30` | GitHub Trending（周一至周六日榜 / 周日周榜）+ README 自动抓读 + Hacker News Top 8（Firebase + Algolia 热评融合）及 30 天跨天在榜记忆。 | [目录](./github-hn-bot/) · [工作流文档](./github-hn-bot/README.md) |
-| 🗽 **美股与加密日报** | 周二至周六 `10:00` | 跨资产美股收盘（四大股指、10Y 美债、VIX、美元、黄金、布油、SOX/HYG、均线与 RSI/布林 %B）+ 24h 加密行情 + Nasdaq 财报/宏观日程 + 自定义分层自选股 + 可选 Exa 异动催化核查。 | [目录](./us%20stock%20bot/) · [工作流文档](./us%20stock%20bot/README.md) |
-| ⚙️ **共享运行时与运维层** | 底层常驻 | `bot_utils.py`、`notion_archive.py`、`notion_reconcile.py`、`*_base.sh` 统一入口、`scheduled-tasks/` `SKILL.md` 调度规范及 45+ 离线单元测试。 | [目录](./shared/) · [架构说明](./shared/README.md) |
+| 🗽 **美股与加密日报** | 周一至周六 `09:05`（第 1/2 棒） | 买方量化美股收盘（日内振幅/CLV/RVOL、2Y/10Y/2s10s、VIX/VIX3M/VRP、均衡 30 股宽度、久期中性 HYG-IEI、220 日 MA50/MA200/HV20/Z-score）+ 24h 加密（含永续资金费率与 OI）+ 收盘日宏观实际值、NYSE 休市提醒与未来 5 日日程 + 自定义分层自选股 + Exa 核查 + Notion 折叠交互图。 | [目录](./us%20stock%20bot/) · [工作流文档](./us%20stock%20bot/README.md) |
+| 🇨🇳 **A 股智能决策日报** | 周一至周五 `09:05–09:30`（第 2/2 棒）& `16:15` | 纯 A 股开盘前瞻（紧接美股收盘 09:30 前完成，融合前日 A 股收盘复盘、盘后至盘前政策电报与刚生成的美股日报正稿）+ 16:15 收盘复盘（220 日 MA50/MA200/RSI/布林/CLV/RVOL/HV20/Z-score）。 | [目录](./a-share-bot/) · [工作流文档](./a-share-bot/README.md) |
+| ⚙️ **共享运行时与运维层** | 底层常驻 | `bot_utils.py`、`notion_archive.py`、`notion_reconcile.py`、`*_base.sh` 统一入口、`scheduled-tasks/` `SKILL.md` 调度规范及 50+ 离线单元测试。 | [目录](./shared/) · [架构说明](./shared/README.md) |
 
 ---
 

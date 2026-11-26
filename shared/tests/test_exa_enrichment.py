@@ -237,8 +237,51 @@ class TestUsUncoveredSelection(unittest.TestCase):
         macro_names = [m["event"] for m in res["macro"]]
         self.assertFalse(any("PCE" in n for n in macro_names))
         self.assertTrue(any("美国 GDP" == n for n in macro_names))
-        # GDP 衍生子项应被主事件去重
-        self.assertEqual(len([m for m in res["macro"] if m["date"] == "2026-11-26"]), 1)
+        # GDP 衍生子项应被主事件去重，且感恩节 2026-11-26 休市与 11-27 半日市应被提醒并跳过休市日
+        self.assertTrue(any("11-26" in h and "感恩节" in h for h in res["holiday_alerts"]))
+        self.assertTrue(any("11-27" in h and "提前收盘" in h for h in res["holiday_alerts"]))
+        self.assertFalse(any(m["date"] == "2026-11-26" for m in res["macro"]))
+        self.assertEqual(len([m for m in res["macro"] if m["date"] == "2026-11-27"]), 1)
+        # 收盘日当日已公布实际值应进入 today_actuals
+        self.assertTrue(any(a["event"] == "美国核心 PCE" and a["actual"] == "0.3%" for a in res["today_actuals"]))
+
+    def test_quant_intraday_hv20_and_exa_skip_rules(self):
+        # 1. Exa 跳过规则应屏蔽大盘综述与软文，放行 WSJ 独家
+        self.assertTrue(stock_report._SKIP_EXA_TITLE_RE.search("Stock Market News, Nov. 25, 2026: Stocks Pare Losses"))
+        self.assertTrue(stock_report._SKIP_EXA_TITLE_RE.search("Wall Street Can't Seem to Find Its Footing"))
+        self.assertFalse(stock_report._SKIP_EXA_TITLE_RE.search("Aschenbrenner's Situational Awareness Lost 65% in Q3"))
+        self.assertTrue(stock_report._NOISE_NEWS_TITLE_RE.search("Opinion: Why the Fed can't pause"))
+        self.assertTrue(stock_report._NOISE_NEWS_TITLE_RE.search("Broadcom Stock Has Turned $10,000 Into $60,000"))
+
+        # 2. 日内结构 CLV / 振幅 / 距 52W 高 / RVOL 计算
+        spx_q = {"last": "7,182.78", "high": "7,199.31", "low": "6,970.11", "yrhiprice": "7,845.00"}
+        intra = stock_report._fmt_intraday_structure(spx_q, rvol=1.35)
+        self.assertIn("振幅 3.29%", intra)
+        self.assertIn("CLV=0.93", intra)
+        self.assertIn("RVOL=1.35x", intra)
+        self.assertIn("距52W高 -8.44%", intra)
+
+        # 3. US2Y 与 US10Y 均按 bp 格式化
+        self.assertEqual(
+            stock_report.fmt_quote({"symbol": "US2Y", "last": "4.65%", "change": "-0.021", "change_pct": "+0.04%"}),
+            "4.65% (-2.1bp)",
+        )
+
+        # 4. HV20 与均衡 30 股宽度样本检查
+        self.assertEqual(len(stock_report.CORE_BREADTH_30), 30)
+        closes = [100.0 * (1.01 if i % 2 == 0 else 0.99) for i in range(25)]
+        hv = stock_report._compute_hv20(closes)
+        self.assertIsNotNone(hv)
+        self.assertGreater(hv, 10.0)
+
+        # 5. VIX 跨日串期防污染：11-26 实时 VIX 不覆盖 11-25 收盘口径
+        v_num, v_disp = stock_report._resolve_session_vix(
+            {".VIX": {"last": "26.72", "previous_day_closing": "28.29", "last_time": "2026-11-26T10:00:00-0500"}},
+            "2026-11-25",
+        )
+        self.assertEqual(v_num, 28.29)
+        self.assertIn("28.29", v_disp)
+        self.assertIn("收盘口径", v_disp)
 
 
 class TestAShareBotHelpers(unittest.TestCase):

@@ -655,6 +655,38 @@ class TestExtractSummaryBySource(unittest.TestCase):
         self.assertIn("\n④ 盘前看点：前日 A 股收盘复盘与主线延续性 ｜ 收盘后至开盘前宏观政策与行业催化 ｜ 海外市场与产业链映射", summary)
         self.assertEqual(na.build_clean_title("🇨🇳 A股", "2026-11-27", "开盘前瞻"), "2026-11-27 A股开盘前瞻")
 
+    def test_us_quant_upgraded_fields_and_signal_regime_parsing(self):
+        doc = """<b>📊 美股收盘 & 加密行情 · 2026-11-25</b>
+
+📈 <b>核心指数</b>：标普 500 7,182.78 (-0.25% · 振幅 3.29% · CLV 0.93) | 纳斯达克 23,585.80 (-0.62% · 振幅 4.40%) | 2 年期美债 4.65% (-2.1bp) | 10 年期美债 4.864% (-3.8bp) | 2s10s +21.4bp | VIX 26.78 (-5.34%) | VIX/VIX3M 1.02 (倒挂) | 伦敦金 (24h 实时) 3,573.28 (-0.22%) | 布伦特原油 (24h 实时) 95.32 (+0.75%) | 比特币 (24h 实时) $60,919.00 (+2.98%)
+🧭 <b>宽度与信用</b>：11 大板块 8 涨 3 跌 | 30 只均衡权重 17 涨 13 跌 | 久期中性信用 (HYG-IEI -0.12%) — 广度修复但信用利差微扩
+📐 <b>趋势与波动率</b>：标普 500 🔴 中期空头 · Z=-1.15σ | 罗素 2000(IWM) 🟡 中期修复 — 高波筑底
+🪙 <b>加密货币</b>：恐贪指数 11 (Extreme Fear) | 总市值 $2,111B (-0.11%·口径延迟) | 永续杠杆 BTC +5.03%/OI +3.91% | BTC $60,919.00 (+2.98%) | ETH $1,698.93 (+2.41%)
+📅 <b>Financial Events</b>：当日宏观实际：⚠️ 11-26 感恩节休市 | 宏观日程：12-02 ISM 制造业 PMI | 财报预告：12-01 盘后 ★MRVL
+
+<b>🎯 交易台风控与执行框架</b>
+· <b>信号灯与 Regime</b>：🟡 震荡分化 — VIX/VIX3M 倒挂
+
+<b>🔥 领涨/抗跌 Top 3 板块 & ❄️ 领跌 Top 3 板块</b>
+<b>1. 原材料 (XLB) (+2.07%)</b>：SHW (+2.40%)、NEM (+2.02%)、APD (+1.84%) — 随 10Y 下行高低切换，未见个股独立消息催化
+"""
+        blocks = na.convert_to_blocks(doc, source="🗽 美股与加密", us_embed_url="")
+        # 紧凑单行板块点评不应被提升为巨型 heading_3
+        self.assertFalse(any(b["type"] == "heading_3" and "未见个股独立消息催化" in _block_plain(b) for b in blocks))
+        t = next(b for b in blocks if b["type"] == "table")
+        rows = t["table"]["children"]
+        idx_cell = "".join(rt["text"]["content"] for rt in rows[1]["table_row"]["cells"][1])
+        self.assertIn("2s10s +21.4bp", idx_cell)
+        self.assertIn("VIX/VIX3M 1.02", idx_cell)
+        crypto_cell = "".join(rt["text"]["content"] for rt in rows[4]["table_row"]["cells"][1])
+        self.assertIn("② 永续杠杆：", crypto_cell)
+        self.assertIn("③ 主流币 (24h)：", crypto_cell)
+        ev_cell = "".join(rt["text"]["content"] for rt in rows[5]["table_row"]["cells"][1])
+        self.assertIn("① 当日实际与休市：", ev_cell)
+        us_sum = na.extract_summary(doc, source="🗽 美股与加密")
+        self.assertTrue(us_sum.startswith("① 信号灯：🟡 震荡分化\n② 核心资产：标普 -0.25% ｜ 纳指 -0.62%"))
+        self.assertIn("伦敦金 -0.22%", us_sum)
+
 
 class TestArchiveToNotionHttp(unittest.TestCase):
     def test_missing_api_key_returns_false_without_network(self):

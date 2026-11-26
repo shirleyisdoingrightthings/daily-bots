@@ -131,6 +131,18 @@ CN_SECTOR_POOL: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
+# 2026–2027 中国 A 股主要法定节假日休市表（避免工作日假期误发盘前前瞻）
+_CN_HOLIDAYS = {
+    "2026-01-01", "2026-01-02",
+    "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-23",
+    "2026-04-06", "2026-05-01", "2026-05-04", "2026-05-05", "2026-06-19",
+    "2026-09-25", "2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07",
+    "2027-01-01",
+    "2027-02-05", "2027-02-08", "2027-02-09", "2027-02-10", "2027-02-11", "2027-02-12",
+    "2027-04-05", "2027-05-03", "2027-05-04", "2027-05-05", "2027-06-09",
+    "2027-09-15", "2027-10-01", "2027-10-04", "2027-10-05", "2027-10-06", "2027-10-07",
+}
+
 # 3. 海外市场与 A 股产业链先行映射报价（09:00 开盘前瞻核心锚）
 US_MAPPING = [
     ("us.INX", "标普500"),
@@ -238,25 +250,33 @@ def fetch_sina_cn_sectors_top3() -> dict[str, list[dict[str, Any]]] | None:
         top_losers = list(reversed(sectors_sorted[-3:]))
 
         def _fetch_node_stocks(node: str, asc: int) -> list[dict[str, Any]]:
-            s_url = (
-                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-                f"Market_Center.getHQNodeData?page=1&num=6&sort=changepercent&asc={asc}&node={node}"
-            )
-            r = DIRECT_SESSION.get(s_url, headers={"User-Agent": _UA}, timeout=8)
-            rows = r.json() or []
+            try:
+                s_url = (
+                    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                    f"Market_Center.getHQNodeData?page=1&num=12&sort=changepercent&asc={asc}&node={node}"
+                )
+                r = DIRECT_SESSION.get(s_url, headers={"User-Agent": _UA}, timeout=8)
+                rows = r.json() or []
+            except Exception:
+                return []
             res = []
             for st in rows:
+                nm = str(st.get("name") or "")
                 pct_v = _safe_float(st.get("changepercent", 0))
+                amt_yi = _safe_float(st.get("amount", 0)) / 1e8
+                # 剔除 ST 风险股与日成交额 < 1 亿元的微盘噪音股
+                if "ST" in nm.upper() or amt_yi < 1.0:
+                    continue
                 if asc == 1 and pct_v >= 0:
                     continue
                 if asc == 0 and pct_v <= 0:
                     continue
                 res.append({
                     "code": st.get("symbol", ""),
-                    "name": st.get("name", ""),
+                    "name": nm,
                     "last": _safe_float(st.get("trade", 0)),
                     "pct": pct_v,
-                    "amount_yi": _safe_float(st.get("amount", 0)) / 1e8,
+                    "amount_yi": amt_yi,
                     "turnover": _safe_float(st.get("turnoverratio", 0)),
                 })
                 if len(res) >= 3:
@@ -347,8 +367,20 @@ def _calc_bollinger_pct_b(closes: list[float], period: int = 20, num_std: float 
     return pct_b, upper, lower
 
 
-def fetch_ma_trend(code: str, live_last: float = 0.0, today_str: str = "") -> str:
-    """拉取最近 220 日 K 线，计算 MA5/10/20/50/200、Wilder RSI(14)、布林 %B(20,2) 与距 52 周高点回撤。"""
+def _calc_hv20(closes: list[float]) -> float | None:
+    if len(closes) < 21:
+        return None
+    win = closes[-21:]
+    rets = [math.log(win[i] / win[i - 1]) for i in range(1, len(win)) if win[i - 1] > 0 and win[i] > 0]
+    if len(rets) < 15:
+        return None
+    mean_r = sum(rets) / len(rets)
+    var = sum((r - mean_r) ** 2 for r in rets) / max(1, len(rets) - 1)
+    return math.sqrt(var) * math.sqrt(252.0) * 100.0
+
+
+def fetch_ma_trend(code: str, live_last: float = 0.0, today_str: str = "", live_date_compact: str = "") -> str:
+    """拉取最近 220 日 K 线，计算双维度趋势(MA50/MA200 + MA20/Z-score)、HV20、RVOL、CLV、Wilder RSI(14) 与布林 %B(20,2)。"""
     try:
         url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,220,qfq"
         resp = DIRECT_SESSION.get(url, headers={"User-Agent": _UA}, timeout=10)
@@ -356,44 +388,70 @@ def fetch_ma_trend(code: str, live_last: float = 0.0, today_str: str = "") -> st
         klines = data.get("day") or data.get("qfqday") or []
         if len(klines) < 20:
             return ""
-        closes = [_safe_float(row[2]) for row in klines if len(row) >= 3]
-        highs = [_safe_float(row[3]) for row in klines if len(row) >= 4]
+        closes = [cv for row in klines if len(row) >= 3 for cv in (_safe_float(row[2]),) if cv > 0]
+        highs = [hv for row in klines if len(row) >= 4 for hv in (_safe_float(row[3]),) if hv > 0]
         last_bar_date = str(klines[-1][0])[:10] if klines and len(klines[-1]) >= 1 else ""
-        if live_last > 0 and today_str:
+        today_compact = today_str.replace("-", "")
+        # 仅当实时行情明确属于今日交易日时才更新末根收盘价，杜绝休市日重复追加旧收盘扭曲指标
+        if live_last > 0 and today_str and live_date_compact == today_compact:
             if last_bar_date == today_str:
                 closes[-1] = live_last
-            elif today_str > last_bar_date and datetime.now().hour >= 10:
+            elif today_str > last_bar_date:
                 closes.append(live_last)
         if len(closes) < 20 or not closes[-1]:
             return ""
 
         cur = closes[-1]
-        ma5 = sum(closes[-5:]) / 5.0
-        ma10 = sum(closes[-10:]) / 10.0
         ma20 = sum(closes[-20:]) / 20.0
-        bias5 = (cur - ma5) / ma5 * 100.0 if ma5 else 0.0
         bias20 = (cur - ma20) / ma20 * 100.0 if ma20 else 0.0
+        ma50 = sum(closes[-50:]) / 50.0 if len(closes) >= 50 else None
+        ma200 = sum(closes[-200:]) / 200.0 if len(closes) >= 200 else None
 
-        if ma5 > ma10 > ma20:
-            trend = "🟢多头排列"
-        elif ma5 < ma10 < ma20:
-            trend = "🔴空头排列"
-        elif cur >= ma20:
-            trend = "🟡均线缠绕偏强(站上MA20)"
+        if ma50 is not None and ma200 is not None:
+            if cur >= ma50 and ma50 >= ma200:
+                trend = "🟢中期多头(MA50>MA200)"
+            elif cur < ma200:
+                trend = "🔴中期空头(跌破年线)"
+            elif cur < ma50:
+                trend = "🟡中期承压(MA50下方/年线上方)"
+            else:
+                trend = "🟡中期修复(MA50上方)"
         else:
-            trend = "🟡均线缠绕偏弱(跌破MA20)"
+            trend = "🟡站上MA20" if cur >= ma20 else "🔴跌破MA20"
 
-        parts = [f"{trend} | MA5={ma5:.2f} (乖离率 {bias5:+.2f}%) | MA20={ma20:.2f} ({bias20:+.2f}%)"]
+        bb = _calc_bollinger_pct_b(closes, 20, 2.0)
+        z_str = ""
+        if bb is not None:
+            _, upper, lower = bb
+            bb_std = (upper - lower) / 4.0
+            if bb_std > 0:
+                z_str = f" · Z={(cur - ma20) / bb_std:+.2f}σ"
 
-        if len(closes) >= 50:
-            ma50 = sum(closes[-50:]) / 50.0
-            d50 = (cur - ma50) / ma50 * 100.0 if ma50 else 0.0
-            parts.append(f"MA50={ma50:.2f} ({d50:+.1f}%)")
-        if len(closes) >= 200:
-            ma200 = sum(closes[-200:]) / 200.0
-            d200 = (cur - ma200) / ma200 * 100.0 if ma200 else 0.0
+        parts = [f"{trend} | MA20={ma20:.2f} ({bias20:+.2f}%{z_str})"]
+        if ma50 is not None:
+            parts.append(f"MA50={ma50:.2f} ({(cur - ma50) / ma50 * 100.0:+.1f}%)")
+        if ma200 is not None:
             y_tag = "站上年线" if cur >= ma200 else "跌破年线"
-            parts.append(f"MA200={ma200:.2f} ({d200:+.1f}%/{y_tag})")
+            parts.append(f"MA200={ma200:.2f} ({(cur - ma200) / ma200 * 100.0:+.1f}%/{y_tag})")
+
+        hv20 = _calc_hv20(closes)
+        if hv20 is not None:
+            parts.append(f"HV20={hv20:.1f}%")
+
+        # 末根 K 线 CLV 与 20 日相对量比 RVOL
+        last_bar = klines[-1]
+        if len(last_bar) >= 5:
+            bh, bl, bc = _safe_float(last_bar[3]), _safe_float(last_bar[4]), _safe_float(last_bar[2])
+            if bh > bl > 0 and bc > 0:
+                clv = max(0.0, min(1.0, (bc - bl) / (bh - bl)))
+                parts.append(f"CLV={clv:.2f}")
+        if len(last_bar) >= 6 and len(klines) >= 21:
+            lv = _safe_float(last_bar[5])
+            pvs = [_safe_float(r[5]) for r in klines[-21:-1] if len(r) >= 6 and _safe_float(r[5]) > 0]
+            if lv > 0 and len(pvs) >= 15:
+                avg_v = sum(pvs) / len(pvs)
+                if avg_v > 0:
+                    parts.append(f"RVOL={lv / avg_v:.2f}x")
 
         rsi = _calc_wilder_rsi(closes, 14)
         if rsi is not None:
@@ -409,7 +467,6 @@ def fetch_ma_trend(code: str, live_last: float = 0.0, today_str: str = "") -> st
                 r_lbl = "中性"
             parts.append(f"RSI(14)={rsi:.1f} ({r_lbl})")
 
-        bb = _calc_bollinger_pct_b(closes, 20, 2.0)
         if bb is not None:
             pct_b, upper, lower = bb
             rb = round(pct_b, 2)
@@ -428,8 +485,7 @@ def fetch_ma_trend(code: str, live_last: float = 0.0, today_str: str = "") -> st
         if highs:
             hi_52 = max(highs)
             if hi_52 > 0:
-                dd = (cur - hi_52) / hi_52 * 100.0
-                parts.append(f"距阶段高点 {dd:+.1f}%")
+                parts.append(f"距阶段高点 {(cur - hi_52) / hi_52 * 100.0:+.1f}%")
 
         return " | ".join(parts)
     except Exception as exc:
@@ -488,72 +544,95 @@ def _tracked_core_names() -> tuple[str, ...]:
     return tuple(names)
 
 
+_SINA_GLOBAL_RELEVANT_RE = re.compile(
+    r"(?:中国|国内|中国人民银行|中国央行|央行降|证监会|发改委|工信部|中国财政部|财政部拟|超长期特别国债|专项债|商务部|统计局|国常会|政治局|国务院|国家数据局|"
+    r"A股|沪深|上证|创业板|科创|北向|南向|人民币|离岸人民币|夜盘期货|中概|港股|"
+    r"美联储|美国财政部|美债|纳斯达克|标普|英伟达|苹果|特斯拉|关税|对华|中美|黄金|布伦特|欧佩克|OPEC|芯片|半导体|算力|人工智能)"
+)
+_SINA_MINOR_COUNTRY_NOISE_RE = re.compile(
+    r"(?:罗马尼亚|匈牙利|捷克|波兰|希腊|保加利亚|塞尔维亚|立陶宛|爱沙尼亚|拉脱维亚|冰岛|挪威克朗|列伊|福林|"
+    r"安哥拉|尼日利亚|肯尼亚|南非兰特|苏里南|巴拉圭|乌拉圭|秘鲁|哥伦比亚|智利比索|厄瓜多尔|欧洲议会|边际贷款利率借款)"
+)
+
+
 def fetch_sina_telegraph(
     limit: int = 40,
     session_mode: str = "close",
     max_age_hours: int | None = None,
     now_dt: datetime | None = None,
 ) -> list[str]:
-    """抓取新浪财经 7x24 小时滚动电报；盘前模式显式标注昨日 15:00 至今日开盘前的政策与行业催化。"""
+    """抓取新浪财经 7x24 小时滚动电报；盘前模式过滤小国外围杂讯、深度覆盖前晚 15:00 至今日开盘前的国内政策与行业催化。"""
     ref_now = now_dt or datetime.now()
     if max_age_hours is None:
         max_age_hours = 78 if (ref_now.weekday() == 0 and ref_now.hour < 12) else 36
     cutoff = ref_now - timedelta(hours=max_age_hours)
     core_names = _tracked_core_names()
 
-    # 盘后至盘前窗口起点：周一取上周五 15:00，其余工作日取昨日 15:00
-    days_back = 3 if ref_now.weekday() == 0 else 1
-    post_close_start = (ref_now - timedelta(days=days_back)).replace(hour=15, minute=0, second=0, microsecond=0)
+    # 盘后至盘前窗口起点：当日 >=15:00 时取当日 15:00（防调试把午评标为盘后）；否则取上一交易日 15:00
+    if ref_now.hour >= 15:
+        post_close_start = ref_now.replace(hour=15, minute=0, second=0, microsecond=0)
+    else:
+        days_back = 3 if ref_now.weekday() == 0 else 1
+        post_close_start = (ref_now - timedelta(days=days_back)).replace(hour=15, minute=0, second=0, microsecond=0)
 
     collected: list[tuple[datetime, str, bool, str]] = []
     seen: set[str] = set()
-    for tag_id, tag_label, pg_size in [(10, "A股市场", 28), (4, "公司/行业", 30), (0, "宏观/政策", 38)]:
-        url = (
-            "https://zhibo.sina.com.cn/api/zhibo/feed"
-            f"?page=1&page_size={pg_size}&zhibo_id=152&tag_id={tag_id}&dire=f&dpc=1"
-        )
-        try:
-            resp = DIRECT_SESSION.get(url, headers={"User-Agent": _UA}, timeout=10)
-            resp.raise_for_status()
-            feed_list = (
-                resp.json()
-                .get("result", {})
-                .get("data", {})
-                .get("feed", {})
-                .get("list", [])
+    # 盘前对 tag_id=10(A股市场) 与 tag_id=4(公司/行业) 拉取前 2 页以覆盖前晚 15:00-23:00 国内政策与公告；tag_id=0 严格过滤非相关海外碎片
+    feed_specs = (
+        [(10, "A股市场", 35, 2), (4, "公司/行业", 35, 2), (0, "宏观/外围", 40, 1)]
+        if session_mode == "premarket"
+        else [(10, "A股市场", 28, 1), (4, "公司/行业", 30, 1), (0, "宏观/政策", 35, 1)]
+    )
+    for tag_id, tag_label, pg_size, max_pages in feed_specs:
+        for page in range(1, max_pages + 1):
+            url = (
+                "https://zhibo.sina.com.cn/api/zhibo/feed"
+                f"?page={page}&page_size={pg_size}&zhibo_id=152&tag_id={tag_id}&dire=f&dpc=1"
             )
-            for row in feed_list:
-                rich = row.get("rich_text") or ""
-                txt = re.sub(r"<[^>]+>", "", html.unescape(rich)).strip()
-                txt = re.sub(r"\s+", " ", txt)
-                ctime = (row.get("create_time") or "").strip()
-                dt = _parse_sina_ctime(ctime)
-                if dt is not None and dt < cutoff:
-                    continue
-                if len(txt) < 20:
-                    continue
-                if _SINA_NOISE_RE.search(txt) and not any(nm in txt for nm in core_names):
-                    continue
-                key = txt[:40]
-                if key not in seen:
-                    seen.add(key)
-                    sort_dt = dt or datetime.min
-                    in_overnight = bool(session_mode == "premarket" and dt is not None and dt >= post_close_start)
-                    win_tag = " · 盘后-盘前" if in_overnight else ""
-                    is_high = bool(
-                        _SINA_HIGH_SIGNAL_RE.search(txt)
-                        or any(nm in txt for nm in core_names)
-                        or (session_mode == "premarket" and in_overnight and tag_id == 0)
-                    )
-                    collected.append((sort_dt, ctime, is_high, f"[{ctime} · {tag_label}{win_tag}] {txt[:260]}"))
-        except Exception as exc:
-            print(f"[WARN] 新浪 7x24 电报(tag={tag_id})抓取异常: {exc}", file=sys.stderr)
+            try:
+                resp = DIRECT_SESSION.get(url, headers={"User-Agent": _UA}, timeout=10)
+                resp.raise_for_status()
+                feed_list = (
+                    resp.json()
+                    .get("result", {})
+                    .get("data", {})
+                    .get("feed", {})
+                    .get("list", [])
+                )
+                for row in feed_list:
+                    rich = row.get("rich_text") or ""
+                    txt = re.sub(r"<[^>]+>", "", html.unescape(rich)).strip()
+                    txt = re.sub(r"\s+", " ", txt)
+                    ctime = (row.get("create_time") or "").strip()
+                    dt = _parse_sina_ctime(ctime)
+                    if dt is not None and dt < cutoff:
+                        continue
+                    if len(txt) < 20:
+                        continue
+                    if _SINA_NOISE_RE.search(txt) and not any(nm in txt for nm in core_names):
+                        continue
+                    # 屏蔽 tag_id=0 全站流水账中与 A 股及核心全球宏观无关的小国碎片（如罗马尼亚发债/安哥拉出口/欧洲议会外交杂讯等）
+                    if tag_id == 0 and (
+                        _SINA_MINOR_COUNTRY_NOISE_RE.search(txt)
+                        or not (_SINA_GLOBAL_RELEVANT_RE.search(txt) or any(nm in txt for nm in core_names))
+                    ):
+                        continue
+                    key = txt[:40]
+                    if key not in seen:
+                        seen.add(key)
+                        sort_dt = dt or datetime.min
+                        in_overnight = bool(session_mode == "premarket" and dt is not None and dt >= post_close_start)
+                        win_tag = " · 盘后-盘前" if in_overnight else ""
+                        is_high = bool(_SINA_HIGH_SIGNAL_RE.search(txt) or any(nm in txt for nm in core_names))
+                        collected.append((sort_dt, ctime, is_high, f"[{ctime} · {tag_label}{win_tag}] {txt[:260]}"))
+            except Exception as exc:
+                print(f"[WARN] 新浪 7x24 电报(tag={tag_id}, p={page})抓取异常: {exc}", file=sys.stderr)
 
     collected.sort(key=lambda x: (x[0], x[1]), reverse=True)
     if len(collected) <= limit:
         return [line for _, _, _, line in collected]
 
-    high_quota = min(20, limit)
+    high_quota = min(24, limit)
     picked_high = [item for item in collected if item[2]][:high_quota]
     picked_set = {item[3] for item in picked_high}
     rest_slots = limit - len(picked_high)
@@ -640,23 +719,26 @@ def _load_market_memory() -> list[dict[str, Any]]:
     return []
 
 
-def _load_latest_a_share_close_archive() -> tuple[str, str]:
-    """读取最近一份本地 A 股收盘复盘归档（供次日 09:00 开盘前瞻联动前日收盘复盘）。"""
+def _load_latest_a_share_close_archive(today_str: str = "") -> tuple[str, str]:
+    """读取最近一份早于今日的本地 A 股收盘复盘归档（供次日 09:00 开盘前瞻联动前日收盘复盘）。"""
     if not ARCHIVE_DIR.exists():
         return "", ""
     candidates = sorted(ARCHIVE_DIR.glob("*_close.txt"), reverse=True)
     for p in candidates:
+        dt_part = p.stem.replace("_close", "")
+        if today_str and dt_part >= today_str:
+            continue
         try:
             txt = p.read_text(encoding="utf-8").strip()
             if txt:
-                return p.stem.replace("_close", ""), txt[:3600]
+                return dt_part, txt[:3600]
         except Exception:
             continue
     return "", ""
 
 
-def _load_latest_us_report(now: datetime | None = None) -> tuple[str, str, str]:
-    """自动读取今早 09:00 刚跑完的《美股收盘 & 加密行情日报》（先读 logs/report_market.txt & report_news.txt，回退 archive/*.txt）。"""
+def _load_latest_us_report(now: datetime | None = None) -> tuple[str, str, str, str]:
+    """自动读取今早 09:00 刚跑完的《美股收盘 & 加密行情日报》，并校验隔夜美股是否休市防止把旧盘面当成隔夜新催化。"""
     ref_now = now or datetime.now()
     m_path = US_BOT_DIR / "logs" / "report_market.txt"
     n_path = US_BOT_DIR / "logs" / "report_news.txt"
@@ -664,13 +746,12 @@ def _load_latest_us_report(now: datetime | None = None) -> tuple[str, str, str]:
     us_news = ""
     us_source_label = ""
 
-    # 优先读取 72 小时内新生成的 report_market.txt（涵盖周一沿用上周六刚生成的周五收盘稿）
     if m_path.exists():
         try:
             age_h = (ref_now.timestamp() - m_path.stat().st_mtime) / 3600.0
             if age_h <= 84:
                 us_market = m_path.read_text(encoding="utf-8").strip()
-                us_source_label = f"实时承接 us stock bot 最新成稿（更新于 {age_h:.1f} 小时前）"
+                us_source_label = f"承接 us stock bot 最新成稿（更新于 {age_h:.1f} 小时前）"
         except Exception:
             pass
     if n_path.exists():
@@ -696,7 +777,19 @@ def _load_latest_us_report(now: datetime | None = None) -> tuple[str, str, str]:
                 except Exception:
                     continue
 
-    # 提炼要闻的 30 秒速览段落，避免上下文冗余过长
+    # 检测隔夜美股休市（如感恩节次日）：若美股最新收盘日早于“昨夜应收盘交易日”，注入强告警防双计价
+    us_holiday_warn = ""
+    m_dt = re.search(r"美股收盘\s*&\s*加密行情\s*·\s*(\d{4}-\d{2}-\d{2})", us_market)
+    if m_dt:
+        us_sess_date = m_dt.group(1)
+        expected_days_back = 3 if ref_now.weekday() == 0 else 1
+        expected_us_date = (ref_now - timedelta(days=expected_days_back)).strftime("%Y-%m-%d")
+        if us_sess_date < expected_us_date:
+            us_holiday_warn = (
+                f"⚠️ 隔夜美股休市提示：昨夜（{expected_us_date}）美股无新增收盘，下方美股成稿与报价均为 "
+                f"{us_sess_date} 旧收盘（已于前一日 A 股盘面消化），严禁将其当成今日新增隔夜利空/利多重复预警！"
+            )
+
     news_summary = ""
     if us_news:
         clean_n = re.sub(r"<[^>]+>", "", html.unescape(us_news))
@@ -711,7 +804,7 @@ def _load_latest_us_report(now: datetime | None = None) -> tuple[str, str, str]:
                 break
         news_summary = "\n".join(picked[:7])
 
-    return us_source_label, us_market[:4200], news_summary
+    return us_source_label, us_market[:6000], news_summary, us_holiday_warn
 
 
 def _format_memory_block(cn_list: list[dict[str, Any]]) -> list[str]:
@@ -799,12 +892,12 @@ def run_fetch(session_mode: str) -> int:
         print("=== SKIP_ALREADY_RAN ===")
         return 0
 
-    if now.weekday() >= 5 and os.getenv("FORCE_RUN") != "1":
-        print("=== SKIP_NON_TRADING_DAY ===")
-        write_log("WARN", f"周末非交易日（{session_mode}），未出稿")
-        return 0
-
     today_str = now.strftime("%Y-%m-%d")
+    if (now.weekday() >= 5 or today_str in _CN_HOLIDAYS) and os.getenv("FORCE_RUN") != "1":
+        print("=== SKIP_NON_TRADING_DAY ===")
+        reason = "法定节假日" if today_str in _CN_HOLIDAYS else "周末非交易日"
+        write_log("WARN", f"{reason}（{session_mode}），未出稿")
+        return 0
     session_label = {
         "premarket": "开盘前瞻（09:00–09:30 盘前）",
         "close": "收盘复盘（16:15 盘后）",
@@ -835,7 +928,7 @@ def run_fetch(session_mode: str) -> int:
     ma_map: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=5) as pool:
         futs = {
-            c: pool.submit(fetch_ma_trend, c, quotes.get(c, {}).get("last", 0.0), today_str)
+            c: pool.submit(fetch_ma_trend, c, quotes.get(c, {}).get("last", 0.0), today_str, sh_date)
             for c in ma_targets
         }
         for c, fut in futs.items():
@@ -872,10 +965,11 @@ def run_fetch(session_mode: str) -> int:
 
     cn_stk_up = sum(1 for c in cn_pool_codes if quotes.get(c, {}).get("pct", 0) > 0)
     cn_stk_down = sum(1 for c in cn_pool_codes if quotes.get(c, {}).get("pct", 0) < 0)
-    cn_sec_all = [
-        sum(quotes.get(c, {}).get("pct", 0) for c, _ in members) / max(1, len(members))
-        for members in CN_SECTOR_POOL.values()
-    ]
+    cn_sec_all = []
+    for members in CN_SECTOR_POOL.values():
+        vals = [quotes[c]["pct"] for c, _ in members if quotes.get(c) and quotes[c].get("last", 0) > 0]
+        if vals:
+            cn_sec_all.append(sum(vals) / len(vals))
     cn_sec_up = sum(1 for v in cn_sec_all if v > 0)
     cn_sec_down = sum(1 for v in cn_sec_all if v < 0)
 
@@ -892,14 +986,16 @@ def run_fetch(session_mode: str) -> int:
 
     # 盘前模式：自动承接今早 09:00《美股收盘 & 加密行情日报》正稿 + 前一日 A 股收盘复盘归档
     if session_mode == "premarket":
-        us_src, us_mkt_txt, us_news_sum = _load_latest_us_report(now)
+        us_src, us_mkt_txt, us_news_sum, us_holiday_warn = _load_latest_us_report(now)
         out.extend([
             "",
             "==========================================",
             f"【一、🌍 海外市场映射：承接今早美股与加密日报（{us_src or '未找到本地美股成稿，仅使用实时映射报价'}）】",
             "==========================================",
-            "· 海外关键指数与产业链映射实时报价：",
         ])
+        if us_holiday_warn:
+            out.append(us_holiday_warn)
+        out.append("· 海外关键指数与产业链映射实时报价：")
         for code, label in US_MAPPING:
             q = quotes.get(code)
             if q:
@@ -911,7 +1007,7 @@ def run_fetch(session_mode: str) -> int:
             out.append("\n· 今早《美股要闻》30 秒速览：")
             out.append(us_news_sum)
 
-        prev_dt, prev_close_txt = _load_latest_a_share_close_archive()
+        prev_dt, prev_close_txt = _load_latest_a_share_close_archive(today_str)
         if prev_close_txt:
             out.extend([
                 "",

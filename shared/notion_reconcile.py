@@ -29,6 +29,7 @@ from notion_archive import archive_to_notion  # noqa: E402
 BOT_SPECS: dict[str, dict[str, str]] = {
     "github-hn-bot": {"source": "🐙 GitHub & HN"},
     "us stock bot": {"source": "🗽 美股与加密"},
+    "a-share-bot": {"source": "🇨🇳 A股"},
     "cn-hk-stock-bot": {"source": "📈 A股与港股"},
     "AI Daily News Bot": {"source": "🤖 AI 产业日报"},
     "x-hotspot-bot": {"source": "🐦 X 热点播报"},
@@ -101,7 +102,7 @@ def resolve_archive_task(bot_name: str, archive_path: Path, jsonl_rows: list[dic
     title_override: str | None = None
     report_type = "日报"
 
-    if bot_name == "cn-hk-stock-bot":
+    if bot_name in ("cn-hk-stock-bot", "a-share-bot"):
         m_cn = re.match(r"^(\d{4}-\d{2}-\d{2})_(premarket|midday|close)$", stem)
         if m_cn:
             date_str, session = m_cn.group(1), m_cn.group(2)

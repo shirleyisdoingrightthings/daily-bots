@@ -1,6 +1,6 @@
 ---
-name: ai-daily-afternoon
-description: 每天 09:00 按 1. AI 产业日报 → 2. X 热点播报 → 3. AI Builder 日报 顺序三合一串行抓取、去重、写稿并推送至飞书（识别 Automation 选定模型并允许自主 Orchestrate）
+name: ai-daily
+description: 每天 09:00 按 1. AI 产业日报 → 2. X & Reddit 社区热议 → 3. AI Builder 日报 顺序三合一串行抓取、去重、写稿并推送至飞书（允许主模型视负载灵活 Orchestrate）
 ---
 
 目标：每天早上 **09:00**，由本任务在**同一个主控会话内**严格按 **`1. AI 产业日报 → 2. X 热点播报 → 3. AI Builder 日报`** 的先后顺序串行完成抓取、写稿、飞书推送与 Notion 归档。紧随其后的 `4. GitHub Trending & Hacker News` 将在 **09:30** 独立运行并读取本任务产出的当日去重账本。
