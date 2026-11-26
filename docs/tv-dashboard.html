@@ -4,24 +4,33 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>US Market &amp; Crypto Interactive Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.1/dist/lightweight-charts.standalone.production.js"></script>
   <style>
     :root {
       --bg: #ffffff;
       --surface: #f7f7f5;
+      --card: #ffffff;
       --border: #e6e6e2;
       --text: #1f2328;
       --muted: #6e7781;
       --accent: #2383e2;
       --accent-bg: #edf5ff;
+      --up: #0f9d58;
+      --down: #d93025;
+      --grid: #f0f0ec;
     }
     [data-theme="dark"] {
       --bg: #191919;
-      --surface: #252525;
+      --surface: #222222;
+      --card: #282828;
       --border: #333333;
       --text: #ebebeb;
       --muted: #9b9b9b;
       --accent: #529cca;
       --accent-bg: #1d2c3a;
+      --up: #26a69a;
+      --down: #ef5350;
+      --grid: #2a2a2a;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
@@ -29,21 +38,16 @@
       background: var(--bg);
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Helvetica Neue", sans-serif;
-      overflow-x: hidden;
+      overflow: hidden;
     }
     .wrap {
       display: flex;
       flex-direction: column;
       height: 100vh;
-      min-height: 520px;
+      min-height: 480px;
       width: 100%;
     }
-    .tape-box {
-      border-bottom: 1px solid var(--border);
-      background: var(--bg);
-      flex: 0 0 auto;
-    }
-    .toolbar {
+    .bar {
       display: flex;
       align-items: center;
       gap: 6px;
@@ -54,23 +58,20 @@
       background: var(--surface);
       flex: 0 0 auto;
     }
-    .toolbar::-webkit-scrollbar { display: none; }
+    .bar::-webkit-scrollbar { display: none; }
     .tab-btn {
       border: 1px solid var(--border);
-      background: var(--bg);
+      background: var(--card);
       color: var(--text);
       border-radius: 999px;
-      padding: 5px 12px;
+      padding: 4px 11px;
       font-size: 12.5px;
       font-weight: 500;
       cursor: pointer;
       white-space: nowrap;
       transition: all 0.15s ease;
     }
-    .tab-btn:hover {
-      border-color: var(--accent);
-      color: var(--accent);
-    }
+    .tab-btn:hover { border-color: var(--accent); color: var(--accent); }
     .tab-btn.active {
       background: var(--accent-bg);
       border-color: var(--accent);
@@ -78,51 +79,181 @@
       font-weight: 600;
     }
     .spacer { flex: 1 1 auto; }
-    .theme-btn {
+    .ctrl-btn {
       border: 1px solid var(--border);
-      background: var(--bg);
+      background: var(--card);
       color: var(--muted);
       border-radius: 6px;
-      padding: 4px 8px;
+      padding: 3px 8px;
       font-size: 12px;
       cursor: pointer;
       white-space: nowrap;
+    }
+    .ctrl-btn.active {
+      color: var(--accent);
+      border-color: var(--accent);
+      background: var(--accent-bg);
+      font-weight: 600;
+    }
+    .ticker-strip {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      overflow-x: auto;
+      scrollbar-width: thin;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+      flex: 0 0 auto;
+    }
+    .ticker-card {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      border-radius: 8px;
+      padding: 5px 10px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.12s ease;
+    }
+    .ticker-card:hover { border-color: var(--accent); }
+    .ticker-card.active {
+      border-color: var(--accent);
+      background: var(--accent-bg);
+    }
+    .t-sym { font-weight: 700; font-size: 12.5px; color: var(--text); }
+    .t-price { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .t-pct { font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .up { color: var(--up); }
+    .down { color: var(--down); }
+
+    .header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 8px 14px 4px 14px;
+      background: var(--bg);
+      flex: 0 0 auto;
+    }
+    .title-group {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .active-name { font-size: 16px; font-weight: 700; }
+    .active-price { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .active-chg { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .ohlc-info { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .range-group {
+      display: flex;
+      align-items: center;
+      gap: 4px;
     }
     .chart-stage {
       flex: 1 1 auto;
       position: relative;
       width: 100%;
-      min-height: 410px;
+      min-height: 260px;
       background: var(--bg);
     }
-    .tradingview-widget-container {
-      width: 100%;
-      height: 100%;
+    #chart-el { width: 100%; height: 100%; }
+    .status-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      color: var(--muted);
+      background: var(--bg);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.15s;
     }
+    .status-overlay.show { opacity: 0.92; pointer-events: auto; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="tape-box" id="tape-container"></div>
-    <div class="toolbar" id="tabs-bar"></div>
-    <div class="chart-stage" id="chart-container"></div>
+    <div class="bar" id="tabs-bar"></div>
+    <div class="ticker-strip" id="ticker-strip"></div>
+    <div class="header-row">
+      <div class="title-group">
+        <span class="active-name" id="hdr-name">加载中...</span>
+        <span class="active-price" id="hdr-price"></span>
+        <span class="active-chg" id="hdr-chg"></span>
+        <span class="ohlc-info" id="hdr-ohlc"></span>
+      </div>
+      <div class="range-group" id="range-bar"></div>
+    </div>
+    <div class="chart-stage">
+      <div id="chart-el"></div>
+      <div class="status-overlay show" id="status-overlay">正在加载实时 K 线数据...</div>
+    </div>
   </div>
 
   <script>
     (function () {
       const qs = new URLSearchParams(window.location.search);
       let currentTheme = (qs.get("theme") || "light").toLowerCase() === "dark" ? "dark" : "light";
-      const locale = qs.get("locale") || "zh_CN";
+      let chartMode = "candle"; // "candle" | "area"
+      let activeRange = 65;     // default ~3M (trading days)
+
+      const RANGES = [
+        { label: "1M", days: 22 },
+        { label: "3M", days: 65 },
+        { label: "6M", days: 130 },
+        { label: "1Y", days: 252 },
+        { label: "ALL", days: 9999 }
+      ];
+
+      function tvToTencentCandidates(rawSym) {
+        const clean = rawSym.split("|")[0].trim();
+        const special = {
+          "FOREXCOM:SPXUSD": ["us.INX"],
+          "SP:SPX": ["us.INX"],
+          "FOREXCOM:NSXUSD": ["us.IXIC"],
+          "NASDAQ:IXIC": ["us.IXIC"],
+          "FOREXCOM:DJI": ["us.DJI"],
+          "DJ:DJI": ["us.DJI"],
+          "TVC:RUT": ["usIWM.N"],
+          "NASDAQ:SOX": ["usSOXX.OQ"],
+          "AMEX:HYG": ["usHYG.N"],
+          "TVC:US10Y": ["usTLT.OQ"],
+          "TVC:VIX": ["usVIXY.N"],
+          "TVC:DXY": ["usUUP.N"],
+          "TVC:GOLD": ["usGLD.N"],
+          "COMEX:GC1!": ["usGLD.N"],
+          "TVC:UKOIL": ["usBNO.N"]
+        };
+        if (special[clean]) return special[clean];
+        let exch = "", code = clean;
+        if (clean.includes(":")) {
+          [exch, code] = clean.split(":");
+        }
+        code = code.toUpperCase();
+        if (exch === "NASDAQ") return [`us${code}.OQ`, `us${code}.N`];
+        if (exch === "NYSE" || exch === "AMEX") return [`us${code}.N`, `us${code}.OQ`];
+        return [`us${code}.OQ`, `us${code}.N`];
+      }
 
       function parseList(raw) {
         if (!raw) return [];
         return raw.split(",").map(s => s.trim()).filter(Boolean).map(item => {
+          let label = "", sym = item;
           if (item.includes("|")) {
-            const [label, sym] = item.split("|");
-            return [label.trim(), sym.trim()];
+            [label, sym] = item.split("|");
+            label = label.trim();
+            sym = sym.trim();
+          } else {
+            label = sym.includes(":") ? sym.split(":")[1] : sym;
           }
-          const shortName = item.includes(":") ? item.split(":")[1] : item;
-          return [shortName, item];
+          return { label, sym, kind: "us", candidates: tvToTencentCandidates(sym) };
         });
       }
 
@@ -130,42 +261,40 @@
         {
           id: "indices",
           label: "📈 核心指数",
-          symbols: [
-            ["标普500", "FOREXCOM:SPXUSD|1M"],
-            ["纳指100", "FOREXCOM:NSXUSD|1M"],
-            ["道琼斯", "FOREXCOM:DJI|1M"],
-            ["罗素2000", "TVC:RUT|1M"],
-            ["费城半导体", "NASDAQ:SOX|1M"],
-            ["高收益债 HYG", "AMEX:HYG|1M"]
+          items: [
+            { label: "标普 500", sym: ".SPX", kind: "us", candidates: ["us.INX"] },
+            { label: "纳斯达克", sym: ".IXIC", kind: "us", candidates: ["us.IXIC"] },
+            { label: "道琼斯", sym: ".DJI", kind: "us", candidates: ["us.DJI"] },
+            { label: "罗素 2000 (IWM)", sym: "IWM", kind: "us", candidates: ["usIWM.N"] },
+            { label: "半导体 (SOXX)", sym: "SOXX", kind: "us", candidates: ["usSOXX.OQ"] },
+            { label: "高收益债 (HYG)", sym: "HYG", kind: "us", candidates: ["usHYG.N"] }
           ]
         },
         {
           id: "macro",
           label: "🌍 利率与大宗",
-          symbols: [
-            ["10Y美债", "TVC:US10Y|1M"],
-            ["VIX恐慌", "TVC:VIX|1M"],
-            ["美元指数", "TVC:DXY|1M"],
-            ["黄金", "TVC:GOLD|1M"],
-            ["布伦特原油", "TVC:UKOIL|1M"]
+          items: [
+            { label: "黄金 (GLD)", sym: "GLD", kind: "us", candidates: ["usGLD.N"] },
+            { label: "布伦特原油 (BNO)", sym: "BNO", kind: "us", candidates: ["usBNO.N"] },
+            { label: "20Y 美债 (TLT)", sym: "TLT", kind: "us", candidates: ["usTLT.OQ"] },
+            { label: "美元指数 (UUP)", sym: "UUP", kind: "us", candidates: ["usUUP.N"] },
+            { label: "VIX 波动率 (VIXY)", sym: "VIXY", kind: "us", candidates: ["usVIXY.N"] }
           ]
         },
         {
           id: "crypto",
           label: "🪙 加密货币",
-          symbols: [
-            ["BTC", "BINANCE:BTCUSDT|1M"],
-            ["ETH", "BINANCE:ETHUSDT|1M"],
-            ["BNB", "BINANCE:BNBUSDT|1M"],
-            ["SOL", "BINANCE:SOLUSDT|1M"],
-            ["XRP", "BINANCE:XRPUSDT|1M"],
-            ["HYPE", "BYBIT:HYPEUSDT|1M"]
+          items: [
+            { label: "BTC", sym: "BTC", kind: "crypto", okx: "BTC-USDT", cg: "bitcoin" },
+            { label: "ETH", sym: "ETH", kind: "crypto", okx: "ETH-USDT", cg: "ethereum" },
+            { label: "BNB", sym: "BNB", kind: "crypto", okx: "BNB-USDT", cg: "binancecoin" },
+            { label: "SOL", sym: "SOL", kind: "crypto", okx: "SOL-USDT", cg: "solana" },
+            { label: "XRP", sym: "XRP", kind: "crypto", okx: "XRP-USDT", cg: "ripple" },
+            { label: "HYPE", sym: "HYPE", kind: "crypto", okx: "HYPE-USDT", cg: "hyperliquid" }
           ]
         }
       ];
 
-      // Optional dynamic watchlist groups via URL params (?l1=...&l2=...&l3=...&l4=...&l5=... or ?ai=...)
-      // Keeps personal watchlists private outside the public GitHub repository.
       const LAYER_DEFS = [
         { param: "l1", id: "l1", label: qs.get("l1_name") || "⚡ 能源层" },
         { param: "l2", id: "l2", label: qs.get("l2_name") || "🔌 芯片层" },
@@ -180,127 +309,361 @@
         const parsed = parseList(qs.get(ld.param));
         if (parsed.length) {
           hasCustomLayers = true;
-          tabs.push({
-            id: ld.id,
-            label: ld.label,
-            symbols: parsed.map(([name, sym]) => [name, sym.includes("|") ? sym : `${sym}|1M`])
-          });
+          tabs.push({ id: ld.id, label: ld.label, items: parsed });
         }
       }
-
       if (!hasCustomLayers) {
         const flatAi = parseList(qs.get("ai"));
         if (flatAi.length) {
-          tabs.push({
-            id: "ai",
-            label: qs.get("ai_name") || "🍰 自选股",
-            symbols: flatAi.map(([name, sym]) => [name, sym.includes("|") ? sym : `${sym}|1M`])
-          });
+          tabs.push({ id: "ai", label: qs.get("ai_name") || "🍰 AI 自选股", items: flatAi });
         } else {
           tabs.push({
             id: "demo",
             label: "🍰 AI 自选股示例",
-            symbols: [
-              ["能源 CEG", "NASDAQ:CEG|1M"],
-              ["芯片 NVDA", "NASDAQ:NVDA|1M"],
-              ["基建 VRT", "NYSE:VRT|1M"],
-              ["模型 MSFT", "NASDAQ:MSFT|1M"],
-              ["应用 PLTR", "NASDAQ:PLTR|1M"]
-            ]
+            items: parseList("NASDAQ:CEG,NASDAQ:NVDA,NYSE:VRT,NASDAQ:MSFT,NASDAQ:PLTR")
           });
         }
       }
 
-      const TAPE_SYMBOLS = [
-        { proName: "FOREXCOM:SPXUSD", title: "标普500" },
-        { proName: "FOREXCOM:NSXUSD", title: "纳指100" },
-        { proName: "FOREXCOM:DJI", title: "道琼斯" },
-        { proName: "TVC:RUT", title: "罗素2000" },
-        { proName: "TVC:US10Y", title: "10Y美债" },
-        { proName: "TVC:VIX", title: "VIX" },
-        { proName: "TVC:DXY", title: "美元指数" },
-        { proName: "TVC:GOLD", title: "黄金" },
-        { proName: "TVC:UKOIL", title: "布伦特" },
-        { proName: "BINANCE:BTCUSDT", title: "BTC" },
-        { proName: "NASDAQ:SOX", title: "费城半导体" },
-        { proName: "AMEX:HYG", title: "HYG信用债" }
-      ];
-
       let activeTabId = qs.get("tab") || tabs[0].id;
       if (!tabs.some(t => t.id === activeTabId)) activeTabId = tabs[0].id;
+      let activeItemKey = "";
+      const cache = new Map();
+      let jsonpSeq = 0;
 
-      function applyThemeAttr() {
-        document.documentElement.setAttribute("data-theme", currentTheme);
+      function loadTencentJsonp(code) {
+        return new Promise((resolve) => {
+          const cbName = `__tv_k_${++jsonpSeq}`;
+          const script = document.createElement("script");
+          const timer = setTimeout(() => { cleanup(); resolve(null); }, 7000);
+          function cleanup() {
+            clearTimeout(timer);
+            try { delete window[cbName]; } catch (_) {}
+            if (script.parentNode) script.parentNode.removeChild(script);
+          }
+          script.onload = () => {
+            const payload = window[cbName];
+            cleanup();
+            try {
+              const node = payload && payload.data && payload.data[code];
+              const rows = (node && (node.qfqday || node.day)) || [];
+              if (!rows.length) return resolve(null);
+              const bars = rows.map(r => ({
+                time: r[0],
+                open: parseFloat(r[1]),
+                close: parseFloat(r[2]),
+                high: parseFloat(r[3]),
+                low: parseFloat(r[4]),
+                volume: parseFloat(r[5] || "0")
+              })).filter(b => !Number.isNaN(b.close));
+              resolve(bars.length ? bars : null);
+            } catch (_) {
+              resolve(null);
+            }
+          };
+          script.onerror = () => { cleanup(); resolve(null); };
+          script.src = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${encodeURIComponent(code)},day,,,260,qfq&_var=${cbName}`;
+          document.head.appendChild(script);
+        });
       }
 
-      function renderTape() {
-        const container = document.getElementById("tape-container");
-        container.innerHTML = "";
-        const wrap = document.createElement("div");
-        wrap.className = "tradingview-widget-container";
-        const widget = document.createElement("div");
-        widget.className = "tradingview-widget-container__widget";
-        const script = document.createElement("script");
-        script.type = "text/javascript";
-        script.async = true;
-        script.src = "https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js";
-        script.textContent = JSON.stringify({
-          symbols: TAPE_SYMBOLS,
-          showSymbolLogo: false,
-          isTransparent: true,
-          displayMode: "adaptive",
-          colorTheme: currentTheme,
-          locale: locale
-        });
-        wrap.appendChild(widget);
-        wrap.appendChild(script);
-        container.appendChild(wrap);
+      async function fetchCryptoBars(item) {
+        // 1. OKX public candles (CORS enabled)
+        try {
+          const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(item.okx)}&bar=1D&limit=260`);
+          if (r.ok) {
+            const j = await r.json();
+            const rows = (j && j.data) || [];
+            if (rows.length) {
+              const bars = rows.slice().reverse().map(r => {
+                const d = new Date(parseInt(r[0], 10));
+                const iso = d.toISOString().slice(0, 10);
+                return {
+                  time: iso,
+                  open: parseFloat(r[1]),
+                  high: parseFloat(r[2]),
+                  low: parseFloat(r[3]),
+                  close: parseFloat(r[4]),
+                  volume: parseFloat(r[5] || "0")
+                };
+              });
+              // Deduplicate by date
+              const byDate = new Map();
+              bars.forEach(b => byDate.set(b.time, b));
+              return Array.from(byDate.values()).sort((a, b) => a.time.localeCompare(b.time));
+            }
+          }
+        } catch (_) {}
+
+        // 2. Fallback: CoinGecko OHLC (CORS *)
+        try {
+          const r = await fetch(`https://api.coingecko.com/api/v3/coins/${encodeURIComponent(item.cg)}/ohlc?vs_currency=usd&days=180`);
+          if (r.ok) {
+            const rows = await r.json();
+            if (Array.isArray(rows) && rows.length) {
+              const byDate = new Map();
+              for (const row of rows) {
+                const iso = new Date(row[0]).toISOString().slice(0, 10);
+                byDate.set(iso, {
+                  time: iso,
+                  open: row[1], high: row[2], low: row[3], close: row[4], volume: 0
+                });
+              }
+              return Array.from(byDate.values()).sort((a, b) => a.time.localeCompare(b.time));
+            }
+          }
+        } catch (_) {}
+        return null;
       }
 
-      function renderChart(tab) {
-        const container = document.getElementById("chart-container");
-        container.innerHTML = "";
-        const wrap = document.createElement("div");
-        wrap.className = "tradingview-widget-container";
-        const widget = document.createElement("div");
-        widget.className = "tradingview-widget-container__widget";
-        widget.style.width = "100%";
-        widget.style.height = "100%";
-        const script = document.createElement("script");
-        script.type = "text/javascript";
-        script.async = true;
-        script.src = "https://s3.tradingview.com/external-embedding/embed-widget-symbol-overview.js";
-        script.textContent = JSON.stringify({
-          symbols: tab.symbols,
-          chartOnly: false,
-          width: "100%",
-          height: "100%",
-          locale: locale,
-          colorTheme: currentTheme,
-          autosize: true,
-          showVolume: true,
-          showMA: true,
-          hideDateRanges: false,
-          hideMarketStatus: false,
-          hideSymbolLogo: false,
-          scalePosition: "right",
-          scaleMode: "Normal",
-          fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif",
-          fontSize: "11",
-          noTimeScale: false,
-          valuesTracking: "1",
-          changeMode: "price-and-percent",
-          chartType: "area",
-          maLineColor: "#2962FF",
-          maLineWidth: 1,
-          maLength: 20,
-          lineWidth: 2,
-          lineType: 0,
-          dateRanges: ["1d|5", "5d|30", "1m|60", "3m|1D", "6m|1D", "ytd|1D", "12m|1D", "all|1W"]
+      async function getBars(item) {
+        const key = item.kind + ":" + item.sym;
+        if (cache.has(key)) return cache.get(key);
+        let bars = null;
+        if (item.kind === "crypto") {
+          bars = await fetchCryptoBars(item);
+        } else {
+          for (const cand of item.candidates) {
+            bars = await loadTencentJsonp(cand);
+            if (bars && bars.length) break;
+          }
+        }
+        if (bars) cache.set(key, bars);
+        return bars;
+      }
+
+      function computeMA(bars, period) {
+        const out = [];
+        let sum = 0;
+        for (let i = 0; i < bars.length; i++) {
+          sum += bars[i].close;
+          if (i >= period) sum -= bars[i - period].close;
+          if (i >= period - 1) {
+            out.push({ time: bars[i].time, value: +(sum / period).toFixed(4) });
+          }
+        }
+        return out;
+      }
+
+      function fmtNum(v) {
+        if (v == null || Number.isNaN(v)) return "--";
+        if (v >= 1000) return v.toLocaleString("en-US", { maximumFractionDigits: 2, minimumFractionDigits: 2 });
+        if (v >= 10) return v.toFixed(2);
+        return v.toFixed(3);
+      }
+
+      let chart = null, mainSeries = null, ma20Series = null, volSeries = null;
+      let currentBars = [];
+      let currentItem = null;
+
+      function getPalette() {
+        const dark = currentTheme === "dark";
+        return {
+          bg: dark ? "#191919" : "#ffffff",
+          text: dark ? "#c7c7c7" : "#4b5563",
+          grid: dark ? "#262626" : "#f0f0ec",
+          border: dark ? "#333333" : "#e6e6e2",
+          up: dark ? "#26a69a" : "#0f9d58",
+          down: dark ? "#ef5350" : "#d93025"
+        };
+      }
+
+      function initChart() {
+        const el = document.getElementById("chart-el");
+        if (chart) {
+          chart.remove();
+          chart = null;
+        }
+        const pal = getPalette();
+        chart = LightweightCharts.createChart(el, {
+          width: el.clientWidth,
+          height: el.clientHeight,
+          layout: {
+            background: { type: "solid", color: pal.bg },
+            textColor: pal.text,
+            fontSize: 11.5
+          },
+          grid: {
+            vertLines: { color: pal.grid },
+            horzLines: { color: pal.grid }
+          },
+          crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+          rightPriceScale: { borderColor: pal.border },
+          timeScale: { borderColor: pal.border, timeVisible: false, rightOffset: 4 }
         });
-        wrap.appendChild(widget);
-        wrap.appendChild(script);
-        container.appendChild(wrap);
+
+        chart.subscribeCrosshairMove((param) => {
+          if (!param || !param.time || !currentBars.length) {
+            if (currentBars.length) updateHeaderStats(currentItem, currentBars, currentBars[currentBars.length - 1]);
+            return;
+          }
+          const bar = currentBars.find(b => b.time === param.time);
+          if (bar) updateHeaderStats(currentItem, currentBars, bar);
+        });
+      }
+
+      function updateHeaderStats(item, bars, focusBar) {
+        if (!item || !bars || !bars.length) return;
+        const b = focusBar || bars[bars.length - 1];
+        const idx = bars.indexOf(b);
+        const prev = idx > 0 ? bars[idx - 1].close : b.open;
+        const pct = prev ? ((b.close - prev) / prev) * 100 : 0;
+        const prefix = item.kind === "crypto" ? "$" : "";
+
+        document.getElementById("hdr-name").textContent = item.label;
+        document.getElementById("hdr-price").textContent = `${prefix}${fmtNum(b.close)}`;
+        const chgEl = document.getElementById("hdr-chg");
+        chgEl.textContent = `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`;
+        chgEl.className = "active-chg " + (pct >= 0 ? "up" : "down");
+        document.getElementById("hdr-ohlc").textContent =
+          `${b.time}  开 ${fmtNum(b.open)}  高 ${fmtNum(b.high)}  低 ${fmtNum(b.low)}  收 ${fmtNum(b.close)}`;
+      }
+
+      function renderSeries(bars) {
+        initChart();
+        const pal = getPalette();
+        if (chartMode === "candle") {
+          mainSeries = chart.addCandlestickSeries({
+            upColor: pal.up, downColor: pal.down,
+            borderVisible: false,
+            wickUpColor: pal.up, wickDownColor: pal.down
+          });
+          mainSeries.setData(bars.map(b => ({
+            time: b.time, open: b.open, high: b.high, low: b.low, close: b.close
+          })));
+        } else {
+          const last = bars[bars.length - 1];
+          const first = bars[Math.max(0, bars.length - activeRange)];
+          const isUp = last.close >= first.close;
+          const lc = isUp ? pal.up : pal.down;
+          mainSeries = chart.addAreaSeries({
+            lineColor: lc,
+            topColor: isUp ? "rgba(15,157,88,0.22)" : "rgba(217,48,37,0.20)",
+            bottomColor: "rgba(0,0,0,0)",
+            lineWidth: 2
+          });
+          mainSeries.setData(bars.map(b => ({ time: b.time, value: b.close })));
+        }
+
+        ma20Series = chart.addLineSeries({
+          color: "#2962FF",
+          lineWidth: 1.5,
+          priceLineVisible: false,
+          lastValueVisible: false
+        });
+        ma20Series.setData(computeMA(bars, 20));
+
+        if (bars.some(b => b.volume > 0)) {
+          volSeries = chart.addHistogramSeries({
+            priceFormat: { type: "volume" },
+            priceScaleId: "",
+            lastValueVisible: false,
+            priceLineVisible: false
+          });
+          volSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+          volSeries.setData(bars.map(b => ({
+            time: b.time,
+            value: b.volume,
+            color: b.close >= b.open ? "rgba(15,157,88,0.22)" : "rgba(217,48,37,0.22)"
+          })));
+        }
+
+        applyVisibleRange(bars);
+      }
+
+      function applyVisibleRange(bars) {
+        if (!chart || !bars.length) return;
+        if (activeRange >= bars.length) {
+          chart.timeScale().fitContent();
+        } else {
+          const fromIdx = Math.max(0, bars.length - activeRange);
+          chart.timeScale().setVisibleRange({
+            from: bars[fromIdx].time,
+            to: bars[bars.length - 1].time
+          });
+        }
+      }
+
+      async function selectItem(item) {
+        currentItem = item;
+        activeItemKey = item.kind + ":" + item.sym;
+        highlightTickerCards();
+        const ov = document.getElementById("status-overlay");
+        ov.textContent = `正在加载 ${item.label} K 线...`;
+        ov.classList.add("show");
+
+        const bars = await getBars(item);
+        if (!bars || !bars.length) {
+          ov.textContent = `暂未获取到 ${item.label} 数据，请点击其他标的或稍后重试`;
+          return;
+        }
+        if (activeItemKey !== item.kind + ":" + item.sym) return;
+        currentBars = bars;
+        ov.classList.remove("show");
+        updateHeaderStats(item, bars);
+        renderSeries(bars);
+      }
+
+      function highlightTickerCards() {
+        document.querySelectorAll(".ticker-card").forEach(el => {
+          el.classList.toggle("active", el.dataset.key === activeItemKey);
+        });
+      }
+
+      function renderTickerStrip(tab) {
+        const strip = document.getElementById("ticker-strip");
+        strip.innerHTML = "";
+        tab.items.forEach((item, idx) => {
+          const key = item.kind + ":" + item.sym;
+          const card = document.createElement("div");
+          card.className = "ticker-card" + (idx === 0 ? " active" : "");
+          card.dataset.key = key;
+          card.innerHTML = `<span class="t-sym">${item.label}</span><span class="t-price">...</span><span class="t-pct"></span>`;
+          card.onclick = () => selectItem(item);
+          strip.appendChild(card);
+
+          getBars(item).then(bars => {
+            if (!bars || !bars.length) {
+              card.querySelector(".t-price").textContent = "--";
+              return;
+            }
+            const last = bars[bars.length - 1];
+            const prev = bars.length > 1 ? bars[bars.length - 2].close : last.open;
+            const pct = prev ? ((last.close - prev) / prev) * 100 : 0;
+            const prefix = item.kind === "crypto" ? "$" : "";
+            card.querySelector(".t-price").textContent = `${prefix}${fmtNum(last.close)}`;
+            const pctEl = card.querySelector(".t-pct");
+            pctEl.textContent = `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`;
+            pctEl.className = "t-pct " + (pct >= 0 ? "up" : "down");
+          });
+        });
+        if (tab.items.length) selectItem(tab.items[0]);
+      }
+
+      function renderRangeBar() {
+        const bar = document.getElementById("range-bar");
+        bar.innerHTML = "";
+        for (const r of RANGES) {
+          const btn = document.createElement("button");
+          btn.className = "ctrl-btn" + (activeRange === r.days ? " active" : "");
+          btn.textContent = r.label;
+          btn.onclick = () => {
+            activeRange = r.days;
+            renderRangeBar();
+            if (chartMode === "area" && currentBars.length) renderSeries(currentBars);
+            else applyVisibleRange(currentBars);
+          };
+          bar.appendChild(btn);
+        }
+        const modeBtn = document.createElement("button");
+        modeBtn.className = "ctrl-btn";
+        modeBtn.textContent = chartMode === "candle" ? "折线" : "K线";
+        modeBtn.onclick = () => {
+          chartMode = chartMode === "candle" ? "area" : "candle";
+          renderRangeBar();
+          if (currentBars.length) renderSeries(currentBars);
+        };
+        bar.appendChild(modeBtn);
       }
 
       function renderTabs() {
@@ -313,7 +676,7 @@
           btn.onclick = () => {
             activeTabId = t.id;
             renderTabs();
-            renderChart(t);
+            renderTickerStrip(t);
           };
           bar.appendChild(btn);
         }
@@ -322,22 +685,27 @@
         bar.appendChild(spacer);
 
         const themeBtn = document.createElement("button");
-        themeBtn.className = "theme-btn";
+        themeBtn.className = "ctrl-btn";
         themeBtn.textContent = currentTheme === "dark" ? "☀️ 浅色" : "🌙 深色";
         themeBtn.onclick = () => {
           currentTheme = currentTheme === "dark" ? "light" : "dark";
-          applyThemeAttr();
+          document.documentElement.setAttribute("data-theme", currentTheme);
           renderTabs();
-          renderTape();
-          renderChart(tabs.find(t => t.id === activeTabId));
+          if (currentBars.length) renderSeries(currentBars);
         };
         bar.appendChild(themeBtn);
       }
 
-      applyThemeAttr();
-      renderTape();
+      window.addEventListener("resize", () => {
+        if (!chart) return;
+        const el = document.getElementById("chart-el");
+        chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+      });
+
+      document.documentElement.setAttribute("data-theme", currentTheme);
       renderTabs();
-      renderChart(tabs.find(t => t.id === activeTabId));
+      renderRangeBar();
+      renderTickerStrip(tabs.find(t => t.id === activeTabId));
     })();
   </script>
 </body>

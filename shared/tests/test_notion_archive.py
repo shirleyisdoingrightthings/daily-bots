@@ -450,7 +450,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
 """
         self.assertEqual(
             na.extract_summary(ai_doc, source="🤖 AI 产业日报"),
-            "• 事实一：指标提升 20%\n• 事实二：成本下降 50%",
+            "① 事实一：指标提升 20%\n② 事实二：成本下降 50%",
         )
 
         gh_doc = """<b>🐙 GitHub Trending</b>
@@ -461,7 +461,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
 """
         self.assertEqual(
             na.extract_summary(gh_doc, source="🐙 GitHub & HN"),
-            "• 🛠️ 今日立即可用轮子：foo/bar 好用",
+            "① 🛠️ 今日立即可用轮子：foo/bar 好用",
         )
 
         builder_doc = """<b>🛠 AI Builder 日报 · 2026-11-14</b>
@@ -473,7 +473,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
 正文。
 """
         b_sum = na.extract_summary(builder_doc, source="🛠️ AI Builder")
-        self.assertIn("• 本期焦点：\n  - 1. 硅谷 CEO 联署", b_sum)
+        self.assertIn("② 本期焦点：1. 硅谷 CEO 联署", b_sum)
         self.assertIn("今天主要讨论 Agent 基建", b_sum)
         self.assertNotIn("这批推文来自", b_sum)
 
@@ -484,7 +484,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
 <b>1. Vercel 探讨 UI 抽象</b>
 """
         b_fw = na.extract_summary(builder_fullwidth_utc, source="🛠️ AI Builder")
-        self.assertTrue(b_fw.startswith("• 今天多位一线 Builder 集中探讨了 UI 重构"))
+        self.assertTrue(b_fw.startswith("① 今天多位一线 Builder 集中探讨了 UI 重构"))
         self.assertNotIn("（UTC）", b_fw)
 
     def test_us_stock_combined_market_and_news_summary(self):
@@ -552,25 +552,28 @@ class TestExtractSummaryBySource(unittest.TestCase):
             ["📈 核心指数", "🧭 市场宽度", "📐 趋势与乖离率", "🪙 加密货币", "📅 Financial Events", "🍰 AI 自选股"],
         )
         t1_c0_val = "".join(rt["text"]["content"] for rt in t1_rows[1]["table_row"]["cells"][1])
-        self.assertIn("• 股指：", t1_c0_val)
-        self.assertIn("\n• 利率与波动：", t1_c0_val)
-        self.assertIn("\n• 大宗与加密：", t1_c0_val)
-        # 表2：独立 AI 自选股明细表（表头 + 5层）
+        self.assertIn("① 股指：", t1_c0_val)
+        self.assertIn("\n② 利率与波动：", t1_c0_val)
+        self.assertIn("\n③ 大宗与加密：", t1_c0_val)
+        # 表2：独立 AI 自选股明细表（表头 + 5层，且 Ticker 自动加粗）
         t2_rows = tables[1]["table"]["children"]
         self.assertEqual(len(t2_rows), 6)
         t2_hdr = ["".join(rt["text"]["content"] for rt in c) for c in t2_rows[0]["table_row"]["cells"]]
         self.assertEqual(t2_hdr, ["AI 自选股层级", "成分股收盘表现"])
+        t2_r1_cells = t2_rows[1]["table_row"]["cells"][1]
+        bold_tickers = [rt["text"]["content"] for rt in t2_r1_cells if rt.get("annotations", {}).get("bold")]
+        self.assertEqual(bold_tickers, ["CEG", "VST", "GEV"])
 
         us_sum = na.extract_summary(us_doc, source="🗽 美股与加密")
-        self.assertTrue(us_sum.startswith("• 信号灯：🟡 震荡分化\n• 核心资产："))
-        self.assertIn("标普 -0.25%", us_sum)
+        self.assertTrue(us_sum.startswith("① 信号灯：🟡 震荡分化\n② 核心资产："))
+        self.assertIn("标普 -0.25% ｜ 纳指 -0.62%", us_sum)
         self.assertIn("10Y 美债 4.864%", us_sum)
         self.assertIn("黄金 +1.75%", us_sum)
         self.assertIn("布油 +0.77%", us_sum)
         self.assertIn("BTC $60,795 (+3.09%) 恐贪 11", us_sum)
-        self.assertIn("\n• AI 自选股：应用领涨 (+0.85%)、芯片承压 (-2.10%)", us_sum)
-        self.assertIn("\n• 近期预告：12-01 盘后 ★MRVL、12-02 盘后 ★CRM / 12-01 ISM 制造业 PMI", us_sum)
-        self.assertIn("\n• 核心要闻：\n  - 美国拟对 14 个经济体加征新关税", us_sum)
+        self.assertIn("\n③ AI 自选股：应用领涨 (+0.85%)、芯片承压 (-2.10%)", us_sum)
+        self.assertIn("\n④ 近期预告：12-01 ISM 制造业 PMI ｜ 12-01 盘后 ★MRVL、12-02 盘后 ★CRM", us_sum)
+        self.assertIn("\n⑤ 核心要闻：美国拟对 14 个经济体加征新关税 ｜ 纳指深 V 反弹收跌 0.62%", us_sum)
 
 
 class TestArchiveToNotionHttp(unittest.TestCase):

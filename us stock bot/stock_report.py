@@ -927,15 +927,20 @@ def fetch_financial_events(
     except Exception as e:
         print(f"[WARN] Financial Events 抓取失败: {e}", file=sys.stderr)
 
-    # 去重并排序：自选股优先，同日按市值降序
+    # 去重并严格按时间先后排序（同日内盘前优先于盘后，再按自选股优先、市值降序）
+    _time_rank = {"盘前": 0, "": 1, "盘后": 2}
     seen_e: set[tuple[str, str]] = set()
     uniq_earnings = []
-    for item in sorted(all_earnings, key=lambda x: (x["date"], not x["is_custom"], -x["market_cap"])):
+    for item in sorted(
+        all_earnings,
+        key=lambda x: (x["date"], _time_rank.get(x["time"], 1), not x["is_custom"], -x["market_cap"]),
+    ):
         k = (item["date"], item["symbol"])
         if k not in seen_e:
             seen_e.add(k)
             uniq_earnings.append(item)
 
+    all_macro.sort(key=lambda x: x["date"])
     return {
         "window": f"{target_dates[0]} ~ {target_dates[-1]}" if target_dates else "",
         "earnings": uniq_earnings[:8],
