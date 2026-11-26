@@ -377,6 +377,41 @@ def _sort_dated_events(items: list[str]) -> list[str]:
     return sorted(items, key=_key)
 
 
+def _merge_same_day_events(items: list[str], *, inner_sep: str = "、", group_sep: str = "、") -> str:
+    """将按日期排好序的事件合并同日重复日期前缀（如 11-26 美国 Core PCE、11-26 美国 GDP -> 11-26 美国核心 PCE、美国 GDP）。"""
+    ordered = _sort_dated_events(items)
+    groups: list[tuple[str, list[str]]] = []
+    for raw in ordered:
+        txt = re.sub(r"([\u4e00-\u9fff])\s*\bCore\s+PCE(?:\s+Price\s+Index|\s+Prices)?\b", r"\1核心 PCE", raw.strip(), flags=re.I)
+        txt = re.sub(r"\bCore\s+PCE(?:\s+Price\s+Index|\s+Prices)?\b", "核心 PCE", txt, flags=re.I)
+        m = re.match(r"^(\d{1,2}-\d{1,2})\s+(.+)$", txt)
+        if m:
+            dt, body = m.group(1), m.group(2).strip()
+            if groups and groups[-1][0] == dt:
+                groups[-1][1].append(body)
+            else:
+                groups.append((dt, [body]))
+        else:
+            groups.append(("", [txt]))
+    rendered = []
+    for dt, bodies in groups:
+        if not dt:
+            rendered.append(inner_sep.join(bodies))
+        else:
+            # 同日内若相邻项重复相同盘前/盘后前缀，合并为 "12-02 盘后 ★CRM、SNOW"
+            merged_bodies = []
+            prev_sess = ""
+            for b in bodies:
+                ms = re.match(r"^(盘前|盘后)\s+(.+)$", b)
+                if ms and ms.group(1) == prev_sess:
+                    merged_bodies.append(ms.group(2).strip())
+                else:
+                    prev_sess = ms.group(1) if ms else ""
+                    merged_bodies.append(b)
+            rendered.append(f"{dt} {inner_sep.join(merged_bodies)}")
+    return group_sep.join(rendered)
+
+
 def _earliest_mmdd(s: str) -> tuple[int, int]:
     hits = re.findall(r"(\d{1,2})-(\d{1,2})", s or "")
     if not hits:
@@ -439,7 +474,7 @@ def _extract_us_market_brief(market_text: str) -> str:
     sig_final = std_sig or signal_str
     is_upgraded = any(
         k in market_text
-        for k in ("黄金", "布伦特原油", "Financial Events", "AI 自选股", "AI 五层自选股", "加密货币")
+        for k in ("伦敦金", "黄金", "布伦特原油", "Financial Events", "AI 自选股", "AI 五层自选股", "加密货币")
     )
 
     if is_upgraded:
@@ -454,12 +489,13 @@ def _extract_us_market_brief(market_text: str) -> str:
             m = re.search(rf"{label_re}\s+([\d,.]+%?)", idx_body)
             return f"{alias} {m.group(1)}" if m else ""
 
+        gold_item = _pick_pct(r"伦敦金", "伦敦金") or _pick_pct(r"黄金", "伦敦金")
         for item in (
             _pick_pct(r"标普\s*500", "标普"),
             _pick_pct(r"纳斯达克", "纳指"),
             _pick_val(r"10\s*年期美债", "10Y 美债"),
             _pick_val(r"VIX", "VIX"),
-            _pick_pct(r"黄金", "黄金"),
+            gold_item,
             _pick_pct(r"布伦特原油", "布油"),
         ):
             if item:
@@ -508,7 +544,7 @@ def _extract_us_market_brief(market_text: str) -> str:
                         for x in re.split(r"\s*[|、]\s*", m_raw) if x.strip()
                     ])
                     if m_items:
-                        ev_dated.append((_earliest_mmdd(m_items[0]), "、".join(m_items[:2])))
+                        ev_dated.append((_earliest_mmdd(m_items[0]), _merge_same_day_events(m_items[:3])))
             if earn_m:
                 e_raw = earn_m.group(1).strip()
                 if e_raw and "暂无" not in e_raw:
@@ -517,7 +553,7 @@ def _extract_us_market_brief(market_text: str) -> str:
                         for x in re.split(r"\s*[|、]\s*", e_raw) if x.strip()
                     ])
                     if e_items:
-                        ev_dated.append((_earliest_mmdd(e_items[0]), "、".join(e_items[:2])))
+                        ev_dated.append((_earliest_mmdd(e_items[0]), _merge_same_day_events(e_items[:3])))
             ev_dated.sort(key=lambda x: x[0])
             ev_clean = [txt for _, txt in ev_dated]
             if not ev_clean and "暂无" not in events_line and "无重磅" not in events_line:
@@ -959,7 +995,7 @@ def _format_us_metric_cell(label: str, val: str) -> str:
                     eq.append(p)
                 elif any(k in p for k in ("美债", "VIX", "美元")):
                     rates.append(p)
-                elif any(k in p for k in ("黄金", "原油", "布油", "比特币", "BTC")):
+                elif any(k in p for k in ("伦敦金", "黄金", "原油", "布油", "比特币", "BTC")):
                     comm.append(p)
                 else:
                     other.append(p)
@@ -1011,39 +1047,35 @@ def _format_us_metric_cell(label: str, val: str) -> str:
         if len(lines) >= 2:
             return _num_lines(lines)
 
-    # 4. 加密货币：情绪与结构 / 主流币 / 活跃币
+    # 4. 加密货币：情绪与结构 / 主流币（全部币种统一合并为一行）
     if "加密货币" in label:
         parts = [p.strip() for p in val.split("|") if p.strip()]
-        mood, major, alt = [], [], []
+        mood, coins = [], []
         for p in parts:
             if any(k in p for k in ("恐贪", "总市值", "市占率")):
                 mood.append(p)
-            elif re.match(r"^(?:BTC|ETH|BNB)\b", p):
-                major.append(p)
             else:
-                alt.append(p)
+                coins.append(p)
         lines = []
         if mood:
             lines.append("情绪与结构：" + " | ".join(mood))
-        if major:
-            lines.append("主流币 (24h)：" + " | ".join(major))
-        if alt:
-            lines.append("活跃币 (24h)：" + " | ".join(alt))
+        if coins:
+            lines.append("主流币 (24h)：" + " | ".join(coins))
         if len(lines) >= 2:
             return _num_lines(lines)
 
-    # 5. Financial Events：按日期从近到远排序，且时间更早的分区排在前面
+    # 5. Financial Events：按日期从近到远排序、合并同日重复日期，且时间更早的分区排在前面
     if "Financial Events" in label or "事件" in label:
         earn_m = re.search(r"财报预告[:：]\s*(.+?)(?=\s*\|\s*宏观日程[:：]|$)", val)
         macro_m = re.search(r"宏观日程[:：]\s*(.+?)(?=\s*\|\s*财报预告[:：]|$)", val)
         blocks_dated: list[tuple[tuple[int, int], str]] = []
         if macro_m:
-            m_items = _sort_dated_events([x.strip() for x in macro_m.group(1).split("|") if x.strip()])
-            m_str = " | ".join(m_items)
+            m_items = [x.strip() for x in macro_m.group(1).split("|") if x.strip()]
+            m_str = _merge_same_day_events(m_items, inner_sep="、", group_sep=" | ")
             blocks_dated.append((_earliest_mmdd(m_str), f"宏观日程：{m_str}"))
         if earn_m:
-            e_items = _sort_dated_events([x.strip() for x in earn_m.group(1).split("|") if x.strip()])
-            e_str = " | ".join(e_items)
+            e_items = [x.strip() for x in earn_m.group(1).split("|") if x.strip()]
+            e_str = _merge_same_day_events(e_items, inner_sep="、", group_sep=" | ")
             blocks_dated.append((_earliest_mmdd(e_str), f"财报预告：{e_str}"))
         if len(blocks_dated) >= 2:
             blocks_dated.sort(key=lambda x: x[0])

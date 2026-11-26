@@ -514,11 +514,11 @@ class TestExtractSummaryBySource(unittest.TestCase):
     def test_us_stock_upgraded_dashboard_tables_and_30s_summary(self):
         us_doc = """<b>📊 美股收盘 & 加密行情 · 2026-11-25</b>
 
-📈 <b>核心指数</b>：标普 500 7,182.78 (-0.25%) | 纳斯达克 23,585.80 (-0.62%) | 道琼斯 50,182.95 (+0.33%) | 罗素 2000 2,704.06 (+0.71%) | 10 年期美债 4.864% (-3.8bp) | VIX 28.29 (+7.32%) | 美元指数 103.75 (+0.08%) | 黄金 3,597.70 (+1.75%) | 布伦特原油 95.34 (+0.77%) | 比特币 $60,795.00 (+3.09%)
+📈 <b>核心指数</b>：标普 500 7,182.78 (-0.25%) | 纳斯达克 23,585.80 (-0.62%) | 道琼斯 50,182.95 (+0.33%) | 罗素 2000 2,704.06 (+0.71%) | 10 年期美债 4.864% (-3.8bp) | VIX 28.29 (+7.32%) | 美元指数 103.75 (+0.08%) | 伦敦金 3,573.28 (-0.22%) | 布伦特原油 95.34 (+0.77%) | 比特币 $60,795.00 (+3.09%)
 🧭 <b>市场宽度</b>：11 大板块 8 涨 3 跌 | 28 只核心权重 12 涨 16 跌 | 等权标普 (RSP) +0.83% (RSP-SPX 剪刀差 +1.08%) | 费城半导体 (SOX) -0.65% | 高收益债 (HYG) +0.12% — 广度明显修复
 📐 <b>趋势与乖离率</b>：标普 500 🔴 空头排列 · MA5 乖离率 +0.58% · RSI(14)=38.2 (偏弱) · 布林 %B=0.18 (近下轨) | 纳斯达克 🔴 空头排列 · RSI(14)=35.6 — 短线近支撑区
 🪙 <b>加密货币</b>：恐贪指数 11 (Extreme Fear) | 总市值 $2,111B (-0.33%) | BTC 市占率 57.9% | BTC $60,795.00 (+3.09%) | ETH $1,700.15 (+2.87%) | BNB $557.38 (+3.19%) | SOL $71.12 (+3.52%) | XRP $0.95 (+4.51%) | HYPE $61.71 (+5.15%)
-📅 <b>Financial Events</b>：财报预告：12-01 盘后 ★MRVL | 12-02 盘后 ★CRM | 宏观日程：12-01 ISM 制造业 PMI
+📅 <b>Financial Events</b>：宏观日程：11-26 美国 Core PCE | 11-26 美国 GDP | 财报预告：12-01 BHP | 12-01 盘后 ★MRVL | 12-02 盘后 ★CRM
 🍰 <b>AI 自选股</b>：29 只 10 涨 19 跌 | ⚡ 能源 -1.39% · 🔌 芯片 -2.10% · 🏗️ 基建 -1.45% · 🧠 模型 +0.32% · 🚀 应用 +0.85% | 最强 META (+3.40%) · 最弱 ORCL (-5.13%)
 
 <b>🍰 AI 自选股明细</b>
@@ -564,15 +564,21 @@ class TestExtractSummaryBySource(unittest.TestCase):
         bold_tickers = [rt["text"]["content"] for rt in t2_r1_cells if rt.get("annotations", {}).get("bold")]
         self.assertEqual(bold_tickers, ["CEG", "VST", "GEV"])
 
+        t1_crypto_val = "".join(rt["text"]["content"] for rt in t1_rows[4]["table_row"]["cells"][1])
+        self.assertIn("① 情绪与结构：", t1_crypto_val)
+        self.assertIn("\n② 主流币 (24h)：", t1_crypto_val)
+        self.assertNotIn("活跃币", t1_crypto_val)
+        self.assertIn("HYPE $61.71", t1_crypto_val)
+
         us_sum = na.extract_summary(us_doc, source="🗽 美股与加密")
         self.assertTrue(us_sum.startswith("① 信号灯：🟡 震荡分化\n② 核心资产："))
         self.assertIn("标普 -0.25% ｜ 纳指 -0.62%", us_sum)
         self.assertIn("10Y 美债 4.864%", us_sum)
-        self.assertIn("黄金 +1.75%", us_sum)
+        self.assertIn("伦敦金 -0.22%", us_sum)
         self.assertIn("布油 +0.77%", us_sum)
         self.assertIn("BTC $60,795 (+3.09%) 恐贪 11", us_sum)
         self.assertIn("\n③ AI 自选股：应用领涨 (+0.85%)、芯片承压 (-2.10%)", us_sum)
-        self.assertIn("\n④ 近期预告：12-01 ISM 制造业 PMI ｜ 12-01 盘后 ★MRVL、12-02 盘后 ★CRM", us_sum)
+        self.assertIn("\n④ 近期预告：11-26 美国核心 PCE、美国 GDP ｜ 12-01 BHP、盘后 ★MRVL、12-02 盘后 ★CRM", us_sum)
         self.assertIn("\n⑤ 核心要闻：美国拟对 14 个经济体加征新关税 ｜ 纳指深 V 反弹收跌 0.62%", us_sum)
 
 

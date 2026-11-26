@@ -89,6 +89,7 @@
       cursor: pointer;
       white-space: nowrap;
     }
+    .ctrl-btn:hover { border-color: var(--accent); color: var(--accent); }
     .ctrl-btn.active {
       color: var(--accent);
       border-color: var(--accent);
@@ -142,23 +143,24 @@
     .title-group {
       display: flex;
       align-items: baseline;
-      gap: 10px;
+      gap: 9px;
       flex-wrap: wrap;
     }
-    .active-name { font-size: 16px; font-weight: 700; }
-    .active-price { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .active-name { font-size: 15.5px; font-weight: 700; }
+    .active-price { font-size: 15.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
     .active-chg { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
     .ohlc-info { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
     .range-group {
       display: flex;
       align-items: center;
       gap: 4px;
+      flex-wrap: wrap;
     }
     .chart-stage {
       flex: 1 1 auto;
       position: relative;
       width: 100%;
-      min-height: 260px;
+      min-height: 250px;
       background: var(--bg);
     }
     #chart-el { width: 100%; height: 100%; }
@@ -193,7 +195,7 @@
     </div>
     <div class="chart-stage">
       <div id="chart-el"></div>
-      <div class="status-overlay show" id="status-overlay">正在加载实时 K 线数据...</div>
+      <div class="status-overlay show" id="status-overlay">正在加载行情数据...</div>
     </div>
   </div>
 
@@ -201,15 +203,19 @@
     (function () {
       const qs = new URLSearchParams(window.location.search);
       let currentTheme = (qs.get("theme") || "light").toLowerCase() === "dark" ? "dark" : "light";
-      let chartMode = "candle"; // "candle" | "area"
-      let activeRange = 65;     // default ~3M (trading days)
+      let chartMode = "area"; // "area" | "candle"
+      let activeRangeId = "1M";
 
+      // 严格按从左到右：1D / 5D / 1M / 6M / YTD / 1Y / 5Y / ALL
       const RANGES = [
-        { label: "1M", days: 22 },
-        { label: "3M", days: 65 },
-        { label: "6M", days: 130 },
-        { label: "1Y", days: 252 },
-        { label: "ALL", days: 9999 }
+        { id: "1D",  label: "1D",  tier: "1d" },
+        { id: "5D",  label: "5D",  tier: "5d" },
+        { id: "1M",  label: "1M",  tier: "day", days: 22 },
+        { id: "6M",  label: "6M",  tier: "day", days: 130 },
+        { id: "YTD", label: "YTD", tier: "day", ytd: true },
+        { id: "1Y",  label: "1Y",  tier: "day", days: 255 },
+        { id: "5Y",  label: "5Y",  tier: "week", bars: 262 },
+        { id: "ALL", label: "ALL", tier: "month", bars: 260 }
       ];
 
       function tvToTencentCandidates(rawSym) {
@@ -227,15 +233,11 @@
           "TVC:US10Y": ["usTLT.OQ"],
           "TVC:VIX": ["usVIXY.N"],
           "TVC:DXY": ["usUUP.N"],
-          "TVC:GOLD": ["usGLD.N"],
-          "COMEX:GC1!": ["usGLD.N"],
           "TVC:UKOIL": ["usBNO.N"]
         };
         if (special[clean]) return special[clean];
         let exch = "", code = clean;
-        if (clean.includes(":")) {
-          [exch, code] = clean.split(":");
-        }
+        if (clean.includes(":")) [exch, code] = clean.split(":");
         code = code.toUpperCase();
         if (exch === "NASDAQ") return [`us${code}.OQ`, `us${code}.N`];
         if (exch === "NYSE" || exch === "AMEX") return [`us${code}.N`, `us${code}.OQ`];
@@ -274,7 +276,7 @@
           id: "macro",
           label: "🌍 利率与大宗",
           items: [
-            { label: "黄金 (GLD)", sym: "GLD", kind: "us", candidates: ["usGLD.N"] },
+            { label: "伦敦金 (XAU)", sym: "XAU", kind: "okx", okx: "XAUT-USDT", cg: "tether-gold", unitPrefix: "$" },
             { label: "布伦特原油 (BNO)", sym: "BNO", kind: "us", candidates: ["usBNO.N"] },
             { label: "20Y 美债 (TLT)", sym: "TLT", kind: "us", candidates: ["usTLT.OQ"] },
             { label: "美元指数 (UUP)", sym: "UUP", kind: "us", candidates: ["usUUP.N"] },
@@ -285,12 +287,12 @@
           id: "crypto",
           label: "🪙 加密货币",
           items: [
-            { label: "BTC", sym: "BTC", kind: "crypto", okx: "BTC-USDT", cg: "bitcoin" },
-            { label: "ETH", sym: "ETH", kind: "crypto", okx: "ETH-USDT", cg: "ethereum" },
-            { label: "BNB", sym: "BNB", kind: "crypto", okx: "BNB-USDT", cg: "binancecoin" },
-            { label: "SOL", sym: "SOL", kind: "crypto", okx: "SOL-USDT", cg: "solana" },
-            { label: "XRP", sym: "XRP", kind: "crypto", okx: "XRP-USDT", cg: "ripple" },
-            { label: "HYPE", sym: "HYPE", kind: "crypto", okx: "HYPE-USDT", cg: "hyperliquid" }
+            { label: "BTC", sym: "BTC", kind: "okx", okx: "BTC-USDT", cg: "bitcoin", unitPrefix: "$" },
+            { label: "ETH", sym: "ETH", kind: "okx", okx: "ETH-USDT", cg: "ethereum", unitPrefix: "$" },
+            { label: "BNB", sym: "BNB", kind: "okx", okx: "BNB-USDT", cg: "binancecoin", unitPrefix: "$" },
+            { label: "SOL", sym: "SOL", kind: "okx", okx: "SOL-USDT", cg: "solana", unitPrefix: "$" },
+            { label: "XRP", sym: "XRP", kind: "okx", okx: "XRP-USDT", cg: "ripple", unitPrefix: "$" },
+            { label: "HYPE", sym: "HYPE", kind: "okx", okx: "HYPE-USDT", cg: "hyperliquid", unitPrefix: "$" }
           ]
         }
       ];
@@ -329,11 +331,11 @@
       if (!tabs.some(t => t.id === activeTabId)) activeTabId = tabs[0].id;
       let activeItemKey = "";
       const cache = new Map();
+      const resolvedCode = new Map();
       let jsonpSeq = 0;
 
-      function loadTencentJsonp(code) {
+      function loadJsonp(url, cbName) {
         return new Promise((resolve) => {
-          const cbName = `__tv_k_${++jsonpSeq}`;
           const script = document.createElement("script");
           const timer = setTimeout(() => { cleanup(); resolve(null); }, 7000);
           function cleanup() {
@@ -344,10 +346,23 @@
           script.onload = () => {
             const payload = window[cbName];
             cleanup();
-            try {
-              const node = payload && payload.data && payload.data[code];
-              const rows = (node && (node.qfqday || node.day)) || [];
-              if (!rows.length) return resolve(null);
+            resolve(payload || null);
+          };
+          script.onerror = () => { cleanup(); resolve(null); };
+          script.src = url;
+          document.head.appendChild(script);
+        });
+      }
+
+      async function fetchUsKline(code, period, count) {
+        for (const ep of ["usfqkline/get", "fqkline/get"]) {
+          const cbName = `__tv_k_${++jsonpSeq}`;
+          const url = `https://web.ifzq.gtimg.cn/appstock/app/${ep}?param=${encodeURIComponent(code)},${period},,,${count},qfq&_var=${cbName}`;
+          const payload = await loadJsonp(url, cbName);
+          try {
+            const node = payload && payload.data && payload.data[code];
+            const rows = (node && (node[`qfq${period}`] || node[period])) || [];
+            if (rows.length) {
               const bars = rows.map(r => ({
                 time: r[0],
                 open: parseFloat(r[1]),
@@ -356,79 +371,145 @@
                 low: parseFloat(r[4]),
                 volume: parseFloat(r[5] || "0")
               })).filter(b => !Number.isNaN(b.close));
-              resolve(bars.length ? bars : null);
-            } catch (_) {
-              resolve(null);
+              if (bars.length) return bars;
             }
-          };
-          script.onerror = () => { cleanup(); resolve(null); };
-          script.src = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${encodeURIComponent(code)},day,,,260,qfq&_var=${cbName}`;
-          document.head.appendChild(script);
-        });
+          } catch (_) {}
+        }
+        return null;
       }
 
-      async function fetchCryptoBars(item) {
-        // 1. OKX public candles (CORS enabled)
+      async function fetchUsIntraday(code, maxDays) {
+        const cbName = `__tv_m_${++jsonpSeq}`;
+        const url = `https://web.ifzq.gtimg.cn/appstock/app/dayus/query?code=${encodeURIComponent(code)}&_var=${cbName}`;
+        const payload = await loadJsonp(url, cbName);
         try {
-          const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(item.okx)}&bar=1D&limit=260`);
+          const dayBlocks = payload && payload.data && payload.data[code] && payload.data[code].data;
+          if (!Array.isArray(dayBlocks) || !dayBlocks.length) return null;
+          // dayBlocks 倒序：[最新一天, 前一天, ...]
+          const picked = dayBlocks.slice(0, maxDays).reverse();
+          const bars = [];
+          const seenTs = new Set();
+          for (const db of picked) {
+            const ds = String(db.date || "");
+            if (ds.length !== 8) continue;
+            const y = +ds.slice(0, 4), m = +ds.slice(4, 6) - 1, d = +ds.slice(6, 8);
+            const pts = db.data || [];
+            // 5D 时每 5 分钟采样保持丝滑，1D 保留全部 1 分钟点
+            const step = maxDays > 1 ? 5 : 1;
+            for (let i = 0; i < pts.length; i += step) {
+              const segs = String(pts[i]).split(" ");
+              if (segs.length < 2) continue;
+              const hhmm = segs[0];
+              const price = parseFloat(segs[1]);
+              if (Number.isNaN(price) || hhmm.length < 4) continue;
+              const hh = +hhmm.slice(0, 2), mm = +hhmm.slice(2, 4);
+              // 以美东本地时钟编码为 UTC unix 秒用于 Lightweight Charts 横轴直观显示
+              const ts = Math.floor(Date.UTC(y, m, d, hh, mm) / 1000);
+              if (seenTs.has(ts)) continue;
+              seenTs.add(ts);
+              bars.push({
+                time: ts,
+                labelTime: `${ds.slice(4,6)}-${ds.slice(6,8)} ${hhmm.slice(0,2)}:${hhmm.slice(2,4)} ET`,
+                open: price, high: price, low: price, close: price,
+                volume: 0,
+                intraday: true
+              });
+            }
+          }
+          return bars.length ? bars : null;
+        } catch (_) {
+          return null;
+        }
+      }
+
+      async function fetchOkxBars(item, tier) {
+        const barMap = {
+          "1d":    { bar: "15m", limit: 96,  intraday: true },
+          "5d":    { bar: "1H",  limit: 120, intraday: true },
+          "day":   { bar: "1D",  limit: 300, intraday: false },
+          "week":  { bar: "1W",  limit: 265, intraday: false },
+          "month": { bar: "1M",  limit: 240, intraday: false }
+        };
+        const cfg = barMap[tier] || barMap.day;
+        try {
+          const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(item.okx)}&bar=${cfg.bar}&limit=${cfg.limit}`);
           if (r.ok) {
             const j = await r.json();
             const rows = (j && j.data) || [];
             if (rows.length) {
-              const bars = rows.slice().reverse().map(r => {
-                const d = new Date(parseInt(r[0], 10));
-                const iso = d.toISOString().slice(0, 10);
-                return {
-                  time: iso,
-                  open: parseFloat(r[1]),
-                  high: parseFloat(r[2]),
-                  low: parseFloat(r[3]),
-                  close: parseFloat(r[4]),
-                  volume: parseFloat(r[5] || "0")
-                };
-              });
-              // Deduplicate by date
-              const byDate = new Map();
-              bars.forEach(b => byDate.set(b.time, b));
-              return Array.from(byDate.values()).sort((a, b) => a.time.localeCompare(b.time));
+              const out = [];
+              const seen = new Set();
+              for (const row of rows.slice().reverse()) {
+                const ms = parseInt(row[0], 10);
+                const d = new Date(ms);
+                const timeKey = cfg.intraday ? Math.floor(ms / 1000) : d.toISOString().slice(0, 10);
+                if (seen.has(timeKey)) continue;
+                seen.add(timeKey);
+                out.push({
+                  time: timeKey,
+                  labelTime: cfg.intraday
+                    ? `${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`
+                    : timeKey,
+                  open: parseFloat(row[1]),
+                  high: parseFloat(row[2]),
+                  low: parseFloat(row[3]),
+                  close: parseFloat(row[4]),
+                  volume: parseFloat(row[5] || "0"),
+                  intraday: cfg.intraday
+                });
+              }
+              if (out.length) return out;
             }
           }
         } catch (_) {}
 
-        // 2. Fallback: CoinGecko OHLC (CORS *)
-        try {
-          const r = await fetch(`https://api.coingecko.com/api/v3/coins/${encodeURIComponent(item.cg)}/ohlc?vs_currency=usd&days=180`);
-          if (r.ok) {
-            const rows = await r.json();
-            if (Array.isArray(rows) && rows.length) {
-              const byDate = new Map();
-              for (const row of rows) {
-                const iso = new Date(row[0]).toISOString().slice(0, 10);
-                byDate.set(iso, {
-                  time: iso,
-                  open: row[1], high: row[2], low: row[3], close: row[4], volume: 0
-                });
+        // CoinGecko 兜底（日线级）
+        if (item.cg) {
+          try {
+            const days = tier === "1d" ? 1 : (tier === "5d" ? 7 : 180);
+            const r = await fetch(`https://api.coingecko.com/api/v3/coins/${encodeURIComponent(item.cg)}/ohlc?vs_currency=usd&days=${days}`);
+            if (r.ok) {
+              const rows = await r.json();
+              if (Array.isArray(rows) && rows.length) {
+                const isIntra = tier === "1d" || tier === "5d";
+                const map = new Map();
+                for (const row of rows) {
+                  const d = new Date(row[0]);
+                  const tk = isIntra ? Math.floor(row[0] / 1000) : d.toISOString().slice(0, 10);
+                  map.set(tk, {
+                    time: tk, open: row[1], high: row[2], low: row[3], close: row[4], volume: 0, intraday: isIntra
+                  });
+                }
+                return Array.from(map.values()).sort((a, b) => (a.time > b.time ? 1 : -1));
               }
-              return Array.from(byDate.values()).sort((a, b) => a.time.localeCompare(b.time));
             }
-          }
-        } catch (_) {}
+          } catch (_) {}
+        }
         return null;
       }
 
-      async function getBars(item) {
-        const key = item.kind + ":" + item.sym;
-        if (cache.has(key)) return cache.get(key);
+      async function getBars(item, tier) {
+        const cKey = `${item.kind}:${item.sym}:${tier}`;
+        if (cache.has(cKey)) return cache.get(cKey);
         let bars = null;
-        if (item.kind === "crypto") {
-          bars = await fetchCryptoBars(item);
+        if (item.kind === "okx") {
+          bars = await fetchOkxBars(item, tier);
         } else {
-          for (const cand of item.candidates) {
-            bars = await loadTencentJsonp(cand);
-            if (bars && bars.length) break;
+          const itemId = `${item.kind}:${item.sym}`;
+          const cands = resolvedCode.has(itemId) ? [resolvedCode.get(itemId)] : item.candidates;
+          for (const cand of cands) {
+            if (tier === "1d") bars = await fetchUsIntraday(cand, 1);
+            else if (tier === "5d") bars = await fetchUsIntraday(cand, 5);
+            else if (tier === "week") bars = await fetchUsKline(cand, "week", 265);
+            else if (tier === "month") bars = await fetchUsKline(cand, "month", 260);
+            else bars = await fetchUsKline(cand, "day", 265);
+            if (bars && bars.length) {
+              resolvedCode.set(itemId, cand);
+              break;
+            }
           }
         }
-        if (bars) cache.set(key, bars);
+        if (bars) cache.set(cKey, bars);
         return bars;
       }
 
@@ -468,12 +549,9 @@
         };
       }
 
-      function initChart() {
+      function initChart(isIntraday) {
         const el = document.getElementById("chart-el");
-        if (chart) {
-          chart.remove();
-          chart = null;
-        }
+        if (chart) { chart.remove(); chart = null; }
         const pal = getPalette();
         chart = LightweightCharts.createChart(el, {
           width: el.clientWidth,
@@ -483,13 +561,10 @@
             textColor: pal.text,
             fontSize: 11.5
           },
-          grid: {
-            vertLines: { color: pal.grid },
-            horzLines: { color: pal.grid }
-          },
+          grid: { vertLines: { color: pal.grid }, horzLines: { color: pal.grid } },
           crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
           rightPriceScale: { borderColor: pal.border },
-          timeScale: { borderColor: pal.border, timeVisible: false, rightOffset: 4 }
+          timeScale: { borderColor: pal.border, timeVisible: !!isIntraday, secondsVisible: false, rightOffset: 4 }
         });
 
         chart.subscribeCrosshairMove((param) => {
@@ -505,24 +580,46 @@
       function updateHeaderStats(item, bars, focusBar) {
         if (!item || !bars || !bars.length) return;
         const b = focusBar || bars[bars.length - 1];
-        const idx = bars.indexOf(b);
-        const prev = idx > 0 ? bars[idx - 1].close : b.open;
-        const pct = prev ? ((b.close - prev) / prev) * 100 : 0;
-        const prefix = item.kind === "crypto" ? "$" : "";
+        const refBase = (activeRangeId === "1D" || activeRangeId === "5D")
+          ? bars[0].open
+          : (bars.indexOf(b) > 0 ? bars[bars.indexOf(b) - 1].close : b.open);
+        const pct = refBase ? ((b.close - refBase) / refBase) * 100 : 0;
+        const prefix = item.unitPrefix || "";
+        const freshTag = item.kind === "okx" ? "24/7 实时" : (b.intraday ? "美股分时" : "美股收盘");
 
         document.getElementById("hdr-name").textContent = item.label;
         document.getElementById("hdr-price").textContent = `${prefix}${fmtNum(b.close)}`;
         const chgEl = document.getElementById("hdr-chg");
         chgEl.textContent = `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`;
         chgEl.className = "active-chg " + (pct >= 0 ? "up" : "down");
-        document.getElementById("hdr-ohlc").textContent =
-          `${b.time}  开 ${fmtNum(b.open)}  高 ${fmtNum(b.high)}  低 ${fmtNum(b.low)}  收 ${fmtNum(b.close)}`;
+
+        const tLabel = b.labelTime || String(b.time);
+        document.getElementById("hdr-ohlc").textContent = b.intraday
+          ? `${tLabel} · ${freshTag}`
+          : `${tLabel} 开 ${fmtNum(b.open)} 高 ${fmtNum(b.high)} 低 ${fmtNum(b.low)} 收 ${fmtNum(b.close)} · ${freshTag}`;
       }
 
-      function renderSeries(bars) {
-        initChart();
+      function sliceByRange(bars, rangeCfg) {
+        if (!bars || !bars.length) return [];
+        if (rangeCfg.ytd) {
+          const latestYear = String(bars[bars.length - 1].time).slice(0, 4);
+          const ytdBars = bars.filter(b => String(b.time).startsWith(latestYear));
+          return ytdBars.length >= 2 ? ytdBars : bars;
+        }
+        if (rangeCfg.days && bars.length > rangeCfg.days) {
+          return bars.slice(bars.length - rangeCfg.days);
+        }
+        return bars;
+      }
+
+      function renderSeries(bars, rangeCfg) {
+        const isIntraday = bars.some(b => b.intraday);
+        initChart(isIntraday);
         const pal = getPalette();
-        if (chartMode === "candle") {
+        const visibleBars = sliceByRange(bars, rangeCfg);
+        const useCandle = chartMode === "candle" && !(isIntraday && currentItem.kind === "us");
+
+        if (useCandle) {
           mainSeries = chart.addCandlestickSeries({
             upColor: pal.up, downColor: pal.down,
             borderVisible: false,
@@ -532,8 +629,8 @@
             time: b.time, open: b.open, high: b.high, low: b.low, close: b.close
           })));
         } else {
-          const last = bars[bars.length - 1];
-          const first = bars[Math.max(0, bars.length - activeRange)];
+          const first = visibleBars[0] || bars[0];
+          const last = visibleBars[visibleBars.length - 1] || bars[bars.length - 1];
           const isUp = last.close >= first.close;
           const lc = isUp ? pal.up : pal.down;
           mainSeries = chart.addAreaSeries({
@@ -545,15 +642,17 @@
           mainSeries.setData(bars.map(b => ({ time: b.time, value: b.close })));
         }
 
-        ma20Series = chart.addLineSeries({
-          color: "#2962FF",
-          lineWidth: 1.5,
-          priceLineVisible: false,
-          lastValueVisible: false
-        });
-        ma20Series.setData(computeMA(bars, 20));
+        if (!isIntraday && bars.length >= 20) {
+          ma20Series = chart.addLineSeries({
+            color: "#2962FF",
+            lineWidth: 1.5,
+            priceLineVisible: false,
+            lastValueVisible: false
+          });
+          ma20Series.setData(computeMA(bars, 20));
+        }
 
-        if (bars.some(b => b.volume > 0)) {
+        if (!isIntraday && bars.some(b => b.volume > 0)) {
           volSeries = chart.addHistogramSeries({
             priceFormat: { type: "volume" },
             priceScaleId: "",
@@ -568,19 +667,13 @@
           })));
         }
 
-        applyVisibleRange(bars);
-      }
-
-      function applyVisibleRange(bars) {
-        if (!chart || !bars.length) return;
-        if (activeRange >= bars.length) {
-          chart.timeScale().fitContent();
-        } else {
-          const fromIdx = Math.max(0, bars.length - activeRange);
+        if (visibleBars.length && visibleBars.length < bars.length) {
           chart.timeScale().setVisibleRange({
-            from: bars[fromIdx].time,
-            to: bars[bars.length - 1].time
+            from: visibleBars[0].time,
+            to: visibleBars[visibleBars.length - 1].time
           });
+        } else {
+          chart.timeScale().fitContent();
         }
       }
 
@@ -588,20 +681,21 @@
         currentItem = item;
         activeItemKey = item.kind + ":" + item.sym;
         highlightTickerCards();
+        const rangeCfg = RANGES.find(r => r.id === activeRangeId) || RANGES[2];
         const ov = document.getElementById("status-overlay");
-        ov.textContent = `正在加载 ${item.label} K 线...`;
+        ov.textContent = `正在加载 ${item.label} (${rangeCfg.label})...`;
         ov.classList.add("show");
 
-        const bars = await getBars(item);
+        const bars = await getBars(item, rangeCfg.tier);
+        if (activeItemKey !== item.kind + ":" + item.sym) return;
         if (!bars || !bars.length) {
-          ov.textContent = `暂未获取到 ${item.label} 数据，请点击其他标的或稍后重试`;
+          ov.textContent = `暂未获取到 ${item.label} (${rangeCfg.label}) 数据，可切换其他时间区间`;
           return;
         }
-        if (activeItemKey !== item.kind + ":" + item.sym) return;
         currentBars = bars;
         ov.classList.remove("show");
         updateHeaderStats(item, bars);
-        renderSeries(bars);
+        renderSeries(bars, rangeCfg);
       }
 
       function highlightTickerCards() {
@@ -622,7 +716,7 @@
           card.onclick = () => selectItem(item);
           strip.appendChild(card);
 
-          getBars(item).then(bars => {
+          getBars(item, "day").then(bars => {
             if (!bars || !bars.length) {
               card.querySelector(".t-price").textContent = "--";
               return;
@@ -630,7 +724,7 @@
             const last = bars[bars.length - 1];
             const prev = bars.length > 1 ? bars[bars.length - 2].close : last.open;
             const pct = prev ? ((last.close - prev) / prev) * 100 : 0;
-            const prefix = item.kind === "crypto" ? "$" : "";
+            const prefix = item.unitPrefix || "";
             card.querySelector(".t-price").textContent = `${prefix}${fmtNum(last.close)}`;
             const pctEl = card.querySelector(".t-pct");
             pctEl.textContent = `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`;
@@ -645,13 +739,12 @@
         bar.innerHTML = "";
         for (const r of RANGES) {
           const btn = document.createElement("button");
-          btn.className = "ctrl-btn" + (activeRange === r.days ? " active" : "");
+          btn.className = "ctrl-btn" + (activeRangeId === r.id ? " active" : "");
           btn.textContent = r.label;
           btn.onclick = () => {
-            activeRange = r.days;
+            activeRangeId = r.id;
             renderRangeBar();
-            if (chartMode === "area" && currentBars.length) renderSeries(currentBars);
-            else applyVisibleRange(currentBars);
+            if (currentItem) selectItem(currentItem);
           };
           bar.appendChild(btn);
         }
@@ -661,7 +754,7 @@
         modeBtn.onclick = () => {
           chartMode = chartMode === "candle" ? "area" : "candle";
           renderRangeBar();
-          if (currentBars.length) renderSeries(currentBars);
+          if (currentBars.length) renderSeries(currentBars, RANGES.find(r => r.id === activeRangeId));
         };
         bar.appendChild(modeBtn);
       }
@@ -691,7 +784,7 @@
           currentTheme = currentTheme === "dark" ? "light" : "dark";
           document.documentElement.setAttribute("data-theme", currentTheme);
           renderTabs();
-          if (currentBars.length) renderSeries(currentBars);
+          if (currentBars.length) renderSeries(currentBars, RANGES.find(r => r.id === activeRangeId));
         };
         bar.appendChild(themeBtn);
       }
