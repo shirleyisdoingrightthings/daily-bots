@@ -149,6 +149,20 @@ class TestUsUncoveredSelection(unittest.TestCase):
         self.assertIn("UNH", syms)
         self.assertIn("INTC", syms)
 
+    def test_noise_filter_and_watchlist_news_tagging(self):
+        self.assertTrue(stock_report._NOISE_NEWS_TITLE_RE.search("AXIS: 3 Key Takeaways for Long-Term Investors"))
+        self.assertTrue(stock_report._NOISE_NEWS_TITLE_RE.search("Inside India newsletter: Roaring economy and auto sales"))
+        self.assertTrue(stock_report._NOISE_NEWS_TITLE_RE.search("K-beauty stocks rally ahead of Black Friday"))
+        self.assertFalse(stock_report._NOISE_NEWS_TITLE_RE.search("S&P warns Nvidia credit rating could be cut"))
+        self.assertFalse(stock_report._NOISE_NEWS_TITLE_RE.search("Aschenbrenner's Situational Awareness lost 65% in Q3"))
+
+        hits = stock_report._match_watchlist_hits(
+            "Nvidia and CoreWeave expand compute agreement",
+            "Oracle also raised debt for data centers.",
+            ["NVDA", "CRWV", "ORCL", "TSLA"],
+        )
+        self.assertEqual(hits, ["NVDA", "CRWV", "ORCL"])
+
 
 if __name__ == "__main__":
     unittest.main()

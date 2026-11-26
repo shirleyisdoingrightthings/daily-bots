@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (sanitize_html, with_retry, fetch_rss, parse_entry_date,
                        already_ran_today, fetch_article_text,
                        url_key, load_sent_urls, record_sent_urls, extract_hrefs,
+                       load_daily_ledger, format_ledger_context,
                        archive_and_sync_notion,
                        send_feishu, update_zero_streak,
                        make_logger, make_pending_saver, proxy_ok,
@@ -404,18 +405,57 @@ def fetch_crypto_snapshot() -> dict:
 
 
 # ===== 新闻抓取 =====
-def build_news_context(entries: list) -> tuple:
+# 过滤非美股主线噪音、区域泛财经通讯与模板化荐股软文（不影响真实美股/宏观/央行/自选股新闻）
+_NOISE_NEWS_TITLE_RE = re.compile(
+    r"(?:\b3\s+key\s+takeaways\s+for\s+long-term\s+investors\b|"
+    r"\binside\s+india\s+newsletter\b|"
+    r"\bk-beauty\s+stocks\b|"
+    r"\bshould\s+you\s+(?:buy|avoid)\b|\bhere.?s\s+why\s+i.?m\s+buying\b|\bbetter\s+buy\s*:|"
+    r"\b(?:kospi|nikkei|hang\s+seng|asx\s+200|ftse\s+100)\s+(?:leads|climbs|drops|falls|rises)\b.*\basia(?:-pacific)?\s+markets\b|"
+    r"\blifts\s+asia\s+markets\b|\beuropean\s+markets\s+(?:open|close|head)\b)",
+    re.IGNORECASE,
+)
+
+
+def _match_watchlist_hits(title: str, text: str, wl_syms: list[str] | None) -> list[str]:
+    """检测新闻标题或正文是否命中个人自选股池（Ticker 或品牌名），返回去重后的代码列表。"""
+    if not wl_syms:
+        return []
+    blob = f"{title}\n{text[:1000]}"
+    low = blob.lower()
+    hits = []
+    for sym in wl_syms:
+        s = sym.upper()
+        matched = False
+        if len(s) >= 3 and re.search(rf"\b{re.escape(s)}\b", blob):
+            matched = True
+        else:
+            for alias in _US_BRAND_ALIASES.get(s, ()):
+                if alias in low:
+                    matched = True
+                    break
+        if matched:
+            hits.append(s)
+    return hits
+
+
+def build_news_context(
+    entries: list,
+    custom_wl_syms: list[str] | None = None,
+    today_ledger_urls: set | None = None,
+) -> tuple:
     """整理新闻素材，返回 (news_lines, kept_per_source, drop_stats)。
 
-    过滤顺序：标题/URL 缺失 → 单次运行内 URL 去重 → 跨天已播去重 → 48h 时间窗。
+    过滤顺序：标题/URL 缺失 → 单次运行内 URL 去重 → 跨天已播去重 → 今日跨 Bot 账本 URL 去重 → 噪音/模板文过滤 → 48h 时间窗。
     用 48h 而非 24h：美股是隔夜市场，收盘后的解读文章常在次日发出。"""
     now        = datetime.now(timezone.utc)
     time_limit = now - timedelta(days=2)
     seen_urls: set = set()
     sent_before    = load_sent_urls(SENT_URLS)
+    ledger_urls    = today_ledger_urls or set()
 
     kept_per_source: dict = {}
-    drops = {"dup": 0, "already_sent": 0, "stale": 0}
+    drops = {"dup": 0, "already_sent": 0, "stale": 0, "off_topic": 0, "ledger_dup": 0}
     picked = []
 
     for entry in entries:
@@ -428,8 +468,15 @@ def build_news_context(entries: list) -> tuple:
             drops["dup"] += 1
             continue
         seen_urls.add(low)
-        if url_key(url) in sent_before:
+        uk = url_key(url)
+        if uk in sent_before:
             drops["already_sent"] += 1
+            continue
+        if uk in ledger_urls:
+            drops["ledger_dup"] += 1
+            continue
+        if _NOISE_NEWS_TITLE_RE.search(title):
+            drops["off_topic"] += 1
             continue
         pub = parse_entry_date(entry)
         if not pub or pub < time_limit:
@@ -539,8 +586,10 @@ def build_news_context(entries: list) -> tuple:
                 drops["no_content"] = drops.get("no_content", 0) + 1
                 kept_per_source[r["src"]] = max(0, kept_per_source.get(r["src"], 1) - 1)
                 continue
+            wl_hits = _match_watchlist_hits(r["title"], r["text"], custom_wl_syms)
+            wl_tag = f"\n[命中AI自选股] {', '.join(wl_hits)}" if wl_hits else ""
             lines.append(
-                f"[原始英文标题] {r['title']}\n[链接] {r['url']}\n[媒体] {r['src']}\n"
+                f"[原始英文标题] {r['title']}\n[链接] {r['url']}\n[媒体] {r['src']}{wl_tag}\n"
                 f"[正文/摘要（{r['kind']}）] {r['text']}\n----"
             )
     return lines, kept_per_source, drops
@@ -1116,7 +1165,15 @@ def gather() -> dict:
         fetched_counts[domain] = fetched_counts.get(domain, 0) + len(es)
         print(f"  ✓ {len(es)} 条  {url}", file=sys.stderr)
 
-    news_lines, kept_per_source, drops = build_news_context(entries)
+    ledger = load_daily_ledger(exclude_bot="🗽 美股与加密")
+    today_ledger_urls = ledger.get("urls") or set()
+    ledger_block = format_ledger_context(exclude_bot="🗽 美股与加密")
+
+    news_lines, kept_per_source, drops = build_news_context(
+        entries,
+        custom_wl_syms=custom_wl_syms,
+        today_ledger_urls=today_ledger_urls,
+    )
     news_count = len(news_lines)
 
     source_stats = {d: {"fetched": n, "kept": kept_per_source.get(d, 0)}
@@ -1171,6 +1228,7 @@ def gather() -> dict:
             "ma_trends": ma_trends,
             "fin_events": fin_events,
             "custom_watchlist": custom_wl,
+            "ledger_block": ledger_block,
             "exa_catalysts": exa_catalysts,
             "news_lines": news_lines,
             "news_count": news_count, "entries": entries,
@@ -1287,10 +1345,16 @@ def build_context(data: dict) -> str:
     custom_wl_section = f"{custom_wl_block}\n----------------\n" if custom_wl_block else ""
     exa_block = format_exa_catalyst_block(data.get("exa_catalysts") or [])
     exa_section = f"{exa_block}\n----------------\n" if exa_block else ""
+    ledger_blk = (data.get("ledger_block") or "").strip()
+    ledger_section = (
+        f"【跨 Bot 去重参考：今日其他 Bot（尤其 09:00 AI 产业日报）已播清单，美股要闻默认跳过同事件】\n"
+        f"{ledger_blk}\n----------------\n"
+    ) if ledger_blk else ""
     return (
         f"【收盘交易日】{data['session']}\n"
         f"----------------\n"
-        f"【🧠 跨日盘面状态记忆（最近 5 个交易日板块轮动、信号灯与关注方向追踪）】\n{_format_us_memory_block()}\n"
+        + ledger_section
+        + f"【🧠 跨日盘面状态记忆（最近 5 个交易日板块轮动、信号灯与关注方向追踪）】\n{_format_us_memory_block()}\n"
         f"----------------\n"
         f"【核心跨资产指数（股市 + 利率/波动率/美元/黄金/布伦特原油/比特币）】\n{idx}\n{core_cross}\n"
         f"标普 开{spx.get('open','?')} 高{spx.get('high','?')} 低{spx.get('low','?')} "
