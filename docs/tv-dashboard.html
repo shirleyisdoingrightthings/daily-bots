@@ -47,6 +47,15 @@
       min-height: 480px;
       width: 100%;
     }
+    [data-compact="1"] .wrap { min-height: 310px; }
+    [data-compact="1"] .bar { padding: 5px 10px; gap: 5px; }
+    [data-compact="1"] .tab-btn { padding: 3px 9px; font-size: 12px; }
+    [data-compact="1"] .ticker-strip { padding: 5px 10px; gap: 6px; }
+    [data-compact="1"] .ticker-card { padding: 3px 8px; }
+    [data-compact="1"] .header-row { padding: 5px 12px 2px 12px; gap: 6px; }
+    [data-compact="1"] .active-name,
+    [data-compact="1"] .active-price { font-size: 14px; }
+    [data-compact="1"] .chart-stage { min-height: 185px; }
     .bar {
       display: flex;
       align-items: center;
@@ -796,6 +805,9 @@
       });
 
       document.documentElement.setAttribute("data-theme", currentTheme);
+      if (qs.get("compact") === "1") {
+        document.documentElement.setAttribute("data-compact", "1");
+      }
       renderTabs();
       renderRangeBar();
       renderTickerStrip(tabs.find(t => t.id === activeTabId));

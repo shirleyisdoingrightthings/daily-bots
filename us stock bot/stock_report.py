@@ -110,9 +110,9 @@ CNBC_QUOTE_URL = (
 
 INDICES = [(".SPX", "标普500"), (".IXIC", "纳斯达克"),
            (".DJI", "道琼斯"), (".RUT", "罗素2000")]
-# 跨资产宏观与大宗指标（并入核心指数行一屏展示；XAU= 为伦敦现货金）
+# 跨资产宏观与大宗指标（并入核心指数行一屏展示；XAU= 伦敦金与 @LCO.1 布油为 24h 实时报价）
 MACRO   = [("US10Y", "10年期美债"), (".VIX", "VIX"), (".DXY", "美元指数"),
-           ("XAU=", "伦敦金"), ("@LCO.1", "布伦特原油")]
+           ("XAU=", "伦敦金(24h实时)"), ("@LCO.1", "布伦特原油(24h实时)")]
 # 行业景气与信用风向标（并入市场宽度行）
 RISK_GAUGES = [(".SOX", "费城半导体"), ("HYG", "高收益债(HYG)")]
 # 11 个 GICS 板块，用 SPDR 行业 ETF 代理
@@ -627,8 +627,13 @@ _US_BRAND_ALIASES = {
 }
 
 
-def _select_uncovered_us_movers(quotes: dict, news_lines: list, max_total: int = 6) -> list:
-    """挑出 RSS 新闻未覆盖、但在领涨/领跌板块 Top 3 或全市场焦点异动榜中波动显著的美股标的。"""
+def _select_uncovered_us_movers(
+    quotes: dict,
+    news_lines: list,
+    max_total: int = 6,
+    custom_wl: dict | None = None,
+) -> list:
+    """挑出 RSS 新闻未覆盖、但在领涨/领跌板块 Top 3、全市场权重或个人自选股中波动显著的美股标的。"""
     news_blob = "\n".join(news_lines)
     news_low = news_blob.lower()
 
@@ -640,7 +645,7 @@ def _select_uncovered_us_movers(quotes: dict, news_lines: list, max_total: int =
                 return True
         return False
 
-    # 汇总领涨/领跌 Top 3 板块内各自 Top 3 成分股 + 全市场 WATCHLIST 涨跌前 5
+    # 汇总领涨/领跌 Top 3 板块内各自 Top 3 成分股 + 全市场 WATCHLIST 涨跌前 5 + 个人自选股显著异动
     sec_rows = []
     for sym, name in SECTORS:
         qq = quotes.get(sym)
@@ -650,9 +655,14 @@ def _select_uncovered_us_movers(quotes: dict, news_lines: list, max_total: int =
     focus_secs = [(n, s, True) for n, s, _ in sec_rows[:3]] + [(n, s, False) for n, s, _ in sec_rows[-3:]]
 
     sym_cn = {m_sym: m_cn for members in SECTOR_STOCKS.values() for m_sym, m_cn in members}
+    if custom_wl:
+        for g in custom_wl.get("groups") or []:
+            for t in g.get("tickers") or []:
+                sym_cn.setdefault(t["symbol"], t.get("name") or t["symbol"])
+
     candidates = {}
 
-    def _consider(sym: str, sector_label: str):
+    def _consider(sym: str, sector_label: str, priority: bool = False):
         qq = quotes.get(sym)
         pct = _num(qq.get("change_pct")) if qq else None
         if pct is None or _is_covered(sym):
@@ -664,7 +674,10 @@ def _select_uncovered_us_movers(quotes: dict, news_lines: list, max_total: int =
                 "pct": pct,
                 "pct_change": qq.get("change_pct", f"{pct:+.2f}%"),
                 "sector": sector_label,
+                "priority": priority,
             }
+        elif priority:
+            candidates[sym]["priority"] = True
 
     for sec_name, sec_sym, is_gainer in focus_secs:
         members = []
@@ -672,7 +685,8 @@ def _select_uncovered_us_movers(quotes: dict, news_lines: list, max_total: int =
             mq = quotes.get(m_sym)
             p = _num(mq.get("change_pct")) if mq else None
             if p is not None:
-                members.append((m_sym, p))
+                if (not is_gainer and p < 0) or (is_gainer and p > 0):
+                    members.append((m_sym, p))
         members.sort(key=lambda x: x[1], reverse=is_gainer)
         for m_sym, _ in members[:3]:
             _consider(m_sym, f"{sec_name}({sec_sym})")
@@ -687,18 +701,30 @@ def _select_uncovered_us_movers(quotes: dict, news_lines: list, max_total: int =
     for sym, _ in mv[:5] + mv[-5:]:
         _consider(sym, "全市场焦点权重")
 
+    # 个人自选股（如 AI 自选股 29 只）单日波动 >= 2.5% 且无 RSS 覆盖时优先纳入补盲池
+    if custom_wl:
+        wl_name = custom_wl.get("name") or "自选股"
+        for g in custom_wl.get("groups") or []:
+            g_lbl = f"{wl_name}-{g.get('name', '')}"
+            for t in g.get("tickers") or []:
+                sym = t["symbol"]
+                qq = quotes.get(sym)
+                p = _num(qq.get("change_pct")) if qq else None
+                if p is not None and abs(p) >= 2.5:
+                    _consider(sym, g_lbl, priority=True)
+
     all_rows = [r for r in candidates.values() if abs(r["pct"]) >= 1.5]
     if not all_rows:
         all_rows = sorted(candidates.values(), key=lambda r: -abs(r["pct"]))[:3]
 
-    gainers = sorted([r for r in all_rows if r["pct"] > 0], key=lambda r: -r["pct"])
-    losers = sorted([r for r in all_rows if r["pct"] < 0], key=lambda r: r["pct"])
+    gainers = sorted([r for r in all_rows if r["pct"] > 0], key=lambda r: (not r["priority"], -r["pct"]))
+    losers = sorted([r for r in all_rows if r["pct"] < 0], key=lambda r: (not r["priority"], r["pct"]))
 
-    # 兼顾涨跌两端：最多取 2 只领涨未覆盖股 + 4 只领跌未覆盖股，空余名额按绝对涨幅补足
+    # 兼顾涨跌两端：最多取 2 只领涨未覆盖股 + 4 只领跌未覆盖股（自选股大波动优先），空余名额按绝对涨幅补足
     picked = gainers[:2] + losers[:4]
     if len(picked) < max_total:
         used = {r["symbol"] for r in picked}
-        rest = sorted([r for r in all_rows if r["symbol"] not in used], key=lambda r: -abs(r["pct"]))
+        rest = sorted([r for r in all_rows if r["symbol"] not in used], key=lambda r: (not r["priority"], -abs(r["pct"])))
         picked.extend(rest[: max_total - len(picked)])
 
     return [
@@ -772,71 +798,96 @@ def _compute_bollinger_20(closes: list[float]) -> tuple[float, float, float, flo
 
 
 def fetch_us_ma_trends() -> dict:
-    """直连腾讯财经日 K 接口拉取美股三大指数最近 60 日收盘价，计算 MA5/MA10/MA20、乖离率、RSI(14) 与布林带 %B(20,2)。"""
+    """直连腾讯财经美股日 K 接口（优先 usfqkline/get 规避 WAF 501，拉取 220 日），计算 MA5/10/20/50/200、乖离率、Wilder RSI(14) 与布林带 %B(20,2)。"""
     out = {}
     s = requests.Session()
     s.trust_env = False
     s.proxies = {}
     for cnbc_sym, (gt_code, label) in _US_MA_MAP.items():
-        try:
-            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={gt_code},day,,,60,qfq"
-            resp = s.get(url, headers={"User-Agent": _UA}, timeout=8)
-            klines = resp.json().get("data", {}).get(gt_code, {}).get("day") or []
-            closes = [float(r[2]) for r in klines if len(r) >= 3 and r[2]]
-            if len(closes) < 20:
-                continue
-            cur = closes[-1]
-            ma5 = sum(closes[-5:]) / 5.0
-            ma10 = sum(closes[-10:]) / 10.0
-            ma20 = sum(closes[-20:]) / 20.0
-            bias5 = (cur - ma5) / ma5 * 100.0 if ma5 else 0.0
-            bias20 = (cur - ma20) / ma20 * 100.0 if ma20 else 0.0
-            if ma5 > ma10 > ma20:
-                trend = "🟢多头排列"
-            elif ma5 < ma10 < ma20:
-                trend = "🔴空头排列"
-            elif cur >= ma20:
-                trend = "🟡均线缠绕偏强(站上MA20)"
-            else:
-                trend = "🟡均线缠绕偏弱(跌破MA20)"
-
-            extra_parts = []
-            rsi14 = _compute_rsi14(closes)
-            if rsi14 is not None:
-                if rsi14 >= 70:
-                    rsi_lbl = "超买警惕"
-                elif rsi14 >= 60:
-                    rsi_lbl = "偏强"
-                elif rsi14 <= 30:
-                    rsi_lbl = "超卖反弹区"
-                elif rsi14 <= 40:
-                    rsi_lbl = "偏弱近超卖"
-                else:
-                    rsi_lbl = "中性"
-                extra_parts.append(f"RSI(14)={rsi14:.1f}({rsi_lbl})")
-
-            bb = _compute_bollinger_20(closes)
-            if bb is not None:
-                _, upper, lower, pct_b = bb
-                if pct_b > 1.0:
-                    bb_lbl = "破上轨(过热防回调)"
-                elif pct_b >= 0.8:
-                    bb_lbl = "近上轨(偏热)"
-                elif pct_b < 0.0:
-                    bb_lbl = "破下轨(超卖反弹窗口)"
-                elif pct_b <= 0.2:
-                    bb_lbl = "近下轨(关注支撑)"
-                else:
-                    bb_lbl = "中轨区间"
-                extra_parts.append(f"布林%B={pct_b:.2f}({bb_lbl}, 上轨{upper:,.1f}/下轨{lower:,.1f})")
-
-            extra_str = (" | " + " | ".join(extra_parts)) if extra_parts else ""
-            out[cnbc_sym] = (
-                f"{trend} | MA5={ma5:,.2f} (乖离率 {bias5:+.2f}%) | "
-                f"MA20={ma20:,.2f} (乖离率 {bias20:+.2f}%){extra_str}"
-            )
-        except Exception:
+        klines = None
+        last_err = None
+        for ep in ("usfqkline/get", "fqkline/get"):
+            try:
+                url = f"https://web.ifzq.gtimg.cn/appstock/app/{ep}?param={gt_code},day,,,220,qfq"
+                resp = s.get(url, headers={"User-Agent": _UA}, timeout=8)
+                if resp.status_code != 200:
+                    last_err = f"HTTP {resp.status_code}"
+                    continue
+                node = resp.json().get("data", {}).get(gt_code, {})
+                cand = node.get("qfqday") or node.get("day") or []
+                if cand:
+                    klines = cand
+                    break
+            except Exception as exc:
+                last_err = str(exc)
+        if not klines:
+            print(f"[WARN] {label}({gt_code}) 日K抓取失败: {last_err}", file=sys.stderr)
             continue
+
+        closes = [float(r[2]) for r in klines if len(r) >= 3 and r[2]]
+        if len(closes) < 20:
+            continue
+        cur = closes[-1]
+        ma5 = sum(closes[-5:]) / 5.0
+        ma10 = sum(closes[-10:]) / 10.0
+        ma20 = sum(closes[-20:]) / 20.0
+        bias5 = (cur - ma5) / ma5 * 100.0 if ma5 else 0.0
+        bias20 = (cur - ma20) / ma20 * 100.0 if ma20 else 0.0
+        if ma5 > ma10 > ma20:
+            trend = "🟢多头排列"
+        elif ma5 < ma10 < ma20:
+            trend = "🔴空头排列"
+        elif cur >= ma20:
+            trend = "🟡均线缠绕偏强(站上MA20)"
+        else:
+            trend = "🟡均线缠绕偏弱(跌破MA20)"
+
+        extra_parts = []
+        if len(closes) >= 50:
+            ma50 = sum(closes[-50:]) / 50.0
+            d50 = (cur - ma50) / ma50 * 100.0 if ma50 else 0.0
+            extra_parts.append(f"MA50={ma50:,.1f}({d50:+.1f}%)")
+        if len(closes) >= 200:
+            ma200 = sum(closes[-200:]) / 200.0
+            d200 = (cur - ma200) / ma200 * 100.0 if ma200 else 0.0
+            pos200 = "年线上方" if cur >= ma200 else "跌破年线"
+            extra_parts.append(f"MA200={ma200:,.1f}({d200:+.1f}%/{pos200})")
+
+        rsi14 = _compute_rsi14(closes)
+        if rsi14 is not None:
+            if rsi14 >= 70:
+                rsi_lbl = "超买警惕"
+            elif rsi14 >= 60:
+                rsi_lbl = "偏强"
+            elif rsi14 <= 30:
+                rsi_lbl = "超卖反弹区"
+            elif rsi14 <= 40:
+                rsi_lbl = "偏弱近超卖"
+            else:
+                rsi_lbl = "中性"
+            extra_parts.append(f"RSI(14)={rsi14:.1f}({rsi_lbl})")
+
+        bb = _compute_bollinger_20(closes)
+        if bb is not None:
+            _, upper, lower, pct_b = bb
+            pct_b_r = round(pct_b, 2)
+            if pct_b_r > 1.0:
+                bb_lbl = "破上轨(过热防回调)"
+            elif pct_b_r >= 0.8:
+                bb_lbl = "近上轨(偏热)"
+            elif pct_b_r < 0.0:
+                bb_lbl = "破下轨(超卖反弹窗口)"
+            elif pct_b_r <= 0.2:
+                bb_lbl = "近下轨(关注支撑)"
+            else:
+                bb_lbl = "中轨区间"
+            extra_parts.append(f"布林%B={pct_b_r:.2f}({bb_lbl}, 上轨{upper:,.1f}/下轨{lower:,.1f})")
+
+        extra_str = (" | " + " | ".join(extra_parts)) if extra_parts else ""
+        out[cnbc_sym] = (
+            f"{trend} | MA5={ma5:,.2f} (乖离率 {bias5:+.2f}%) | "
+            f"MA20={ma20:,.2f} (乖离率 {bias20:+.2f}%){extra_str}"
+        )
     return out
 
 
@@ -949,8 +1000,39 @@ def fetch_financial_events(
                     ev_name = html.unescape(str(row.get("eventName") or "")).strip()
                     if not ev_name or _MACRO_NOISE_RE.search(ev_name) or not _MACRO_EVENT_RE.search(ev_name):
                         continue
-                    # 去除同日同指标的冗余子项（如 MoM/YoY 重复保留首条核心项）
-                    key = re.sub(r"\s*\([^)]*\)|\b(?:MoM|YoY|QoQ|s\.a\.|n\.s\.a\.|Prelim|Final|Rev)\b", "", ev_name, flags=re.I).strip().lower()
+                    # 过滤已有实际公布值的历史数据（如跨时区/节假日误挂在次日的已公布数据）
+                    actual = html.unescape(str(row.get("actual") or "")).replace("\xa0", "").strip()
+                    if actual and actual not in ("-", "--", "N/A", "n/a"):
+                        continue
+                    # 归并同类衍生子项（如 GDP Price Index / GDP Sales / Core PCE Prices）并转为简洁中文名
+                    low_ev = ev_name.lower()
+                    if "core pce" in low_ev:
+                        key, disp_ev = "core_pce", "美国核心 PCE"
+                    elif "pce" in low_ev or "personal consumption" in low_ev:
+                        key, disp_ev = "pce", "美国 PCE"
+                    elif "core cpi" in low_ev:
+                        key, disp_ev = "core_cpi", "美国核心 CPI"
+                    elif "cpi" in low_ev or "consumer price" in low_ev:
+                        key, disp_ev = "cpi", "美国 CPI"
+                    elif "nonfarm" in low_ev or "non-farm" in low_ev:
+                        key, disp_ev = "nfp", "美国非农就业"
+                    elif "unemployment" in low_ev:
+                        key, disp_ev = "unemp", "美国失业率"
+                    elif "gdp" in low_ev or "gross domestic" in low_ev:
+                        key, disp_ev = "gdp", "美国 GDP"
+                    elif "ism manufacturing" in low_ev:
+                        key, disp_ev = "ism_mfg", "ISM 制造业 PMI"
+                    elif "ism services" in low_ev or "ism non-manufacturing" in low_ev:
+                        key, disp_ev = "ism_svc", "ISM 服务业 PMI"
+                    elif "retail sales" in low_ev:
+                        key, disp_ev = "retail", "美国零售销售"
+                    elif "ppi" in low_ev or "producer price" in low_ev:
+                        key, disp_ev = "ppi", "美国 PPI"
+                    elif "fomc" in low_ev or "federal funds" in low_ev or "fed interest rate" in low_ev or "fed chair" in low_ev:
+                        key, disp_ev = re.sub(r"\s+", " ", low_ev), ev_name
+                    else:
+                        key = re.sub(r"\s*\([^)]*\)|\b(?:MoM|YoY|QoQ|s\.a\.|n\.s\.a\.|Prelim|Final|Rev)\b", "", low_ev, flags=re.I).strip()
+                        disp_ev = ev_name
                     if key in seen_ev:
                         continue
                     seen_ev.add(key)
@@ -958,7 +1040,7 @@ def fetch_financial_events(
                     prev = html.unescape(str(row.get("previous") or "")).replace("\xa0", "").strip()
                     day_econ.append({
                         "date": dt_str,
-                        "event": ev_name,
+                        "event": disp_ev,
                         "consensus": cons,
                         "previous": prev,
                     })
@@ -1209,7 +1291,7 @@ def gather() -> dict:
 
     exa_catalysts = []
     if exa_enrich_enabled(default_enabled=True):
-        uncovered = _select_uncovered_us_movers(quotes, news_lines, max_total=6)
+        uncovered = _select_uncovered_us_movers(quotes, news_lines, max_total=6, custom_wl=custom_wl)
         if uncovered:
             print(
                 f"\n🔍 触发 Exa Agent 异动股定向催化补盲（{len(uncovered)} 只未命中 RSS）："
@@ -1246,7 +1328,7 @@ def build_context(data: dict) -> str:
 
     idx = "\n".join(f"{name}: {fmt_quote(q.get(sym))}" for sym, name in INDICES)
     mac = " | ".join(f"{name} {fmt_quote(q.get(sym))}" for sym, name in MACRO)
-    core_cross = f"{mac} | 比特币 {cp.get('BTC', '未知')}"
+    core_cross = f"{mac} | 比特币(24h实时) {cp.get('BTC', '未知')}"
 
     # 板块按涨跌幅排序，让写稿时一眼看出轮动方向
     sec_rows = []
@@ -1257,15 +1339,29 @@ def build_context(data: dict) -> str:
     sec_rows.sort(key=lambda r: (r[3] is None, -(r[3] or 0)))
     sec = "\n".join(f"{n}({s}): {p}" for n, s, p, _ in sec_rows)
 
-    def _sector_top3_stocks(sec_sym: str, is_gainer: bool) -> str:
+    def _sector_top3_stocks(sec_sym: str, is_gainer: bool, sec_pct: float | None = None) -> str:
         members = SECTOR_STOCKS.get(sec_sym, [])
         items = []
         for m_sym, m_cn in members:
             mq = q.get(m_sym)
-            if mq and _num(mq.get("change_pct")) is not None:
+            p_val = _num(mq.get("change_pct")) if mq else None
+            if mq and p_val is not None:
                 items.append((m_sym, m_cn, mq.get("last", "?"),
-                              mq.get("change_pct", "?"), _num(mq.get("change_pct"))))
-        items.sort(key=lambda x: x[4], reverse=is_gainer)
+                              mq.get("change_pct", "?"), p_val))
+        # 领跌榜严禁混入上涨股；收涨板块的领涨榜只列上涨股（大盘普跌“抗跌”板块除外）
+        if not is_gainer:
+            filtered = [x for x in items if x[4] < 0]
+            if not filtered:
+                return "板块内核心成分股全线收涨（无下跌个股）"
+            filtered.sort(key=lambda x: x[4])
+            top3 = filtered[:3]
+            suffix = f"（注：核心成分股中仅 {len(top3)} 只收跌）" if len(top3) < 3 else ""
+            return "、".join(f"{cn}({sym}) {last} ({pct})" for sym, cn, last, pct, _ in top3) + suffix
+        if sec_pct is not None and sec_pct > 0:
+            pos = [x for x in items if x[4] > 0]
+            if pos:
+                items = pos
+        items.sort(key=lambda x: x[4], reverse=True)
         top3 = items[:3]
         if not top3:
             return "暂无成分股行情"
@@ -1276,16 +1372,16 @@ def build_context(data: dict) -> str:
     top3_lose_secs = list(reversed(valid_secs[-3:])) if len(valid_secs) >= 3 else []
 
     sec_top3_gain_lines = []
-    for idx_i, (n, s, p, _) in enumerate(top3_gain_secs, 1):
+    for idx_i, (n, s, p, p_num) in enumerate(top3_gain_secs, 1):
         sec_top3_gain_lines.append(
             f"{idx_i}. 【{n}({s})】 板块涨跌幅：{p}\n"
-            f"   · 板块内领涨 Top 3：{_sector_top3_stocks(s, is_gainer=True)}"
+            f"   · 板块内领涨 Top 3：{_sector_top3_stocks(s, is_gainer=True, sec_pct=p_num)}"
         )
     sec_top3_lose_lines = []
-    for idx_i, (n, s, p, _) in enumerate(top3_lose_secs, 1):
+    for idx_i, (n, s, p, p_num) in enumerate(top3_lose_secs, 1):
         sec_top3_lose_lines.append(
             f"{idx_i}. 【{n}({s})】 板块涨跌幅：{p}\n"
-            f"   · 板块内领跌 Top 3：{_sector_top3_stocks(s, is_gainer=False)}"
+            f"   · 板块内领跌 Top 3：{_sector_top3_stocks(s, is_gainer=False, sec_pct=p_num)}"
         )
     sec_detail_block = (
         "🔥 领涨 Top 3 板块（及板块内涨幅 Top 3 个股）：\n"

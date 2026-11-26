@@ -360,13 +360,44 @@ Original: Some title
 📄 The Details：
 财报具体数字与分析。
 """
-        blocks = na.convert_to_blocks(draft, source="🗽 美股与加密")
+        blocks = na.convert_to_blocks(draft, source="🗽 美股与加密", us_embed_url="")
         types_texts = [(b["type"], _block_plain(b)) for b in blocks]
         self.assertIn(("heading_1", "📊 美股收盘 & 加密行情 · 2026-11-13"), types_texts)
         self.assertIn(("divider", "---"), types_texts)
         self.assertIn(("heading_1", "📋 美股要闻 · 2026-11-13"), types_texts)
         self.assertFalse(any("要闻速览条1" in t for _, t in types_texts))
         self.assertIn(("heading_2", "美股重大财报超预期"), types_texts)
+        self.assertFalse(any(b["type"] == "toggle" for b in blocks))
+
+    def test_us_stock_auto_embed_toggle_under_h1(self):
+        draft = """<b>📊 美股收盘 & 加密行情 · 2026-11-25</b>
+
+📈 <b>核心指数</b>：标普 500 7,182.78 (-0.25%) | 纳斯达克 23,585.80 (-0.62%)
+🧭 <b>市场宽度</b>：11 大板块 8 涨 3 跌
+
+---
+
+<b>📋 美股要闻 · 2026-11-25</b>
+
+<a href="https://cnbc.com/1"><b>头条新闻</b></a>
+
+⭐⭐⭐⭐⭐ #宏观
+
+📄 The Details：
+正文。
+"""
+        embed_url = "https://example.com/tv-dashboard.html?theme=light&compact=1"
+        blocks = na.convert_to_blocks(draft, source="🗽 美股与加密", us_embed_url=embed_url)
+        self.assertEqual(blocks[0]["type"], "heading_1")
+        self.assertEqual(_block_plain(blocks[0]), "📊 美股收盘 & 加密行情 · 2026-11-25")
+        self.assertEqual(blocks[1]["type"], "toggle")
+        self.assertEqual(_block_plain(blocks[1]), "📈 实时交互行情看板（点击展开）")
+        children = blocks[1]["toggle"]["children"]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0], {"object": "block", "type": "embed", "embed": {"url": embed_url}})
+        self.assertEqual(blocks[2]["type"], "table")
+        # 仅在美股收盘 H1 下插入一次，不在美股要闻 H1 下重复插入
+        self.assertEqual(sum(1 for b in blocks if b["type"] == "toggle"), 1)
 
 
 class TestExtractSummaryBySource(unittest.TestCase):
@@ -514,7 +545,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
     def test_us_stock_upgraded_dashboard_tables_and_30s_summary(self):
         us_doc = """<b>📊 美股收盘 & 加密行情 · 2026-11-25</b>
 
-📈 <b>核心指数</b>：标普 500 7,182.78 (-0.25%) | 纳斯达克 23,585.80 (-0.62%) | 道琼斯 50,182.95 (+0.33%) | 罗素 2000 2,704.06 (+0.71%) | 10 年期美债 4.864% (-3.8bp) | VIX 28.29 (+7.32%) | 美元指数 103.75 (+0.08%) | 伦敦金 3,573.28 (-0.22%) | 布伦特原油 95.34 (+0.77%) | 比特币 $60,795.00 (+3.09%)
+📈 <b>核心指数</b>：标普 500 7,182.78 (-0.25%) | 纳斯达克 23,585.80 (-0.62%) | 道琼斯 50,182.95 (+0.33%) | 罗素 2000 2,704.06 (+0.71%) | 10 年期美债 4.864% (-3.8bp) | VIX 28.29 (+7.32%) | 美元指数 103.75 (+0.08%) | 伦敦金 (24h 实时) 3,573.28 (-0.22%) | 布伦特原油 (24h 实时) 95.34 (+0.77%) | 比特币 (24h 实时) $60,795.00 (+3.09%)
 🧭 <b>市场宽度</b>：11 大板块 8 涨 3 跌 | 28 只核心权重 12 涨 16 跌 | 等权标普 (RSP) +0.83% (RSP-SPX 剪刀差 +1.08%) | 费城半导体 (SOX) -0.65% | 高收益债 (HYG) +0.12% — 广度明显修复
 📐 <b>趋势与乖离率</b>：标普 500 🔴 空头排列 · MA5 乖离率 +0.58% · RSI(14)=38.2 (偏弱) · 布林 %B=0.18 (近下轨) | 纳斯达克 🔴 空头排列 · RSI(14)=35.6 — 短线近支撑区
 🪙 <b>加密货币</b>：恐贪指数 11 (Extreme Fear) | 总市值 $2,111B (-0.33%) | BTC 市占率 57.9% | BTC $60,795.00 (+3.09%) | ETH $1,700.15 (+2.87%) | BNB $557.38 (+3.19%) | SOL $71.12 (+3.52%) | XRP $0.95 (+4.51%) | HYPE $61.71 (+5.15%)
@@ -540,7 +571,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
 - 美国拟对14个经济体加征新关税
 - 纳指深V反弹收跌0.62%
 """
-        blocks = na.convert_to_blocks(us_doc, source="🗽 美股与加密")
+        blocks = na.convert_to_blocks(us_doc, source="🗽 美股与加密", us_embed_url="")
         tables = [b for b in blocks if b.get("type") == "table"]
         self.assertEqual(len(tables), 2)
         # 表1：主指标表（表头 + 6行指标，右侧单元格按 bullet 分区）

@@ -60,6 +60,12 @@ def get_notion_database_id() -> str:
     return _read_dotenv_value("NOTION_ARCHIVE_DATABASE_ID") or DEFAULT_DATABASE_ID
 
 
+def get_us_embed_url() -> str:
+    """获取美股日报可选的交互式行情看板嵌入 URL（来自环境变量或本地私有 .env）。"""
+    u = _read_dotenv_value("US_STOCK_NOTION_EMBED_URL")
+    return u if u.lower().startswith(("http://", "https://")) else ""
+
+
 # ───────────────────────────────────────────
 # Markdown / HTML 解析为 Notion Blocks
 # ───────────────────────────────────────────
@@ -482,7 +488,7 @@ def _extract_us_market_brief(market_text: str) -> str:
         idx_body = re.sub(r"^核心指数[:：\s]*", "", indices_str)
 
         def _pick_pct(label_re: str, alias: str) -> str:
-            m = re.search(rf"{label_re}\s+[\d,.$%]+\s*\(([^)]+)\)", idx_body)
+            m = re.search(rf"{label_re}(?:\s*[\(（][^()（）]{{1,16}}[\)）])?\s+[\d,.$%]+\s*\(([^)]+)\)", idx_body)
             return f"{alias} {m.group(1)}" if m else ""
 
         def _pick_val(label_re: str, alias: str) -> str:
@@ -553,7 +559,10 @@ def _extract_us_market_brief(market_text: str) -> str:
                         for x in re.split(r"\s*[|、]\s*", e_raw) if x.strip()
                     ])
                     if e_items:
-                        ev_dated.append((_earliest_mmdd(e_items[0]), _merge_same_day_events(e_items[:3])))
+                        star_e = [x for x in e_items if "★" in x]
+                        non_star_e = [x for x in e_items if "★" not in x]
+                        picked_e = _sort_dated_events((star_e + non_star_e)[:3])
+                        ev_dated.append((_earliest_mmdd(picked_e[0]), _merge_same_day_events(picked_e)))
             ev_dated.sort(key=lambda x: x[0])
             ev_clean = [txt for _, txt in ev_dated]
             if not ev_clean and "暂无" not in events_line and "无重磅" not in events_line:
@@ -922,6 +931,14 @@ def _toggle_block(title_text: str, children: list[dict]) -> dict:
     }
 
 
+def _embed_block(url: str) -> dict:
+    return {
+        "object": "block",
+        "type": "embed",
+        "embed": {"url": url},
+    }
+
+
 def _table_block(rows: list[tuple[str, str]], headers: tuple[str, str] = ("指标维度", "核心数据与状态")) -> dict:
     def _row(col1: str, col2: str, *, bold_col1: bool = True, bold_all: bool = False) -> dict:
         return {
@@ -1149,7 +1166,13 @@ def _extract_numbered_body(line: str) -> str | None:
     return None
 
 
-def convert_to_blocks(content: str, source: str = "", *, summary_override: str | None = None) -> list[dict]:
+def convert_to_blocks(
+    content: str,
+    source: str = "",
+    *,
+    summary_override: str | None = None,
+    us_embed_url: str | None = None,
+) -> list[dict]:
     """将稿件转换为 Notion Blocks 结构，并按信源优化指标表格、折叠区与目录层级（正文不使用 Callout 框）"""
     blocks: list[dict] = []
     lines = content.splitlines()
@@ -1158,6 +1181,8 @@ def convert_to_blocks(content: str, source: str = "", *, summary_override: str |
     is_us = ("美股" in source)
     is_cn_hk = ("A股与港股" in source)
     is_x_or_builder = ("X 热点" in source or "AI Builder" in source)
+    resolved_us_embed = (get_us_embed_url() if us_embed_url is None else (us_embed_url or "")) if is_us else ""
+    inserted_us_embed = False
     in_us_news = False
     in_details = False
     in_sector_section = False
@@ -1456,6 +1481,9 @@ def convert_to_blocks(content: str, source: str = "", *, summary_override: str |
             if is_cn_hk:
                 h1_text = _format_cn_hk_heading(h1_text)
             blocks.append(_h_block(1, h1_text))
+            if is_us and not in_us_news and resolved_us_embed and not inserted_us_embed and "美股收盘" in h1_text:
+                blocks.append(_toggle_block("📈 实时交互行情看板（点击展开）", [_embed_block(resolved_us_embed)]))
+                inserted_us_embed = True
             i += 1
             continue
 
@@ -1464,6 +1492,9 @@ def convert_to_blocks(content: str, source: str = "", *, summary_override: str |
             in_sector_section = False
             h1_text = _format_cn_hk_heading(plain_no_b) if is_cn_hk else plain_no_b
             blocks.append(_h_block(1, h1_text))
+            if is_us and not in_us_news and resolved_us_embed and not inserted_us_embed and "美股收盘" in h1_text:
+                blocks.append(_toggle_block("📈 实时交互行情看板（点击展开）", [_embed_block(resolved_us_embed)]))
+                inserted_us_embed = True
             i += 1
             continue
 
