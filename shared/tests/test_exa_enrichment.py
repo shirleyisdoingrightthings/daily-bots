@@ -1,19 +1,16 @@
-"""Unit tests for Exa enrichment helpers in shared/bot_utils.py and cn_hk_report.py bug fixes."""
+"""Unit tests for Exa enrichment helpers in shared/bot_utils.py and stock_report.py."""
 
 import os
 import sys
 import unittest
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "shared"))
-sys.path.insert(0, str(ROOT / "cn-hk-stock-bot"))
 sys.path.insert(0, str(ROOT / "us stock bot"))
 
 import bot_utils
-import cn_hk_report
 import stock_report
 
 
@@ -127,78 +124,6 @@ class TestExaHelpers(unittest.TestCase):
         block = bot_utils.format_exa_catalyst_block(confirmed)
         self.assertIn("拼多多(PDD +11.04%)", block)
         self.assertIn("[财报业绩]", block)
-
-
-class TestCnHkTelegraphFixAndSelection(unittest.TestCase):
-    def test_fetch_sina_telegraph_drops_stale_and_sorts_newest_first(self):
-        fake_feeds = {
-            "tag_id=10": [
-                {"create_time": "2026-11-11 15:00:00", "rich_text": "这是九天前的陈旧A股收评内容，长度超过二十个字应该被过滤掉"},
-                {"create_time": "2026-11-19 15:01:00", "rich_text": "2026-11-19 A股收评：沪指震荡收跌0.28%，半导体走势分化明显"},
-            ],
-            "tag_id=4": [
-                {"create_time": "2026-11-20 07:30:00", "rich_text": "日本10月核心CPI同比上涨2.2%，市场继续博弈日本央行12月加息"},
-            ],
-            "tag_id=0": [
-                {"create_time": "2026-11-20 09:00:05", "rich_text": "中国11月1年期LPR报3.0%，5年期以上LPR报3.5%，均维持不变"},
-            ],
-        }
-
-        def fake_get(url, **kwargs):
-            resp = MagicMock()
-            for k, rows in fake_feeds.items():
-                if k in url:
-                    resp.json.return_value = {"result": {"data": {"feed": {"list": rows}}}}
-                    return resp
-            resp.json.return_value = {}
-            return resp
-
-        with patch.object(cn_hk_report.DIRECT_SESSION, "get", side_effect=fake_get):
-            items = cn_hk_report.fetch_sina_telegraph(
-                limit=10,
-                max_age_hours=36,
-                now_dt=datetime(2026, 11, 20, 9, 24, 0),
-            )
-
-        self.assertEqual(len(items), 3)
-        self.assertIn("中国11月1年期LPR", items[0])
-        self.assertIn("日本10月核心CPI", items[1])
-        self.assertIn("2026-11-19 A股收评", items[2])
-        self.assertFalse(any("九天前" in it for it in items))
-
-    def test_select_uncovered_cn_hk_merges_dual_listed(self):
-        quotes = {
-            "usPDD": {"pct": 11.04},
-            "usNTES": {"pct": -11.39},
-            "usBABA": {"pct": -1.26},
-        }
-        cn_pool = {
-            "gainers": [],
-            "losers": [
-                {
-                    "name": "半导体芯片与设备",
-                    "pct": -3.67,
-                    "stocks": [{"code": "sh688041", "name": "海光信息", "pct": -9.39}],
-                }
-            ],
-        }
-        hk_pool = {
-            "gainers": [],
-            "losers": [
-                {
-                    "name": "游戏内容与文旅出行",
-                    "pct": -3.09,
-                    "stocks": [{"code": "hk09999", "name": "网易-S", "pct": -14.39}],
-                }
-            ],
-        }
-        picked = cn_hk_report._select_uncovered_cn_hk_movers(
-            "premarket", quotes, cn_pool, hk_pool, telegraph=["无相关个股电报"], max_total=6
-        )
-        syms = [p["symbol"] for p in picked]
-        self.assertEqual(syms.count("NTES / 09999.HK"), 1)
-        self.assertIn("PDD", syms)
-        self.assertIn("688041.SH", syms)
 
 
 class TestUsUncoveredSelection(unittest.TestCase):

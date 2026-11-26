@@ -33,8 +33,7 @@ jobs:
             ai-builder-bot/builder_report.py \
             github-hn-bot/sources.py \
             github-hn-bot/github_hn_report.py \
-            "us stock bot/stock_report.py" \
-            cn-hk-stock-bot/cn_hk_report.py
+            "us stock bot/stock_report.py"
 
       - name: Syntax check all shell scripts
         run: |

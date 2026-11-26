@@ -5,6 +5,11 @@
 *.plist
 !*.plist.example
 
+# Personal Watchlists (NEVER commit personal stock lists)
+watchlist.json
+**/watchlist.json
+!**/watchlist.example.json
+
 # Local Personal Workspace Rules
 GEMINI.md
 

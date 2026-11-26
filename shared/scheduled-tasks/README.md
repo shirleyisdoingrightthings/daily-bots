@@ -7,9 +7,8 @@
 | `SKILL.md` 路径 | Task ID | 调度 | 作用 |
 | :--- | :--- | :--- | :--- |
 | [`ai-daily-afternoon/SKILL.md`](./ai-daily-afternoon/SKILL.md) | `ai-daily-afternoon` | 每天 09:00（`0 9 * * *`） | AI 三合一串行流水线：`1. AI 产业日报 → 2. X 热点播报 → 3. AI Builder 日报`（共享当日账本 `daily_topic_ledger.json` 跨 Bot 去重） |
-| [`cn-hk-stock-bot/SKILL.md`](./cn-hk-stock-bot/SKILL.md) | `cn-hk-premarket` / `cn-hk-midday` / `cn-hk-close` | 工作日 09:00 / 12:05 / 16:15 | A股 & 港股开盘前瞻、午间缺早补午与收盘复盘 |
 | [`github-hn-morning/SKILL.md`](./github-hn-morning/SKILL.md) | `github-hn-morning` | 每天 09:30（`30 9 * * *`） | GitHub Trending（周一至周六日榜 / 周日周榜）+ Hacker News Top 8（读取 09:00 账本去重） |
-| [`morning-catchup-daily-bots/SKILL.md`](./morning-catchup-daily-bots/SKILL.md) | `morning-catchup-daily-bots` | 周二至周六 10:00（`0 10 * * 2-6`） | 美股收盘 & 24h 加密合盘日报 |
+| [`morning-catchup-daily-bots/SKILL.md`](./morning-catchup-daily-bots/SKILL.md) | `morning-catchup-daily-bots` | 周二至周六 10:00（`0 10 * * 2-6`） | 美股收盘 & 24h 加密合盘日报（含自选股与财报/宏观日程） |
 
 > 注：各 bot 目录下的命令行包装脚本保留 `claude_report.sh` 文件名以兼容既有自动化路径，内部统一 `source ../shared/report_base.sh`。手动强制补发当天已有草稿时，可执行：`FORCE_RUN=1 bash "<bot>/claude_report.sh" send`。
 

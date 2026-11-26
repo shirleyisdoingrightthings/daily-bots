@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>US Market &amp; Crypto Interactive Dashboard</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --surface: #f7f7f5;
+      --border: #e6e6e2;
+      --text: #1f2328;
+      --muted: #6e7781;
+      --accent: #2383e2;
+      --accent-bg: #edf5ff;
+    }
+    [data-theme="dark"] {
+      --bg: #191919;
+      --surface: #252525;
+      --border: #333333;
+      --text: #ebebeb;
+      --muted: #9b9b9b;
+      --accent: #529cca;
+      --accent-bg: #1d2c3a;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Helvetica Neue", sans-serif;
+      overflow-x: hidden;
+    }
+    .wrap {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      min-height: 520px;
+      width: 100%;
+    }
+    .tape-box {
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+      flex: 0 0 auto;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 12px;
+      overflow-x: auto;
+      scrollbar-width: none;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex: 0 0 auto;
+    }
+    .toolbar::-webkit-scrollbar { display: none; }
+    .tab-btn {
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 5px 12px;
+      font-size: 12.5px;
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s ease;
+    }
+    .tab-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .tab-btn.active {
+      background: var(--accent-bg);
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .spacer { flex: 1 1 auto; }
+    .theme-btn {
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--muted);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .chart-stage {
+      flex: 1 1 auto;
+      position: relative;
+      width: 100%;
+      min-height: 410px;
+      background: var(--bg);
+    }
+    .tradingview-widget-container {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="tape-box" id="tape-container"></div>
+    <div class="toolbar" id="tabs-bar"></div>
+    <div class="chart-stage" id="chart-container"></div>
+  </div>
+
+  <script>
+    (function () {
+      const qs = new URLSearchParams(window.location.search);
+      let currentTheme = (qs.get("theme") || "light").toLowerCase() === "dark" ? "dark" : "light";
+      const locale = qs.get("locale") || "zh_CN";
+
+      function parseList(raw) {
+        if (!raw) return [];
+        return raw.split(",").map(s => s.trim()).filter(Boolean).map(item => {
+          if (item.includes("|")) {
+            const [label, sym] = item.split("|");
+            return [label.trim(), sym.trim()];
+          }
+          const shortName = item.includes(":") ? item.split(":")[1] : item;
+          return [shortName, item];
+        });
+      }
+
+      const CORE_TABS = [
+        {
+          id: "indices",
+          label: "📈 核心指数",
+          symbols: [
+            ["标普500", "FOREXCOM:SPXUSD|1M"],
+            ["纳指100", "FOREXCOM:NSXUSD|1M"],
+            ["道琼斯", "FOREXCOM:DJI|1M"],
+            ["罗素2000", "TVC:RUT|1M"],
+            ["费城半导体", "NASDAQ:SOX|1M"],
+            ["高收益债 HYG", "AMEX:HYG|1M"]
+          ]
+        },
+        {
+          id: "macro",
+          label: "🌍 利率与大宗",
+          symbols: [
+            ["10Y美债", "TVC:US10Y|1M"],
+            ["VIX恐慌", "TVC:VIX|1M"],
+            ["美元指数", "TVC:DXY|1M"],
+            ["黄金", "TVC:GOLD|1M"],
+            ["布伦特原油", "TVC:UKOIL|1M"]
+          ]
+        },
+        {
+          id: "crypto",
+          label: "🪙 加密货币",
+          symbols: [
+            ["BTC", "BINANCE:BTCUSDT|1M"],
+            ["ETH", "BINANCE:ETHUSDT|1M"],
+            ["BNB", "BINANCE:BNBUSDT|1M"],
+            ["SOL", "BINANCE:SOLUSDT|1M"],
+            ["XRP", "BINANCE:XRPUSDT|1M"],
+            ["HYPE", "BYBIT:HYPEUSDT|1M"]
+          ]
+        }
+      ];
+
+      // Optional dynamic watchlist groups via URL params (?l1=...&l2=...&l3=...&l4=...&l5=... or ?ai=...)
+      // Keeps personal watchlists private outside the public GitHub repository.
+      const LAYER_DEFS = [
+        { param: "l1", id: "l1", label: qs.get("l1_name") || "⚡ 能源层" },
+        { param: "l2", id: "l2", label: qs.get("l2_name") || "🔌 芯片层" },
+        { param: "l3", id: "l3", label: qs.get("l3_name") || "🏗️ 基础设施" },
+        { param: "l4", id: "l4", label: qs.get("l4_name") || "🧠 模型层" },
+        { param: "l5", id: "l5", label: qs.get("l5_name") || "🚀 应用层" }
+      ];
+
+      const tabs = [...CORE_TABS];
+      let hasCustomLayers = false;
+      for (const ld of LAYER_DEFS) {
+        const parsed = parseList(qs.get(ld.param));
+        if (parsed.length) {
+          hasCustomLayers = true;
+          tabs.push({
+            id: ld.id,
+            label: ld.label,
+            symbols: parsed.map(([name, sym]) => [name, sym.includes("|") ? sym : `${sym}|1M`])
+          });
+        }
+      }
+
+      if (!hasCustomLayers) {
+        const flatAi = parseList(qs.get("ai"));
+        if (flatAi.length) {
+          tabs.push({
+            id: "ai",
+            label: qs.get("ai_name") || "🍰 自选股",
+            symbols: flatAi.map(([name, sym]) => [name, sym.includes("|") ? sym : `${sym}|1M`])
+          });
+        } else {
+          tabs.push({
+            id: "demo",
+            label: "🍰 AI 自选股示例",
+            symbols: [
+              ["能源 CEG", "NASDAQ:CEG|1M"],
+              ["芯片 NVDA", "NASDAQ:NVDA|1M"],
+              ["基建 VRT", "NYSE:VRT|1M"],
+              ["模型 MSFT", "NASDAQ:MSFT|1M"],
+              ["应用 PLTR", "NASDAQ:PLTR|1M"]
+            ]
+          });
+        }
+      }
+
+      const TAPE_SYMBOLS = [
+        { proName: "FOREXCOM:SPXUSD", title: "标普500" },
+        { proName: "FOREXCOM:NSXUSD", title: "纳指100" },
+        { proName: "FOREXCOM:DJI", title: "道琼斯" },
+        { proName: "TVC:RUT", title: "罗素2000" },
+        { proName: "TVC:US10Y", title: "10Y美债" },
+        { proName: "TVC:VIX", title: "VIX" },
+        { proName: "TVC:DXY", title: "美元指数" },
+        { proName: "TVC:GOLD", title: "黄金" },
+        { proName: "TVC:UKOIL", title: "布伦特" },
+        { proName: "BINANCE:BTCUSDT", title: "BTC" },
+        { proName: "NASDAQ:SOX", title: "费城半导体" },
+        { proName: "AMEX:HYG", title: "HYG信用债" }
+      ];
+
+      let activeTabId = qs.get("tab") || tabs[0].id;
+      if (!tabs.some(t => t.id === activeTabId)) activeTabId = tabs[0].id;
+
+      function applyThemeAttr() {
+        document.documentElement.setAttribute("data-theme", currentTheme);
+      }
+
+      function renderTape() {
+        const container = document.getElementById("tape-container");
+        container.innerHTML = "";
+        const wrap = document.createElement("div");
+        wrap.className = "tradingview-widget-container";
+        const widget = document.createElement("div");
+        widget.className = "tradingview-widget-container__widget";
+        const script = document.createElement("script");
+        script.type = "text/javascript";
+        script.async = true;
+        script.src = "https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js";
+        script.textContent = JSON.stringify({
+          symbols: TAPE_SYMBOLS,
+          showSymbolLogo: false,
+          isTransparent: true,
+          displayMode: "adaptive",
+          colorTheme: currentTheme,
+          locale: locale
+        });
+        wrap.appendChild(widget);
+        wrap.appendChild(script);
+        container.appendChild(wrap);
+      }
+
+      function renderChart(tab) {
+        const container = document.getElementById("chart-container");
+        container.innerHTML = "";
+        const wrap = document.createElement("div");
+        wrap.className = "tradingview-widget-container";
+        const widget = document.createElement("div");
+        widget.className = "tradingview-widget-container__widget";
+        widget.style.width = "100%";
+        widget.style.height = "100%";
+        const script = document.createElement("script");
+        script.type = "text/javascript";
+        script.async = true;
+        script.src = "https://s3.tradingview.com/external-embedding/embed-widget-symbol-overview.js";
+        script.textContent = JSON.stringify({
+          symbols: tab.symbols,
+          chartOnly: false,
+          width: "100%",
+          height: "100%",
+          locale: locale,
+          colorTheme: currentTheme,
+          autosize: true,
+          showVolume: true,
+          showMA: true,
+          hideDateRanges: false,
+          hideMarketStatus: false,
+          hideSymbolLogo: false,
+          scalePosition: "right",
+          scaleMode: "Normal",
+          fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, sans-serif",
+          fontSize: "11",
+          noTimeScale: false,
+          valuesTracking: "1",
+          changeMode: "price-and-percent",
+          chartType: "area",
+          maLineColor: "#2962FF",
+          maLineWidth: 1,
+          maLength: 20,
+          lineWidth: 2,
+          lineType: 0,
+          dateRanges: ["1d|5", "5d|30", "1m|60", "3m|1D", "6m|1D", "ytd|1D", "12m|1D", "all|1W"]
+        });
+        wrap.appendChild(widget);
+        wrap.appendChild(script);
+        container.appendChild(wrap);
+      }
+
+      function renderTabs() {
+        const bar = document.getElementById("tabs-bar");
+        bar.innerHTML = "";
+        for (const t of tabs) {
+          const btn = document.createElement("button");
+          btn.className = "tab-btn" + (t.id === activeTabId ? " active" : "");
+          btn.textContent = t.label;
+          btn.onclick = () => {
+            activeTabId = t.id;
+            renderTabs();
+            renderChart(t);
+          };
+          bar.appendChild(btn);
+        }
+        const spacer = document.createElement("div");
+        spacer.className = "spacer";
+        bar.appendChild(spacer);
+
+        const themeBtn = document.createElement("button");
+        themeBtn.className = "theme-btn";
+        themeBtn.textContent = currentTheme === "dark" ? "☀️ 浅色" : "🌙 深色";
+        themeBtn.onclick = () => {
+          currentTheme = currentTheme === "dark" ? "light" : "dark";
+          applyThemeAttr();
+          renderTabs();
+          renderTape();
+          renderChart(tabs.find(t => t.id === activeTabId));
+        };
+        bar.appendChild(themeBtn);
+      }
+
+      applyThemeAttr();
+      renderTape();
+      renderTabs();
+      renderChart(tabs.find(t => t.id === activeTabId));
+    })();
+  </script>
+</body>
+</html>

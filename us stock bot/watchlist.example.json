@@ -1,0 +1,52 @@
+{
+  "name": "AI 自选股（示例模板）",
+  "emoji": "🍰",
+  "methodology": "参考黄仁勋《AI 是一块“五层蛋糕”》（https://blogs.nvidia.cn/blog/ai-5-layer-cake/）的能源→芯片→基础设施→模型→应用五层框架。本文件仅为公开结构示例，并非唯一参照；复制为 watchlist.json 后可按个人偏好自由替换任意主题（如高股息、医疗、半导体、消费等）与标的。",
+  "groups": [
+    {
+      "name": "能源层",
+      "emoji": "⚡",
+      "description": "实时算力的底层硬约束：核电、独立发电与电网设备",
+      "tickers": [
+        {"symbol": "CEG", "name": "Constellation核电"},
+        {"symbol": "VST", "name": "Vistra电力"}
+      ]
+    },
+    {
+      "name": "芯片层",
+      "emoji": "🔌",
+      "description": "将电力高效转化为并行算力：GPU、ASIC、代工与 HBM 存储",
+      "tickers": [
+        {"symbol": "NVDA", "name": "英伟达"},
+        {"symbol": "TSM", "name": "台积电"}
+      ]
+    },
+    {
+      "name": "基础设施层",
+      "emoji": "🏗️",
+      "description": "AI 工厂：液冷供电、高速网络交换机、数据中心与算力云",
+      "tickers": [
+        {"symbol": "VRT", "name": "Vertiv"},
+        {"symbol": "ANET", "name": "Arista网络"}
+      ]
+    },
+    {
+      "name": "模型层",
+      "emoji": "🧠",
+      "description": "实时推理引擎、前沿基础模型实验室与开源生态",
+      "tickers": [
+        {"symbol": "MSFT", "name": "微软"},
+        {"symbol": "GOOGL", "name": "Alphabet"}
+      ]
+    },
+    {
+      "name": "应用层",
+      "emoji": "🚀",
+      "description": "产生真实经济价值：企业级 AI Agent、SaaS 与物理 AI",
+      "tickers": [
+        {"symbol": "PLTR", "name": "Palantir"},
+        {"symbol": "TSLA", "name": "特斯拉"}
+      ]
+    }
+  ]
+}

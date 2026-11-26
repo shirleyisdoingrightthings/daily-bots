@@ -6,7 +6,7 @@
 
 🌐 [English](./README.md) | **简体中文**
 
-一个经过生产环境长期验证的 Monorepo，包含 **6 个模块化自动情报机器人**与一套 **共享运行时及运维层**，覆盖 **AI 产业新闻、X & Reddit 社区热议、一线 AI Builder、GitHub Trending & Hacker News、美股与加密行情、A股与港股三时段复盘**，每日自动完成抓取、去重、事实核验，并推送至 **飞书（Lark）卡片 2.0** 与 **Notion 知识库**。
+一个经过生产环境长期验证的 Monorepo，包含 **5 个模块化自动情报机器人**（编排为 **3 条定时流水线**：早间 AI 三合一、GitHub & Hacker News、美股与加密行情）与一套 **共享运行时及运维层**，每日自动完成抓取、去重、事实核验，并推送至 **飞书（Lark）卡片 2.0** 与 **Notion 知识库**。
 
 > **零大模型厂商锁定（Zero LLM Vendor Lock-In）**：所有 Python 脚本（`*_report.py`）均只负责确定性的 `fetch` 抓取、去重、HTML 清洗、飞书推送与 Notion 归档，不硬编码任何第三方大模型 SDK。AI 写稿完全解耦为 Markdown 规范（`prompt*.md`）与定时调度说明书（`shared/scheduled-tasks/*/SKILL.md`），可自由搭配任意编程/自动化 Agent 与模型运行。
 
@@ -20,15 +20,13 @@ flowchart LR
         S1["每日 09:00<br/>AI 三合一串行流水线"]
         S2["每日 09:30<br/>GitHub &amp; Hacker News"]
         S3["周二至周六 10:00<br/>美股收盘与加密行情"]
-        S4["周一至周五 09:00 / 12:05 / 16:15<br/>A股与港股三时段播报"]
     end
 
-    subgraph Bots["6 个模块化 Bot（fetch -&gt; Agent 写稿 -&gt; send）"]
+    subgraph Bots["5 个模块化 Bot（fetch -&gt; Agent 写稿 -&gt; send）"]
         direction TB
         B1["1. AI 产业日报"] --> B2["2. X &amp; Reddit 社区热议"] --> B3["3. AI Builder 日报"]
         B4["4. GitHub &amp; HN 早报"]
         B5["5. 美股与加密日报"]
-        B6["6. A股与港股日报"]
     end
 
     subgraph Shared["shared/ 共享运行时与运维层"]
@@ -46,9 +44,8 @@ flowchart LR
     S1 --> B1
     S2 --> B4
     S3 --> B5
-    S4 --> B6
     B1 & B2 & B3 & B4 <--> L
-    B1 & B2 & B3 & B4 & B5 & B6 --> U
+    B1 & B2 & B3 & B4 & B5 --> U
     U --> F
     U --> N --> ND
     H -.-> Bots
@@ -66,8 +63,7 @@ flowchart LR
 | 🐦 **X & Reddit 社区热议** | 每日 `09:00`（第 2/3 棒） | 48 小时窗口，完整提取 Latent Space `[AINews]` 的 Twitter Recap + Reddit Recap（12 个核心 AI subreddit）与 Techmeme 交叉验证；保留正反技术交锋、一线实测吐槽与原帖直链。 | [目录](./x-hotspot-bot/) · [工作流文档](./x-hotspot-bot/README.md) |
 | 🛠️ **AI Builder 日报** | 每日 `09:00`（第 3/3 棒） | 通过 `twitterapi.io` 直连抓取公开自建 X List（零浏览器/Cookie 封号风险）+ 自动拉取 X Article 长文与外链博客正文；自动过滤前序已播原推。 | [目录](./ai-builder-bot/) · [工作流文档](./ai-builder-bot/README.md) |
 | 🐙 **GitHub & HN 早报** | 每日 `09:30` | GitHub Trending（周一至周六日榜 / 周日周榜）+ README 自动抓读 + Hacker News Top 8（Firebase + Algolia 热评融合）及 30 天跨天在榜记忆。 | [目录](./github-hn-bot/) · [工作流文档](./github-hn-bot/README.md) |
-| 🗽 **美股与加密日报** | 周二至周六 `10:00` | 美股收盘（CNBC 11 大 GICS 板块 + 28 只权重股宽度 + MA5/MA20 乖离率）+ 24h 核心加密行情（CoinGecko + 恐贪指数）+ 5 路财经 RSS + 可选 Exa 异动催化核查。 | [目录](./us%20stock%20bot/) · [工作流文档](./us%20stock%20bot/README.md) |
-| 📈 **A股与港股日报** | 周一至周五 `09:00` / `12:05` / `16:15` | A股与港股双通道播报（开盘前瞻 / 午间缺早补午 / 收盘复盘），接入腾讯行情、新浪板块与 7×24 电报、均线乖离率及可选 Exa 补盲核查。 | [目录](./cn-hk-stock-bot/) · [工作流文档](./cn-hk-stock-bot/README.md) |
+| 🗽 **美股与加密日报** | 周二至周六 `10:00` | 跨资产美股收盘（四大股指、10Y 美债、VIX、美元、黄金、布油、SOX/HYG、均线与 RSI/布林 %B）+ 24h 加密行情 + Nasdaq 财报/宏观日程 + 自定义分层自选股 + 可选 Exa 异动催化核查。 | [目录](./us%20stock%20bot/) · [工作流文档](./us%20stock%20bot/README.md) |
 | ⚙️ **共享运行时与运维层** | 底层常驻 | `bot_utils.py`、`notion_archive.py`、`notion_reconcile.py`、`*_base.sh` 统一入口、`scheduled-tasks/` `SKILL.md` 调度规范及 45+ 离线单元测试。 | [目录](./shared/) · [架构说明](./shared/README.md) |
 
 ---
@@ -95,13 +91,13 @@ daily-bots/
 ├── .env.example                   # 环境变量配置模板
 ├── .github/workflows/ci.yml       # GitHub Actions 语法与单元测试 CI
 ├── docs/
+│   ├── tv-dashboard.html          # Notion 嵌入式 TradingView 交互看板（GitHub Pages）
 │   └── launchd-env.plist.example  # 可选 macOS LaunchAgent 配置模板
 ├── AI Daily News Bot/             # 第 1 棒：全球 AI 产业日报
 ├── x-hotspot-bot/                 # 第 2 棒：X & Reddit 社区热议
 ├── ai-builder-bot/                # 第 3 棒：一线 AI Builder X List 日报
 ├── github-hn-bot/                 # GitHub Trending + Hacker News Top 8
-├── us stock bot/                  # 美股收盘 + 24h 加密仪表盘
-├── cn-hk-stock-bot/               # A股与港股三时段决策播报
+├── us stock bot/                  # 美股收盘 + 24h 加密 + 自定义自选股仪表盘
 └── shared/                        # 共享工具库、Notion 归档、Shell 底座、SKILL.md 与单测
 ```
 
@@ -147,14 +143,14 @@ bash "AI Daily News Bot/claude_report.sh" send
 
 | 变量名 | 使用模块 | 说明 |
 | :--- | :--- | :--- |
-| `FEISHU_WEBHOOK` | AI 产业日报、X & Reddit、AI Builder、GitHub & HN、美股 | 飞书自定义机器人 Webhook 地址 |
-| `FEISHU_SECRET` | 可选（上述全部模块） | 飞书 Webhook HMAC 签名密钥 |
-| `FEISHU_WEBHOOK_CN` / `FEISHU_WEBHOOK_HK` | A股与港股 | 分别推送至 A股群与港股群的独立 Webhook |
+| `FEISHU_WEBHOOK` | 全部模块 | 飞书自定义机器人 Webhook 地址 |
+| `FEISHU_SECRET` | 可选（全部模块） | 飞书 Webhook HMAC 签名密钥 |
 | `TWITTERAPI_IO_KEY` | AI Builder | [twitterapi.io](https://twitterapi.io/) API Key，用于免登抓取公开 X List |
 | `X_LIST_ID` | AI Builder | 数字 List ID 或完整 `https://x.com/i/lists/<id>` 链接 |
 | `NOTION_ARCHIVE_API_KEY` | 可选（全部模块） | Notion 内部集成 Token，用于每日自动归档 |
 | `NOTION_ARCHIVE_DATABASE_ID` | 可选（全部模块） | 目标 Notion 数据库 ID |
-| `EXA_API_KEY` / `ENABLE_EXA_ENRICH` | 可选（美股、A股与港股） | 设 `ENABLE_EXA_ENRICH=1` 开启未覆盖异动股 Exa 核查 |
+| `WATCHLIST_FILE` | 可选（美股与加密） | 自定义本地分层自选股 JSON 路径（默认 `watchlist.json`） |
+| `EXA_API_KEY` / `ENABLE_EXA_ENRICH` | 可选（美股与加密） | 设 `ENABLE_EXA_ENRICH=1` 开启未覆盖异动股 Exa 核查 |
 | `EXA_AGENT_EFFORT` | 可选（Exa） | 固定档位：`minimal` / `low` / `medium`（默认） / `high` |
 | `COINGECKO_API_KEY` / `CMC_API_KEY` | 可选（美股与加密） | 可选 Key，用于提升加密行情与恐贪指数接口限额 |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 可选（全部模块） | 网络受限环境下的本地代理地址 |

@@ -2,12 +2,13 @@
 """
 美股收盘 & 24h 加密行情合盘日报
 数据源：
-  · CNBC quote API: 4 大指数 / VIX / 美债 / 美元 / 11 个 GICS 板块 ETF 与核心成分股 / 28 只权重股 / RSP
-  · 腾讯财经日 K (`fqkline`): 标普 500 / 纳指 / 道指 MA5 / MA10 / MA20 均线与乖离率
-  · CoinGecko + Alternative.me / CMC: BTC/ETH/SOL/BNB/XRP/HYPE 24h 行情、总市值、BTC 市占率与恐贪指数
+  · CNBC quote API: 4 大指数 / 10Y美债 / VIX / DXY / 黄金 / 布伦特原油 / SOX / HYG / 11 个 GICS 板块 ETF 与核心成分股 / 28 只权重股 / RSP / 可选个人自选股(watchlist.json)
+  · 腾讯财经日 K (`fqkline`, 60日): 标普 500 / 纳指 / 道指 MA5/MA10/MA20 均线与乖离率 + RSI(14) + 布林带 %B(20,2)
+  · CoinGecko + Alternative.me / CMC: BTC/ETH/BNB/SOL/XRP/HYPE 24h 行情、总市值、BTC 市占率与恐贪指数
+  · Nasdaq Calendar API: 未来 5 个交易日重大美股财报（含自选股优先标注）与核心美国宏观日程（FOMC/CPI/PCE/非农/GDP/ISM）
   · RSS × 5: CNBC 财经头条 / CNBC 盈利 / Dow Jones MarketWatch / Nasdaq Markets / Nasdaq Earnings
   · 可选 Exa 定向补盲: 付费墙短摘要补全 + Exa Agent 异动股三态催化验证（confirmed/absent/cannot_verify）
-由 AI 定时任务写稿：① 收盘仪表盘（美股 + 加密 + 决策信号灯）② 美股要闻播报，推送 2 条飞书卡片并归档至 Notion。
+由 AI 定时任务写稿：① 收盘仪表盘（美股 + 大宗 + 加密 + 自选股 + 决策信号灯）② 美股要闻播报，推送 2 条飞书卡片并归档至 Notion。
 本脚本只负责抓取与推送，不含写稿用的第三方大模型 API。
 
 两种运行模式（--mode）：
@@ -21,6 +22,8 @@
 
 写稿规范存放于 prompt_market.md（消息①）与 prompt_news.md（消息②）。
 """
+
+from __future__ import annotations
 
 import os
 import re
@@ -73,6 +76,8 @@ LAST_SESSION = Path(__file__).parent / "logs" / ".last_session"
 # 跨日盘面状态记忆库（保留最近 5 个交易日的板块轮动、信号灯与关注方向，借鉴 claude-quickstarts State Store 设计）
 MARKET_MEMORY = Path(__file__).parent / "logs" / "market_memory.json"
 MAX_MEMORY_DAYS = 5
+# 个人分层自选股配置（本地私有，默认读取同目录 watchlist.json，已在 .gitignore 忽略；支持 WATCHLIST_FILE 覆盖）
+WATCHLIST_FILE = Path(os.getenv("WATCHLIST_FILE") or (Path(__file__).parent / "watchlist.json"))
 
 # ===== P0: 显式代理配置 =====
 _PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
@@ -104,7 +109,11 @@ CNBC_QUOTE_URL = (
 
 INDICES = [(".SPX", "标普500"), (".IXIC", "纳斯达克"),
            (".DJI", "道琼斯"), (".RUT", "罗素2000")]
-MACRO   = [(".VIX", "VIX恐慌指数"), ("US10Y", "10年期美债"), (".DXY", "美元指数")]
+# 跨资产宏观与大宗指标（并入核心指数行一屏展示）
+MACRO   = [("US10Y", "10年期美债"), (".VIX", "VIX"), (".DXY", "美元指数"),
+           ("@GC.1", "黄金"), ("@LCO.1", "布伦特原油")]
+# 行业景气与信用风向标（并入市场宽度行）
+RISK_GAUGES = [(".SOX", "费城半导体"), ("HYG", "高收益债(HYG)")]
 # 11 个 GICS 板块，用 SPDR 行业 ETF 代理
 SECTORS = [("XLK", "科技"), ("XLC", "通信服务"), ("XLY", "可选消费"),
            ("XLP", "必需消费"), ("XLE", "能源"), ("XLF", "金融"),
@@ -192,15 +201,72 @@ def _num(s):
 
 @with_retry(max_retries=2, base_delay=5, exceptions=(Exception,))
 def fetch_quotes(symbols: list) -> dict:
-    """一次取回全部标的行情，返回 {symbol: quote_dict}。"""
-    url = CNBC_QUOTE_URL.format(syms="|".join(symbols))
-    resp = SESSION.get(url, headers={"User-Agent": _UA}, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    quotes = data.get("FormattedQuoteResult", {}).get("FormattedQuote", [])
-    if isinstance(quotes, dict):          # 单标的时 CNBC 返回对象而非数组
-        quotes = [quotes]
-    return {q.get("symbol"): q for q in quotes if q.get("symbol")}
+    """分批取回全部标的行情（每批最多 50 个，防止加入大型自选股池后 URL 超长），返回 {symbol: quote_dict}。"""
+    merged: dict = {}
+    batch_size = 50
+    for i in range(0, len(symbols), batch_size):
+        chunk = symbols[i:i + batch_size]
+        url = CNBC_QUOTE_URL.format(syms="|".join(chunk))
+        resp = SESSION.get(url, headers={"User-Agent": _UA}, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        quotes = data.get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+        if isinstance(quotes, dict):          # 单标的时 CNBC 返回对象而非数组
+            quotes = [quotes]
+        for q in quotes:
+            sym = q.get("symbol")
+            if sym:
+                merged[sym] = q
+    return merged
+
+
+def load_custom_watchlist(path: Path | None = None) -> dict | None:
+    """加载个人分层自选股配置（watchlist.json）。文件不存在时静默返回 None，保证开源默认运行不报错。"""
+    cfg_path = path or WATCHLIST_FILE
+    if not cfg_path or not cfg_path.exists():
+        return None
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        groups = []
+        all_symbols: list[str] = []
+        seen: set[str] = set()
+        for g in raw.get("groups") or []:
+            g_name = str(g.get("name") or "").strip()
+            g_emoji = str(g.get("emoji") or "•").strip()
+            tickers = []
+            for t in g.get("tickers") or []:
+                if isinstance(t, str):
+                    sym, nm = t.strip().upper(), t.strip().upper()
+                elif isinstance(t, dict):
+                    sym = str(t.get("symbol") or "").strip().upper()
+                    nm = str(t.get("name") or sym).strip()
+                else:
+                    continue
+                if not sym:
+                    continue
+                tickers.append({"symbol": sym, "name": nm})
+                if sym not in seen:
+                    seen.add(sym)
+                    all_symbols.append(sym)
+            if g_name and tickers:
+                groups.append({
+                    "name": g_name,
+                    "emoji": g_emoji,
+                    "description": str(g.get("description") or "").strip(),
+                    "tickers": tickers,
+                })
+        if not groups:
+            return None
+        return {
+            "name": str(raw.get("name") or "自选股").strip(),
+            "emoji": str(raw.get("emoji") or "⭐").strip(),
+            "methodology": str(raw.get("methodology") or "").strip(),
+            "groups": groups,
+            "all_symbols": all_symbols,
+        }
+    except Exception as e:
+        print(f"[WARN] 加载自选股配置 {cfg_path} 失败: {e}", file=sys.stderr)
+        return None
 
 
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -505,6 +571,10 @@ _US_BRAND_ALIASES = {
     "O": ("realty income",), "NEE": ("nextera",), "CEG": ("constellation energy",),
     "VST": ("vistra",), "SO": ("southern company",), "DUK": ("duke energy",),
     "AEP": ("american electric",),
+    "GEV": ("ge vernova",), "VRT": ("vertiv",), "ANET": ("arista networks", "arista"),
+    "CRWV": ("coreweave",), "NBIS": ("nebius",), "ANT": ("anthropic",),
+    "MRVL": ("marvell",), "ASML": ("asml",), "NOW": ("servicenow",),
+    "CRWD": ("crowdstrike",),
 }
 
 
@@ -620,15 +690,47 @@ _US_MA_MAP = {
 }
 
 
+def _compute_rsi14(closes: list[float]) -> float | None:
+    """按 Wilder 平滑法计算 14 日 RSI。"""
+    if len(closes) < 15:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+    avg_gain = sum(gains[:14]) / 14.0
+    avg_loss = sum(losses[:14]) / 14.0
+    for g, l in zip(gains[14:], losses[14:]):
+        avg_gain = (avg_gain * 13.0 + g) / 14.0
+        avg_loss = (avg_loss * 13.0 + l) / 14.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _compute_bollinger_20(closes: list[float]) -> tuple[float, float, float, float] | None:
+    """计算 20 日布林带 (mid, upper, lower, pct_b)，标准差取 2σ。"""
+    if len(closes) < 20:
+        return None
+    win = closes[-20:]
+    mid = sum(win) / 20.0
+    var = sum((x - mid) ** 2 for x in win) / 20.0
+    std = var ** 0.5
+    upper = mid + 2.0 * std
+    lower = mid - 2.0 * std
+    pct_b = (closes[-1] - lower) / (upper - lower) if upper > lower else 0.5
+    return mid, upper, lower, pct_b
+
+
 def fetch_us_ma_trends() -> dict:
-    """直连腾讯财经日 K 接口拉取美股三大指数最近 25 日收盘价，计算 MA5/MA10/MA20 与 MA5 乖离率。"""
+    """直连腾讯财经日 K 接口拉取美股三大指数最近 60 日收盘价，计算 MA5/MA10/MA20、乖离率、RSI(14) 与布林带 %B(20,2)。"""
     out = {}
     s = requests.Session()
     s.trust_env = False
     s.proxies = {}
     for cnbc_sym, (gt_code, label) in _US_MA_MAP.items():
         try:
-            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={gt_code},day,,,25,qfq"
+            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={gt_code},day,,,60,qfq"
             resp = s.get(url, headers={"User-Agent": _UA}, timeout=8)
             klines = resp.json().get("data", {}).get(gt_code, {}).get("day") or []
             closes = [float(r[2]) for r in klines if len(r) >= 3 and r[2]]
@@ -639,6 +741,7 @@ def fetch_us_ma_trends() -> dict:
             ma10 = sum(closes[-10:]) / 10.0
             ma20 = sum(closes[-20:]) / 20.0
             bias5 = (cur - ma5) / ma5 * 100.0 if ma5 else 0.0
+            bias20 = (cur - ma20) / ma20 * 100.0 if ma20 else 0.0
             if ma5 > ma10 > ma20:
                 trend = "🟢多头排列"
             elif ma5 < ma10 < ma20:
@@ -647,10 +750,197 @@ def fetch_us_ma_trends() -> dict:
                 trend = "🟡均线缠绕偏强(站上MA20)"
             else:
                 trend = "🟡均线缠绕偏弱(跌破MA20)"
-            out[cnbc_sym] = f"{trend} | MA5={ma5:,.2f} (乖离率 {bias5:+.2f}%) | MA20={ma20:,.2f}"
+
+            extra_parts = []
+            rsi14 = _compute_rsi14(closes)
+            if rsi14 is not None:
+                if rsi14 >= 70:
+                    rsi_lbl = "超买警惕"
+                elif rsi14 >= 60:
+                    rsi_lbl = "偏强"
+                elif rsi14 <= 30:
+                    rsi_lbl = "超卖反弹区"
+                elif rsi14 <= 40:
+                    rsi_lbl = "偏弱近超卖"
+                else:
+                    rsi_lbl = "中性"
+                extra_parts.append(f"RSI(14)={rsi14:.1f}({rsi_lbl})")
+
+            bb = _compute_bollinger_20(closes)
+            if bb is not None:
+                _, upper, lower, pct_b = bb
+                if pct_b > 1.0:
+                    bb_lbl = "破上轨(过热防回调)"
+                elif pct_b >= 0.8:
+                    bb_lbl = "近上轨(偏热)"
+                elif pct_b < 0.0:
+                    bb_lbl = "破下轨(超卖反弹窗口)"
+                elif pct_b <= 0.2:
+                    bb_lbl = "近下轨(关注支撑)"
+                else:
+                    bb_lbl = "中轨区间"
+                extra_parts.append(f"布林%B={pct_b:.2f}({bb_lbl}, 上轨{upper:,.1f}/下轨{lower:,.1f})")
+
+            extra_str = (" | " + " | ".join(extra_parts)) if extra_parts else ""
+            out[cnbc_sym] = (
+                f"{trend} | MA5={ma5:,.2f} (乖离率 {bias5:+.2f}%) | "
+                f"MA20={ma20:,.2f} (乖离率 {bias20:+.2f}%){extra_str}"
+            )
         except Exception:
             continue
     return out
+
+
+# ===== Financial Events（未来 5 个交易日重大财报 + 美国核心宏观日程）=====
+_MACRO_EVENT_RE = re.compile(
+    r"\b(?:FOMC|Federal Funds|Fed Interest Rate|Fed Chair|"
+    r"CPI|Consumer Price Index|Core CPI|"
+    r"PCE|Personal Consumption Expenditures|Core PCE|"
+    r"Nonfarm Payrolls|Non-Farm Payrolls|Unemployment Rate|"
+    r"GDP|Gross Domestic Product|"
+    r"ISM Manufacturing|ISM Services|ISM Non-Manufacturing|"
+    r"Retail Sales|PPI|Producer Price Index)\b",
+    re.IGNORECASE,
+)
+_MACRO_NOISE_RE = re.compile(r"\b(?:Redbook|Chain Store|MBA|EIA|API|Bill Auction|Note Auction|Bond Auction|Baker Hughes)\b", re.IGNORECASE)
+
+
+def _parse_market_cap(raw: str) -> float:
+    if not raw:
+        return 0.0
+    s = str(raw).replace("$", "").replace(",", "").strip().upper()
+    mult = 1.0
+    if s.endswith("T"):
+        mult, s = 1e12, s[:-1]
+    elif s.endswith("B"):
+        mult, s = 1e9, s[:-1]
+    elif s.endswith("M"):
+        mult, s = 1e6, s[:-1]
+    try:
+        return float(s) * mult
+    except ValueError:
+        return 0.0
+
+
+def fetch_financial_events(
+    session_str: str,
+    custom_wl_syms: set[str] | None = None,
+    days_ahead: int = 5,
+) -> dict:
+    """从 Nasdaq Calendar API 并行拉取未来 5 个交易日的重大财报（大市值 + 自选股优先）及美国核心宏观日程。"""
+    custom_wl = {s.upper() for s in (custom_wl_syms or set())}
+    priority_syms = custom_wl | {s.upper() for s in WATCHLIST}
+
+    try:
+        base_dt = datetime.strptime(session_str, "%Y-%m-%d")
+    except Exception:
+        base_dt = datetime.now()
+
+    target_dates: list[str] = []
+    cur = base_dt
+    while len(target_dates) < days_ahead:
+        cur += timedelta(days=1)
+        if cur.weekday() < 5:  # 周一至周五
+            target_dates.append(cur.strftime("%Y-%m-%d"))
+
+    headers = {
+        "User-Agent": _UA,
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.nasdaq.com",
+        "Referer": "https://www.nasdaq.com/",
+    }
+
+    def _fetch_day(dt_str: str) -> tuple[list[dict], list[dict]]:
+        day_earn: list[dict] = []
+        day_econ: list[dict] = []
+        try:
+            r = SESSION.get(
+                f"https://api.nasdaq.com/api/calendar/earnings?date={dt_str}",
+                headers=headers,
+                timeout=12,
+            )
+            if r.status_code == 200:
+                rows = (r.json().get("data") or {}).get("rows") or []
+                for row in rows:
+                    sym = str(row.get("symbol") or "").strip().upper()
+                    if not sym:
+                        continue
+                    mcap = _parse_market_cap(row.get("marketCap") or "")
+                    in_custom = sym in custom_wl
+                    in_prio = sym in priority_syms
+                    if not in_prio and mcap < 50_000_000_000:
+                        continue
+                    t_raw = str(row.get("time") or "").lower()
+                    t_lbl = "盘前" if "pre" in t_raw else ("盘后" if "after" in t_raw else "")
+                    day_earn.append({
+                        "date": dt_str,
+                        "symbol": sym,
+                        "name": str(row.get("name") or sym).strip(),
+                        "market_cap": mcap,
+                        "time": t_lbl,
+                        "eps_forecast": str(row.get("epsForecast") or "").strip(),
+                        "is_custom": in_custom,
+                    })
+        except Exception:
+            pass
+
+        try:
+            r2 = SESSION.get(
+                f"https://api.nasdaq.com/api/calendar/economicevents?date={dt_str}",
+                headers=headers,
+                timeout=12,
+            )
+            if r2.status_code == 200:
+                rows2 = (r2.json().get("data") or {}).get("rows") or []
+                seen_ev: set[str] = set()
+                for row in rows2:
+                    country = str(row.get("country") or "").strip()
+                    if country.lower() not in ("united states", "us", "u.s."):
+                        continue
+                    ev_name = html.unescape(str(row.get("eventName") or "")).strip()
+                    if not ev_name or _MACRO_NOISE_RE.search(ev_name) or not _MACRO_EVENT_RE.search(ev_name):
+                        continue
+                    # 去除同日同指标的冗余子项（如 MoM/YoY 重复保留首条核心项）
+                    key = re.sub(r"\s*\([^)]*\)|\b(?:MoM|YoY|QoQ|s\.a\.|n\.s\.a\.|Prelim|Final|Rev)\b", "", ev_name, flags=re.I).strip().lower()
+                    if key in seen_ev:
+                        continue
+                    seen_ev.add(key)
+                    cons = html.unescape(str(row.get("consensus") or "")).replace("\xa0", "").strip()
+                    prev = html.unescape(str(row.get("previous") or "")).replace("\xa0", "").strip()
+                    day_econ.append({
+                        "date": dt_str,
+                        "event": ev_name,
+                        "consensus": cons,
+                        "previous": prev,
+                    })
+        except Exception:
+            pass
+        return day_earn, day_econ
+
+    all_earnings: list[dict] = []
+    all_macro: list[dict] = []
+    try:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            for e_list, m_list in ex.map(_fetch_day, target_dates):
+                all_earnings.extend(e_list)
+                all_macro.extend(m_list)
+    except Exception as e:
+        print(f"[WARN] Financial Events 抓取失败: {e}", file=sys.stderr)
+
+    # 去重并排序：自选股优先，同日按市值降序
+    seen_e: set[tuple[str, str]] = set()
+    uniq_earnings = []
+    for item in sorted(all_earnings, key=lambda x: (x["date"], not x["is_custom"], -x["market_cap"])):
+        k = (item["date"], item["symbol"])
+        if k not in seen_e:
+            seen_e.add(k)
+            uniq_earnings.append(item)
+
+    return {
+        "window": f"{target_dates[0]} ~ {target_dates[-1]}" if target_dates else "",
+        "earnings": uniq_earnings[:8],
+        "macro": all_macro[:6],
+    }
 
 
 def _load_us_memory() -> list:
@@ -692,13 +982,104 @@ def _extract_us_signal_and_focus(report_text: str) -> tuple:
     return sig, focus
 
 
+def _format_custom_watchlist_block(custom_wl: dict | None, quotes: dict) -> str:
+    """格式化自定义分层自选股汇总（单行总览 + 逐层成分股明细），无配置时返回空串。"""
+    if not custom_wl:
+        return ""
+    group_summaries = []
+    detail_lines = []
+    all_items = []
+    for g in custom_wl.get("groups") or []:
+        g_name = g["name"]
+        g_emoji = g.get("emoji", "•")
+        g_pcts = []
+        ticker_strs = []
+        for t in g.get("tickers") or []:
+            sym = t["symbol"]
+            nm = t.get("name", sym)
+            qq = quotes.get(sym)
+            if qq and _num(qq.get("change_pct")) is not None:
+                p_val = _num(qq.get("change_pct"))
+                g_pcts.append(p_val)
+                all_items.append((sym, nm, qq.get("last", "?"), qq.get("change_pct", "?"), p_val))
+                ticker_strs.append(f"{sym} {qq.get('last', '?')} ({qq.get('change_pct', '?')})")
+            else:
+                ticker_strs.append(f"{sym} 未知")
+        if g_pcts:
+            avg_p = sum(g_pcts) / len(g_pcts)
+            avg_str = f"{avg_p:+.2f}%"
+            short_g = g_name.rstrip("层")
+            group_summaries.append(f"{g_emoji} {short_g} {avg_str}")
+            detail_lines.append(f"{g_emoji} {g_name}（均值 {avg_str}）：{' | '.join(ticker_strs)}")
+        else:
+            detail_lines.append(f"{g_emoji} {g_name}（均值 未知）：{' | '.join(ticker_strs)}")
+
+    if not all_items:
+        return ""
+    up = sum(1 for x in all_items if x[4] > 0)
+    down = sum(1 for x in all_items if x[4] < 0)
+    flat = len(all_items) - up - down
+    sorted_all = sorted(all_items, key=lambda x: x[4], reverse=True)
+    best = sorted_all[0]
+    worst = sorted_all[-1]
+    flat_s = f" {flat} 平" if flat else ""
+    summary_line = (
+        f"总览：{len(all_items)} 只 {up} 涨 {down} 跌{flat_s} | "
+        f"{' · '.join(group_summaries)} | "
+        f"最强 {best[0]} ({best[3]}) · 最弱 {worst[0]} ({worst[3]})"
+    )
+    title = f"{custom_wl.get('emoji', '⭐')} {custom_wl.get('name', '自选股')}"
+    return f"【{title}追踪（共 {len(all_items)} 只）】\n{summary_line}\n" + "\n".join(detail_lines)
+
+
+def _format_financial_events_block(events: dict | None) -> str:
+    """格式化未来 5 个交易日重大财报与美国核心宏观日程。"""
+    if not events:
+        return "暂无未来 5 日日程数据"
+    earn_items = events.get("earnings") or []
+    macro_items = events.get("macro") or []
+    lines = [f"时间窗口：{events.get('window', '')}"]
+    if earn_items:
+        e_strs = []
+        for e in earn_items:
+            mmdd = e["date"][5:]
+            star = "★" if e.get("is_custom") else ""
+            t_str = f" {e['time']}" if e.get("time") else ""
+            mcap_b = e["market_cap"] / 1e9 if e.get("market_cap") else 0
+            cap_str = f" (${mcap_b:,.0f}B)" if mcap_b >= 10 else ""
+            e_strs.append(f"{mmdd}{t_str} {star}{e['symbol']}{cap_str}")
+        lines.append("即将到来的重大财报（★为个人自选股）：" + " | ".join(e_strs))
+    else:
+        lines.append("即将到来的重大财报：未来5个交易日暂无市值≥500亿美元或自选股财报")
+    if macro_items:
+        m_strs = []
+        for m in macro_items:
+            mmdd = m["date"][5:]
+            extra = []
+            if m.get("consensus"):
+                extra.append(f"预期{m['consensus']}")
+            if m.get("previous"):
+                extra.append(f"前值{m['previous']}")
+            ex_s = f"（{'/'.join(extra)}）" if extra else ""
+            m_strs.append(f"{mmdd} {m['event']}{ex_s}")
+        lines.append("美国核心宏观日程：" + " | ".join(m_strs))
+    else:
+        lines.append("美国核心宏观日程：未来5个交易日暂无 FOMC/CPI/PCE/非农/GDP/ISM 公布")
+    return "\n".join(lines)
+
+
 # ===== 汇总抓取 =====
 def gather() -> dict:
     print("📈 抓取行情...", file=sys.stderr)
+    custom_wl = load_custom_watchlist()
+    custom_wl_syms = custom_wl["all_symbols"] if custom_wl else []
+    if custom_wl:
+        print(f"  ✓ 已加载个人自选股配置《{custom_wl['name']}》（{len(custom_wl_syms)} 只）", file=sys.stderr)
+
     sector_member_syms = [sym for members in SECTOR_STOCKS.values() for sym, _ in members]
     all_syms = list(dict.fromkeys(
-        [s for s, _ in INDICES] + [s for s, _ in MACRO] +
-        [s for s, _ in SECTORS] + WATCHLIST + sector_member_syms + ["RSP"]
+        [s for s, _ in INDICES] + [s for s, _ in MACRO] + [s for s, _ in RISK_GAUGES] +
+        [s for s, _ in SECTORS] + WATCHLIST + sector_member_syms + custom_wl_syms + ["RSP"]
     ))
     quotes = {}
     try:
@@ -757,6 +1138,11 @@ def gather() -> dict:
     print(f"  ✓ BTC {crypto['prices'].get('BTC', '未知')} | 恐贪指数 {crypto['fear_val']} ({crypto['fear_label']})",
           file=sys.stderr)
 
+    print("\n📅 抓取未来 5 个交易日重大财报与宏观日程...", file=sys.stderr)
+    fin_events = fetch_financial_events(sess, set(custom_wl_syms))
+    print(f"  ✓ 财报 {len(fin_events.get('earnings') or [])} 条 | 宏观 {len(fin_events.get('macro') or [])} 条",
+          file=sys.stderr)
+
     ma_trends = fetch_us_ma_trends()
 
     exa_catalysts = []
@@ -778,6 +1164,8 @@ def gather() -> dict:
     return {"quotes": quotes, "session": sess,
             "crypto": crypto,
             "ma_trends": ma_trends,
+            "fin_events": fin_events,
+            "custom_watchlist": custom_wl,
             "exa_catalysts": exa_catalysts,
             "news_lines": news_lines,
             "news_count": news_count, "entries": entries,
@@ -789,9 +1177,13 @@ def gather() -> dict:
 def build_context(data: dict) -> str:
     """拼出交给写稿模型的完整 context。"""
     q = data["quotes"]
+    c = data.get("crypto") or {}
+    cp = c.get("prices", {})
+    cg = c.get("global", {})
 
     idx = "\n".join(f"{name}: {fmt_quote(q.get(sym))}" for sym, name in INDICES)
     mac = " | ".join(f"{name} {fmt_quote(q.get(sym))}" for sym, name in MACRO)
+    core_cross = f"{mac} | 比特币 {cp.get('BTC', '未知')}"
 
     # 板块按涨跌幅排序，让写稿时一眼看出轮动方向
     sec_rows = []
@@ -852,13 +1244,21 @@ def build_context(data: dict) -> str:
 
     spx = q.get(".SPX", {})
     rsp = q.get("RSP", {})
+    spx_pct = _num(spx.get("change_pct"))
+    rsp_pct = _num(rsp.get("change_pct"))
+    spread_str = (
+        f" (RSP-SPX剪刀差 {rsp_pct - spx_pct:+.2f}%)"
+        if (spx_pct is not None and rsp_pct is not None) else ""
+    )
+    risk_str = " | ".join(f"{name}: {fmt_quote(q.get(sym))}" for sym, name in RISK_GAUGES)
+
     ma_trends = data.get("ma_trends") or {}
     ma_lines = "\n".join(
-        f"{name} 均线趋势: {ma_trends[sym]}"
+        f"{name} 技术与超买超卖: {ma_trends[sym]}"
         for sym, name in INDICES if ma_trends.get(sym)
-    ) or "均线数据暂缺"
+    ) or "均线与超买超卖数据暂缺"
 
-    # 市场宽度统计（11大板块涨跌比 + 28只核心权重股涨跌比 + 等权标普RSP对比）
+    # 市场宽度统计（11大板块涨跌比 + 28只核心权重股涨跌比 + 等权标普RSP及剪刀差 + SOX/HYG）
     sec_up = sum(1 for _, _, _, v in sec_rows if v is not None and v > 0)
     sec_down = sum(1 for _, _, _, v in sec_rows if v is not None and v < 0)
     stk_up = sum(1 for _, _, _, _, v in mv if v is not None and v > 0)
@@ -866,19 +1266,20 @@ def build_context(data: dict) -> str:
     breadth_block = (
         f"11大GICS板块：{sec_up} 涨 {sec_down} 跌 | "
         f"28只核心权重股：{stk_up} 涨 {stk_down} 跌 | "
-        f"等权标普(RSP)：{fmt_quote(rsp)}"
+        f"等权标普(RSP)：{fmt_quote(rsp)}{spread_str}\n"
+        f"行业与信用风向标：{risk_str}"
     )
 
-    c = data.get("crypto") or {}
-    cp = c.get("prices", {})
-    cg = c.get("global", {})
     crypto_block = (
-        f"BTC: {cp.get('BTC', '未知')} | ETH: {cp.get('ETH', '未知')} | SOL: {cp.get('SOL', '未知')}\n"
-        f"BNB: {cp.get('BNB', '未知')} | XRP: {cp.get('XRP', '未知')} | HYPE: {cp.get('HYPE', '未知')}\n"
+        f"恐惧贪婪指数: {c.get('fear_val', '未知')} ({c.get('fear_label', '未知')}) | "
         f"全球加密市值: {cg.get('total_market_cap_b', '未知')} ({cg.get('market_cap_change_24h', '未知')}) | "
-        f"BTC 市占率: {cg.get('btc_dominance', '未知')}（{cg.get('bull_bear_label', '未知')}） | "
-        f"恐惧贪婪指数: {c.get('fear_val', '未知')} ({c.get('fear_label', '未知')})"
+        f"BTC 市占率: {cg.get('btc_dominance', '未知')}（{cg.get('bull_bear_label', '未知')}）\n"
+        f"BTC: {cp.get('BTC', '未知')} | ETH: {cp.get('ETH', '未知')} | BNB: {cp.get('BNB', '未知')}\n"
+        f"SOL: {cp.get('SOL', '未知')} | XRP: {cp.get('XRP', '未知')} | HYPE: {cp.get('HYPE', '未知')}"
     )
+    events_block = _format_financial_events_block(data.get("fin_events"))
+    custom_wl_block = _format_custom_watchlist_block(data.get("custom_watchlist"), q)
+    custom_wl_section = f"{custom_wl_block}\n----------------\n" if custom_wl_block else ""
     exa_block = format_exa_catalyst_block(data.get("exa_catalysts") or [])
     exa_section = f"{exa_block}\n----------------\n" if exa_block else ""
     return (
@@ -886,17 +1287,18 @@ def build_context(data: dict) -> str:
         f"----------------\n"
         f"【🧠 跨日盘面状态记忆（最近 5 个交易日板块轮动、信号灯与关注方向追踪）】\n{_format_us_memory_block()}\n"
         f"----------------\n"
-        f"【指数收盘】\n{idx}\n"
+        f"【核心跨资产指数（股市 + 利率/波动率/美元/黄金/布伦特原油/比特币）】\n{idx}\n{core_cross}\n"
         f"标普 开{spx.get('open','?')} 高{spx.get('high','?')} 低{spx.get('low','?')} "
         f"52周高{spx.get('yrhiprice','?')} 52周低{spx.get('yrloprice','?')}\n"
         f"----------------\n"
-        f"【市场宽度与均线乖离率】\n{breadth_block}\n{ma_lines}\n"
+        f"【市场宽度与均线/超买超卖指标】\n{breadth_block}\n{ma_lines}\n"
         f"----------------\n"
-        f"【宏观指标】\n{mac}\n"
+        f"【加密货币（24h）】\n{crypto_block}\n"
         f"----------------\n"
-        f"【加密核心行情（24h）】\n{crypto_block}\n"
+        f"【Financial Events（未来 5 个交易日重大财报 & 核心宏观日程）】\n{events_block}\n"
         f"----------------\n"
-        f"【11大板块表现（按涨跌幅排序）】\n{sec}\n"
+        + custom_wl_section
+        + f"【11大板块表现（按涨跌幅排序）】\n{sec}\n"
         f"----------------\n"
         f"【领涨 Top 3 板块 & 领跌 Top 3 板块（含各板块内 Top 3 个股）】\n{sec_detail_block}\n"
         f"----------------\n"

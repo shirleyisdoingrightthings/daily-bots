@@ -78,6 +78,30 @@ INLINE_RE = re.compile(
 _RESIDUAL_TAG_RE = re.compile(r"</?(?:b|strong|i|em|code|a)(?:\s+[^<>]*)?>", re.I)
 
 
+def add_cjk_spacing(text: str) -> str:
+    """在中文汉字与数字/英文字母/Ticker/半角括号之间自动补齐 1 个半角空格（不破坏 URL、HTML 标签与 #标签）。"""
+    if not text:
+        return text
+    parts = re.split(r"(<[^>]+>|https?://[^\s<>\"'）)]+|#[A-Za-z0-9\u4e00-\u9fff_-]+)", text)
+    out = []
+    for idx, seg in enumerate(parts):
+        if idx % 2 == 1 or not seg:
+            out.append(seg)
+            continue
+        # 1. 中文 ↔ 英文 / 数字 / $ / % / ★ / 带正负号数字
+        seg = re.sub(r"([\u4e00-\u9fff])([A-Za-z0-9$%★]|(?<![A-Za-z0-9])[+-]\d)", r"\1 \2", seg)
+        seg = re.sub(r"([A-Za-z0-9%])([\u4e00-\u9fff])", r"\1 \2", seg)
+        # 2. 中文 ↔ 半角括号内的英文/数字/涨跌幅（如 宣伟(SHW) -> 宣伟 (SHW)，道指(+0.33%) -> 道指 (+0.33%)）
+        seg = re.sub(r"([\u4e00-\u9fff])\(([A-Za-z0-9+\-$%])", r"\1 (\2", seg)
+        seg = re.sub(r"([A-Za-z0-9%])\)([\u4e00-\u9fff])", r"\1) \2", seg)
+        # 3. Ticker / 价格 紧贴涨跌幅括号（如 META(+3.40%) -> META (+3.40%)，235.28(-3.90%) -> 235.28 (-3.90%)）
+        seg = re.sub(r"([A-Za-z0-9])\(([+-]\d)", r"\1 (\2", seg)
+        # 4. 合并行内多余连续空格，保留换行与行首缩进
+        seg = re.sub(r"(?<=[^\s]) {2,}", " ", seg)
+        out.append(seg)
+    return "".join(out)
+
+
 def _clean_text(s: str) -> str:
     s = re.sub(r"&amp;(?:amp;)+", "&amp;", s or "")
     s = re.sub(r"(\d+)\\\.", r"\1.", s)
@@ -95,6 +119,8 @@ def _text_items(
 ) -> list:
     if not content:
         return []
+    if not code:
+        content = add_cjk_spacing(content)
     items = []
     chunks = [content[i : i + TEXT_LIMIT] for i in range(0, len(content), TEXT_LIMIT)]
     for chunk in chunks:
@@ -334,7 +360,7 @@ def _extract_cn_hk_market_brief(
 
 
 def _extract_us_market_brief(market_text: str) -> str:
-    """从美股收盘消息①提取前置信号灯、核心指数与 BTC/恐贪情绪摘要"""
+    """从美股收盘消息①提取前置信号灯、核心跨资产指数、BTC/恐贪情绪、AI 五层强弱与近期事件摘要"""
     plain_lines = [
         re.sub(r"^#{1,3}\s*", "", _strip_tags_plain(l)).strip()
         for l in market_text.splitlines()
@@ -343,19 +369,27 @@ def _extract_us_market_brief(market_text: str) -> str:
     std_sig = extract_market_signal(market_text, source="美股与加密")
     signal_str = ""
     indices_str = ""
+    crypto_line = ""
     crypto_str = ""
     fear_str = ""
+    ai_wl_line = ""
+    events_line = ""
     for line in plain_lines:
         clean = re.sub(r"^(?:[\U0001F1E6-\U0001F1FF]{2}|[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\s])+", "", line).strip()
         if not indices_str and re.match(r"^核心指数[:：\s]", clean):
             indices_str = clean
-        if not crypto_str and line.startswith("🪙"):
+        if not crypto_line and line.startswith("🪙"):
+            crypto_line = clean
             m_btc = re.search(r"(BTC\s+[^|｜\n]+)", clean)
             crypto_str = m_btc.group(1).strip() if m_btc else clean
         if not fear_str and "恐贪指数" in clean:
             m_fg = re.search(r"(恐贪指数\s*[^|｜\n]+)", clean)
             if m_fg:
                 fear_str = m_fg.group(1).strip()
+        if not ai_wl_line and line.startswith("🍰") and ("：" in clean or ":" in clean):
+            ai_wl_line = re.sub(r"^[^：:]+[：:]\s*", "", clean).strip()
+        if not events_line and line.startswith("📅") and ("：" in clean or ":" in clean):
+            events_line = re.sub(r"^[^：:]+[：:]\s*", "", clean).strip()
         if not signal_str and not line.lstrip("·•-* ").strip().startswith(("💡", "👀", "🚨")):
             cand = line.lstrip("·•-* ").strip()
             if re.match(r"^(?:(?:🟢|🟡|🔴|🚦)\s*)?信号灯", cand):
@@ -364,6 +398,107 @@ def _extract_us_market_brief(market_text: str) -> str:
                 signal_str = re.sub(r"^([🟢🟡🔴])(\S)", r"\1 \2", sig)
 
     sig_final = std_sig or signal_str
+    is_upgraded = any(
+        k in market_text
+        for k in ("黄金", "布伦特原油", "Financial Events", "AI 自选股", "AI 五层自选股", "加密货币")
+    )
+
+    if is_upgraded:
+        core_items: list[str] = []
+        idx_body = re.sub(r"^核心指数[:：\s]*", "", indices_str)
+
+        def _pick_pct(label_re: str, alias: str) -> str:
+            m = re.search(rf"{label_re}\s+[\d,.$%]+\s*\(([^)]+)\)", idx_body)
+            return f"{alias} {m.group(1)}" if m else ""
+
+        def _pick_val(label_re: str, alias: str) -> str:
+            m = re.search(rf"{label_re}\s+([\d,.]+%?)", idx_body)
+            return f"{alias} {m.group(1)}" if m else ""
+
+        for item in (
+            _pick_pct(r"标普\s*500", "标普"),
+            _pick_pct(r"纳斯达克", "纳指"),
+            _pick_val(r"10\s*年期美债", "10Y 美债"),
+            _pick_val(r"VIX", "VIX"),
+            _pick_pct(r"黄金", "黄金"),
+            _pick_pct(r"布伦特原油", "布油"),
+        ):
+            if item:
+                core_items.append(item)
+
+        btc_short = ""
+        m_btc = re.search(r"BTC\s+(\$?[\d,]+(?:\.\d+)?)\s*\(([^)]+)\)", crypto_line or idx_body)
+        if m_btc:
+            price_num = m_btc.group(1).split(".")[0]
+            btc_short = f"BTC {price_num} ({m_btc.group(2)})"
+        elif crypto_str:
+            btc_short = crypto_str
+        m_fg_num = re.search(r"恐贪指数\s*(\d+)", fear_str)
+        if btc_short and m_fg_num:
+            core_items.append(f"{btc_short} 恐贪 {m_fg_num.group(1)}")
+        elif btc_short:
+            core_items.append(btc_short)
+
+        ai_short = ""
+        if ai_wl_line:
+            layer_hits = re.findall(r"[⚡🔌🏗️🧠🚀\uFE0F]+\s*([^\s·|：:]+)\s*([+-]?\d+(?:\.\d+)?%)", ai_wl_line)
+            parsed_layers = []
+            for lname, lpct in layer_hits:
+                try:
+                    parsed_layers.append((lname, lpct, float(lpct.rstrip("%"))))
+                except ValueError:
+                    pass
+            if len(parsed_layers) >= 2:
+                parsed_layers.sort(key=lambda x: x[2], reverse=True)
+                top_l, bot_l = parsed_layers[0], parsed_layers[-1]
+                top_verb = "领涨" if top_l[2] > 0 else "抗跌"
+                ai_short = f"{top_l[0]}{top_verb} ({top_l[1]})、{bot_l[0]}承压 ({bot_l[1]})"
+            else:
+                ai_short = ai_wl_line[:80]
+
+        ev_short = ""
+        if events_line:
+            earn_m = re.search(r"财报预告[:：]\s*(.+?)(?=\s*\|\s*宏观日程[:：]|$)", events_line)
+            macro_m = re.search(r"宏观日程[:：]\s*(.+)$", events_line)
+            ev_clean = []
+            if earn_m:
+                e_raw = earn_m.group(1).strip()
+                if e_raw and "暂无" not in e_raw:
+                    e_items = [
+                        re.sub(r"\s*[\(（]\$[\d.,]+[BMT][\)）]", "", x).strip()
+                        for x in re.split(r"\s*[|、]\s*", e_raw) if x.strip()
+                    ]
+                    if e_items:
+                        ev_clean.append("、".join(e_items[:2]))
+            if macro_m:
+                m_raw = macro_m.group(1).strip()
+                if m_raw and "暂无" not in m_raw and "无重磅" not in m_raw:
+                    m_items = [
+                        re.sub(r"\s*[\(（][^()（）]{1,28}[\)）]", "", x).strip()
+                        for x in re.split(r"\s*[|、]\s*", m_raw) if x.strip()
+                    ]
+                    if m_items:
+                        ev_clean.append("、".join(m_items[:2]))
+            if not ev_clean and "暂无" not in events_line and "无重磅" not in events_line:
+                ev_clean.append(events_line[:60])
+            if ev_clean:
+                ev_short = " / ".join(ev_clean)
+                if len(ev_short) > 105:
+                    ev_short = ev_short[:103].rstrip("、，,;；/ ") + "…"
+
+        segs: list[str] = []
+        if sig_final:
+            segs.append(f"• 信号灯：{sig_final}")
+        if core_items:
+            segs.append("• 核心资产：" + " / ".join(core_items))
+        if ai_short:
+            segs.append(f"• AI 自选股：{ai_short}")
+        if ev_short:
+            segs.append(f"• 近期预告：{ev_short}")
+        if segs:
+            return "\n".join(segs)
+
+    # 兼容历史旧版美股日报格式
     parts = [p for p in (indices_str,) if p]
     if crypto_str and fear_str and "恐贪" not in crypto_str:
         parts.append(f"{crypto_str} ({fear_str})")
@@ -439,20 +574,48 @@ def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
             market_brief = _extract_us_market_brief(secs[0]) if ("美股收盘" in secs[0] or len(secs) > 1) else ""
             news_sec = secs[1] if len(secs) > 1 else text
         content_lines = _extract_summary_bullets(news_sec)
+        if market_brief and market_brief.startswith("• ") and content_lines:
+            news_lines = []
+            budget = max(400, 1750 - len(market_brief))
+            used = 0
+            for item in content_lines:
+                c = item.strip().rstrip("。；;")
+                if not c:
+                    continue
+                line_s = f"  - {c}"
+                if news_lines and used + len(line_s) + 1 > budget:
+                    break
+                news_lines.append(line_s)
+                used += len(line_s) + 1
+            if news_lines:
+                return add_cjk_spacing(f"{market_brief}\n• 核心要闻：\n" + "\n".join(news_lines))
+            return add_cjk_spacing(market_brief)
+        if market_brief and market_brief.startswith("• "):
+            return add_cjk_spacing(market_brief)
         clauses = ([market_brief] if market_brief else []) + content_lines
         if clauses:
             joined = _join_clauses(clauses, max_chars=1600)
             if joined:
-                return joined
+                return add_cjk_spacing(joined)
 
-    # 2. 匹配 30秒速览 区块（兼容带 <b> 包裹的章节标题，遇到 ⭐ 条目 / 标题链接 / 大板块即止）
+    # 2. 匹配 30秒速览 区块（兼容带 <b> 包裹的章节标题，采用多行 bullet points 增强可读性）
     content_lines = _extract_summary_bullets(text)
     if content_lines:
-        joined = _join_clauses(content_lines, max_chars=1400)
-        if joined:
-            return joined
+        bullet_lines = []
+        used = 0
+        for item in content_lines:
+            c = item.strip().rstrip("；;")
+            if not c:
+                continue
+            b_line = f"• {c}"
+            if bullet_lines and used + len(b_line) + 1 > 1500:
+                break
+            bullet_lines.append(b_line)
+            used += len(b_line) + 1
+        if bullet_lines:
+            return add_cjk_spacing("\n".join(bullet_lines))
 
-    # 3. X 热点播报 & AI Builder：首段导语 + 全部编号主题标题（含 Reddit 实测子话题）
+    # 3. X 热点播报 & AI Builder：首段导语 + 编号主题列表（多行 bullet points 格式）
     if "X 热点" in source or "AI Builder" in source or re.search(r"^(?:#+\s*)?(?:<b>)?(?:🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠\uFE0F?\s*AI\s*Builder)", text.strip()):
         plain_lines = [re.sub(r"^#{1,3}\s*", "", _strip_tags_plain(l)).strip() for l in text.splitlines()]
         plain_lines = [l for l in plain_lines if l]
@@ -473,14 +636,16 @@ def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
                 "",
                 overview,
             ).strip()
-        clauses = []
+        out_lines = []
         if overview:
-            clauses.append(overview)
+            out_lines.append(f"• {overview}")
         if topics:
-            clauses.append("本期焦点：" + " / ".join(topics))
-        joined = _join_clauses(clauses, max_chars=1400)
-        if joined:
-            return joined
+            out_lines.append("• 本期焦点：")
+            for tp in topics:
+                out_lines.append(f"  - {tp}")
+        if out_lines:
+            res = "\n".join(out_lines)
+            return add_cjk_spacing(res[:1500])
 
     # 4. 兜底：取完整句子，不超过 600 字符，严禁半句截断
     clean = _strip_tags_plain(text).replace("\n", " ")
@@ -730,8 +895,124 @@ def _chunk_blocks_by_count(blocks: list[dict], max_blocks: int = 80) -> list[lis
     return chunks
 
 
-_METRIC_PREFIXES = ("📈", "📊", "🧭", "📐", "💰", "💸", "🌍", "🌡", "🪙", "🇺🇸", "📅")
+_METRIC_PREFIXES = ("📈", "📊", "🧭", "📐", "💰", "💸", "🌍", "🌡", "🪙", "🇺🇸", "📅", "🍰")
+_WATCHLIST_LAYER_PREFIXES = ("⚡", "🔌", "🏗", "🧠", "🚀")
 _META_PREFIXES = ("Original:", "Original：", "🏷️", "🛠️", "原帖：", "原帖:", "原推：", "原推:", "素材：")
+
+
+def _format_us_metric_cell(label: str, val: str) -> str:
+    """将美股核心指标表右侧单元格按语义拆分为多行 bullet points，增强 Notion 表格阅读呼吸感。"""
+    if not val or "\n" in val:
+        return val
+    # 1. 核心指数：股指 / 利率与波动 / 大宗与加密
+    if "核心指数" in label:
+        parts = [p.strip() for p in val.split("|") if p.strip()]
+        if len(parts) >= 5:
+            eq, rates, comm, other = [], [], [], []
+            for p in parts:
+                if any(k in p for k in ("标普", "纳斯达克", "纳指", "道琼斯", "道指", "罗素")):
+                    eq.append(p)
+                elif any(k in p for k in ("美债", "VIX", "美元")):
+                    rates.append(p)
+                elif any(k in p for k in ("黄金", "原油", "布油", "比特币", "BTC")):
+                    comm.append(p)
+                else:
+                    other.append(p)
+            lines = []
+            if eq:
+                lines.append("• 股指：" + " | ".join(eq))
+            if rates:
+                lines.append("• 利率与波动：" + " | ".join(rates))
+            if comm:
+                lines.append("• 大宗与加密：" + " | ".join(comm))
+            if other:
+                lines.append("• 其他：" + " | ".join(other))
+            if len(lines) >= 2:
+                return "\n".join(lines)
+
+    # 2. 市场宽度：广度 / 风向标 / 诊断
+    if "市场宽度" in label:
+        head, diag = (val.split("—", 1)[0].strip(), val.split("—", 1)[1].strip()) if "—" in val else (val, "")
+        parts = [p.strip() for p in head.split("|") if p.strip()]
+        breadth, gauges = [], []
+        for p in parts:
+            if any(k in p for k in ("半导体", "SOX", "高收益债", "HYG")):
+                gauges.append(p)
+            else:
+                breadth.append(p)
+        lines = []
+        if breadth:
+            lines.append("• 广度：" + " | ".join(breadth))
+        if gauges:
+            lines.append("• 风向标：" + " | ".join(gauges))
+        if diag:
+            lines.append("• 诊断：" + diag)
+        if len(lines) >= 2:
+            return "\n".join(lines)
+
+    # 3. 趋势与乖离率：逐指数分行 + 短线判定
+    if "趋势" in label or "乖离率" in label:
+        head, judge = (val.split("—", 1)[0].strip(), val.split("—", 1)[1].strip()) if "—" in val else (val, "")
+        parts = [p.strip() for p in head.split("|") if p.strip()]
+        lines = []
+        for p in parts:
+            m_idx = re.match(r"^(标普\s*500|纳斯达克|纳指|道琼斯|道指)\s+(.+)$", p)
+            if m_idx:
+                lines.append(f"• {m_idx.group(1)}：{m_idx.group(2)}")
+            else:
+                lines.append(f"• {p}")
+        if judge:
+            lines.append(f"• 短线判定：{judge}")
+        if len(lines) >= 2:
+            return "\n".join(lines)
+
+    # 4. 加密货币：情绪与结构 / 主流币 / 活跃币
+    if "加密货币" in label:
+        parts = [p.strip() for p in val.split("|") if p.strip()]
+        mood, major, alt = [], [], []
+        for p in parts:
+            if any(k in p for k in ("恐贪", "总市值", "市占率")):
+                mood.append(p)
+            elif re.match(r"^(?:BTC|ETH|BNB)\b", p):
+                major.append(p)
+            else:
+                alt.append(p)
+        lines = []
+        if mood:
+            lines.append("• 情绪与结构：" + " | ".join(mood))
+        if major:
+            lines.append("• 主流币 (24h)：" + " | ".join(major))
+        if alt:
+            lines.append("• 活跃币 (24h)：" + " | ".join(alt))
+        if len(lines) >= 2:
+            return "\n".join(lines)
+
+    # 5. Financial Events：财报预告 / 宏观日程
+    if "Financial Events" in label or "事件" in label:
+        m_ev = re.match(r"^(财报预告[:：].+?)\s*\|\s*(宏观日程[:：].+)$", val)
+        if m_ev:
+            return f"• {m_ev.group(1).strip()}\n• {m_ev.group(2).strip()}"
+
+    # 6. AI 自选股：整体表现 / 分层均幅
+    if "自选股" in label:
+        parts = [p.strip() for p in val.split("|") if p.strip()]
+        if len(parts) >= 3:
+            return f"• 整体表现：{parts[0]} | {parts[2]}\n• 分层均幅：{parts[1]}"
+        if len(parts) == 2:
+            return f"• {parts[0]}\n• {parts[1]}"
+
+    return val
+
+
+def _split_watchlist_row(raw_line: str) -> tuple[str, str] | None:
+    """将美股独立自选股区块中的单层行（⚡/🔌/🏗️/🧠/🚀）拆分为 2 列 (层级, 成分股收盘表现)"""
+    plain = _strip_tags_plain(raw_line).lstrip("·•-* ").strip()
+    if not plain or len(plain) < 6 or not plain.startswith(_WATCHLIST_LAYER_PREFIXES):
+        return None
+    m_plain = re.match(r"^(.{2,32}?)\s*(?:：|(?<!\d):(?!\d))\s*(.+)$", plain)
+    if not m_plain:
+        return None
+    return m_plain.group(1).strip(), m_plain.group(2).strip()
 
 
 def _is_metadata_line(plain_clean: str) -> bool:
@@ -918,9 +1199,39 @@ def convert_to_blocks(content: str, source: str = "", *, summary_override: str |
                     metric_rows.append(nxt_row)
                     j += 1
                 if len(metric_rows) >= 2:
+                    if is_us and not in_us_news:
+                        metric_rows = [(k, _format_us_metric_cell(k, v)) for k, v in metric_rows]
                     blocks.append(_table_block(metric_rows))
                     i = j
                     continue
+
+        # 美股独立自选股追踪区块：标题 + 紧跟的五层行自动合并为独立 2 列 Notion Table
+        if is_us and not in_us_news and plain_clean.startswith("🍰") and ("自选股明细" in plain_clean or "自选股追踪" in plain_clean) and not _split_metric_row(line):
+            h2_txt = plain_no_b if (line.startswith("<b>") and line.endswith("</b>") and line.count("<b>") == 1) else re.sub(r"^#{1,3}\s*", "", line).strip()
+            blocks.append(_h_block(2, h2_txt))
+            wl_rows: list[tuple[str, str]] = []
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j].strip()
+                if not nxt:
+                    k = j + 1
+                    while k < len(lines) and not lines[k].strip():
+                        k += 1
+                    if k < len(lines) and _split_watchlist_row(lines[k].strip()):
+                        j = k
+                        continue
+                    break
+                w_row = _split_watchlist_row(nxt)
+                if not w_row:
+                    break
+                wl_rows.append(w_row)
+                j += 1
+            if len(wl_rows) >= 2:
+                blocks.append(_table_block(wl_rows, headers=("AI 自选股层级", "成分股收盘表现")))
+                i = j
+                continue
+            i += 1
+            continue
 
         # 金融市场 `🎯 决策仪表盘` / `🎯 早盘决策仪表盘` / `🎯 投资启示`：直接作为标准 heading_2 展示，不嵌套 Callout
         if (is_cn_hk or (is_us and not in_us_news)) and plain_clean.startswith("🎯") and not re.match(r"^(?:-\s+|[·•●▪]\s*)", line):

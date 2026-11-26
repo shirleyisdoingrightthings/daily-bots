@@ -271,7 +271,7 @@ Original: Some title
         self.assertEqual(
             [(b["type"], _block_plain(b)) for b in empty_blocks],
             [
-                ("heading_1", "🇨🇳 A股收盘复盘 · 2026-11-13"),
+                ("heading_1", "🇨🇳 A 股收盘复盘 · 2026-11-13"),
                 ("heading_1", "🇭🇰 港股收盘复盘 · 2026-11-13"),
             ],
         )
@@ -291,7 +291,7 @@ Original: Some title
         blocks = na.convert_to_blocks(draft, source="📈 A股与港股")
         types_texts = [(b["type"], _block_plain(b)) for b in blocks]
         self.assertNotIn(("heading_2", "📈 A股市场（2026年11月13日 收盘复盘）"), types_texts)
-        self.assertEqual(types_texts[0], ("heading_1", "🇨🇳 A股收盘复盘 · 2026-11-13"))
+        self.assertEqual(types_texts[0], ("heading_1", "🇨🇳 A 股收盘复盘 · 2026-11-13"))
         self.assertEqual(types_texts[2], ("divider", "---"))
         self.assertEqual(types_texts[3], ("heading_1", "🇭🇰 港股收盘复盘 · 2026-11-13"))
 
@@ -450,7 +450,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
 """
         self.assertEqual(
             na.extract_summary(ai_doc, source="🤖 AI 产业日报"),
-            "事实一：指标提升 20%；事实二：成本下降 50%。",
+            "• 事实一：指标提升 20%\n• 事实二：成本下降 50%",
         )
 
         gh_doc = """<b>🐙 GitHub Trending</b>
@@ -461,7 +461,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
 """
         self.assertEqual(
             na.extract_summary(gh_doc, source="🐙 GitHub & HN"),
-            "🛠️ 今日立即可用轮子：foo/bar 好用。",
+            "• 🛠️ 今日立即可用轮子：foo/bar 好用",
         )
 
         builder_doc = """<b>🛠 AI Builder 日报 · 2026-11-14</b>
@@ -473,7 +473,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
 正文。
 """
         b_sum = na.extract_summary(builder_doc, source="🛠️ AI Builder")
-        self.assertIn("本期焦点：1. 硅谷 CEO 联署", b_sum)
+        self.assertIn("• 本期焦点：\n  - 1. 硅谷 CEO 联署", b_sum)
         self.assertIn("今天主要讨论 Agent 基建", b_sum)
         self.assertNotIn("这批推文来自", b_sum)
 
@@ -484,7 +484,7 @@ class TestExtractSummaryBySource(unittest.TestCase):
 <b>1. Vercel 探讨 UI 抽象</b>
 """
         b_fw = na.extract_summary(builder_fullwidth_utc, source="🛠️ AI Builder")
-        self.assertTrue(b_fw.startswith("今天多位一线 Builder 集中探讨了 UI 重构"))
+        self.assertTrue(b_fw.startswith("• 今天多位一线 Builder 集中探讨了 UI 重构"))
         self.assertNotIn("（UTC）", b_fw)
 
     def test_us_stock_combined_market_and_news_summary(self):
@@ -510,6 +510,67 @@ class TestExtractSummaryBySource(unittest.TestCase):
         self.assertIn("BTC $91,200 (+2.1%) (恐贪指数 72 (贪婪))", us_sum)
         self.assertIn("要闻一：美联储会议纪要偏鸽", us_sum)
         self.assertIn("要闻二：科技巨头资本开支维持高位", us_sum)
+
+    def test_us_stock_upgraded_dashboard_tables_and_30s_summary(self):
+        us_doc = """<b>📊 美股收盘 & 加密行情 · 2026-11-25</b>
+
+📈 <b>核心指数</b>：标普 500 7,182.78 (-0.25%) | 纳斯达克 23,585.80 (-0.62%) | 道琼斯 50,182.95 (+0.33%) | 罗素 2000 2,704.06 (+0.71%) | 10 年期美债 4.864% (-3.8bp) | VIX 28.29 (+7.32%) | 美元指数 103.75 (+0.08%) | 黄金 3,597.70 (+1.75%) | 布伦特原油 95.34 (+0.77%) | 比特币 $60,795.00 (+3.09%)
+🧭 <b>市场宽度</b>：11 大板块 8 涨 3 跌 | 28 只核心权重 12 涨 16 跌 | 等权标普 (RSP) +0.83% (RSP-SPX 剪刀差 +1.08%) | 费城半导体 (SOX) -0.65% | 高收益债 (HYG) +0.12% — 广度明显修复
+📐 <b>趋势与乖离率</b>：标普 500 🔴 空头排列 · MA5 乖离率 +0.58% · RSI(14)=38.2 (偏弱) · 布林 %B=0.18 (近下轨) | 纳斯达克 🔴 空头排列 · RSI(14)=35.6 — 短线近支撑区
+🪙 <b>加密货币</b>：恐贪指数 11 (Extreme Fear) | 总市值 $2,111B (-0.33%) | BTC 市占率 57.9% | BTC $60,795.00 (+3.09%) | ETH $1,700.15 (+2.87%) | BNB $557.38 (+3.19%) | SOL $71.12 (+3.52%) | XRP $0.95 (+4.51%) | HYPE $61.71 (+5.15%)
+📅 <b>Financial Events</b>：财报预告：12-01 盘后 ★MRVL | 12-02 盘后 ★CRM | 宏观日程：12-01 ISM 制造业 PMI
+🍰 <b>AI 自选股</b>：29 只 10 涨 19 跌 | ⚡ 能源 -1.39% · 🔌 芯片 -2.10% · 🏗️ 基建 -1.45% · 🧠 模型 +0.32% · 🚀 应用 +0.85% | 最强 META (+3.40%) · 最弱 ORCL (-5.13%)
+
+<b>🍰 AI 自选股明细</b>
+⚡ <b>能源层（均值 -1.39%）</b>：CEG 235.28 (-3.90%) | VST 121.32 (+0.50%) | GEV 715.00 (-0.78%)
+🔌 <b>芯片层（均值 -2.10%）</b>：NVDA 149.30 (-3.91%) | TSM 210.10 (-1.20%)
+🏗️ <b>基础设施层（均值 -1.45%）</b>：VRT 173.37 (-0.26%) | ORCL 103.88 (-5.13%)
+🧠 <b>模型层（均值 +0.32%）</b>：ANT 82.79 (+1.08%) | META 609.89 (+3.40%)
+🚀 <b>应用层（均值 +0.85%）</b>：CRM 197.21 (+2.04%) | AAPL 355.58 (+0.43%)
+
+<b>🎯 决策仪表盘 & 💡 分析师观点</b>
+· <b>信号灯状态</b>：🟡 震荡分化 — 广度修复但三大指数空头排列
+
+---
+
+<b>📋 美股要闻 · 2026-11-25</b>
+
+<b>⚡ 30秒速览</b>
+
+- 美国拟对14个经济体加征新关税
+- 纳指深V反弹收跌0.62%
+"""
+        blocks = na.convert_to_blocks(us_doc, source="🗽 美股与加密")
+        tables = [b for b in blocks if b.get("type") == "table"]
+        self.assertEqual(len(tables), 2)
+        # 表1：主指标表（表头 + 6行指标，右侧单元格按 bullet 分区）
+        t1_rows = tables[0]["table"]["children"]
+        self.assertEqual(len(t1_rows), 7)
+        t1_keys = ["".join(rt["text"]["content"] for rt in r["table_row"]["cells"][0]) for r in t1_rows[1:]]
+        self.assertEqual(
+            t1_keys,
+            ["📈 核心指数", "🧭 市场宽度", "📐 趋势与乖离率", "🪙 加密货币", "📅 Financial Events", "🍰 AI 自选股"],
+        )
+        t1_c0_val = "".join(rt["text"]["content"] for rt in t1_rows[1]["table_row"]["cells"][1])
+        self.assertIn("• 股指：", t1_c0_val)
+        self.assertIn("\n• 利率与波动：", t1_c0_val)
+        self.assertIn("\n• 大宗与加密：", t1_c0_val)
+        # 表2：独立 AI 自选股明细表（表头 + 5层）
+        t2_rows = tables[1]["table"]["children"]
+        self.assertEqual(len(t2_rows), 6)
+        t2_hdr = ["".join(rt["text"]["content"] for rt in c) for c in t2_rows[0]["table_row"]["cells"]]
+        self.assertEqual(t2_hdr, ["AI 自选股层级", "成分股收盘表现"])
+
+        us_sum = na.extract_summary(us_doc, source="🗽 美股与加密")
+        self.assertTrue(us_sum.startswith("• 信号灯：🟡 震荡分化\n• 核心资产："))
+        self.assertIn("标普 -0.25%", us_sum)
+        self.assertIn("10Y 美债 4.864%", us_sum)
+        self.assertIn("黄金 +1.75%", us_sum)
+        self.assertIn("布油 +0.77%", us_sum)
+        self.assertIn("BTC $60,795 (+3.09%) 恐贪 11", us_sum)
+        self.assertIn("\n• AI 自选股：应用领涨 (+0.85%)、芯片承压 (-2.10%)", us_sum)
+        self.assertIn("\n• 近期预告：12-01 盘后 ★MRVL、12-02 盘后 ★CRM / 12-01 ISM 制造业 PMI", us_sum)
+        self.assertIn("\n• 核心要闻：\n  - 美国拟对 14 个经济体加征新关税", us_sum)
 
 
 class TestArchiveToNotionHttp(unittest.TestCase):

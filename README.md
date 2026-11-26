@@ -6,7 +6,7 @@
 
 🌐 **English** | [简体中文](./README.zh-CN.md)
 
-A production-tested monorepo of **6 modular automated intelligence bots** + a **shared runtime & ops layer** that collect, deduplicate, verify, and publish daily briefings across **AI Industry News, X & Reddit Debates, AI Builders, GitHub & Hacker News, US Equities & Crypto, and China A-Share & Hong Kong Markets** to **Feishu (Lark) Card 2.0** and **Notion**.
+A production-tested monorepo of **5 modular automated intelligence bots** (organized into **3 scheduled pipelines**: Morning AI Daily 3-in-1, GitHub & Hacker News, and US Stock & Crypto) + a **shared runtime & ops layer** that collect, deduplicate, verify, and publish daily briefings across **AI Industry News, X & Reddit Debates, AI Builders, GitHub & Hacker News, and US Equities & Crypto** to **Feishu (Lark) Card 2.0** and **Notion**.
 
 > **Zero LLM Vendor Lock-In**: Every Python script (`*_report.py`) performs deterministic `fetch`, deduplication, sanitization, Feishu delivery, and Notion archiving with zero hardcoded LLM SDK calls. AI editorial drafting is cleanly decoupled into Markdown prompts (`prompt*.md`) and agent workflow specs (`shared/scheduled-tasks/*/SKILL.md`), so you can run it with any coding/automation agent or LLM of your choice.
 
@@ -20,15 +20,13 @@ flowchart LR
         S1["09:00 Daily<br/>AI 3-in-1 Sequential Pipeline"]
         S2["09:30 Daily<br/>GitHub &amp; Hacker News"]
         S3["10:00 Tue-Sat<br/>US Stock &amp; Crypto"]
-        S4["09:00 / 12:05 / 16:15 Mon-Fri<br/>CN &amp; HK Stock"]
     end
 
-    subgraph Bots["6 Modular Bots (fetch -&gt; Agent Draft -&gt; send)"]
+    subgraph Bots["5 Modular Bots (fetch -&gt; Agent Draft -&gt; send)"]
         direction TB
         B1["1. AI Daily News"] --> B2["2. X Hotspot"] --> B3["3. AI Builder"]
         B4["4. GitHub &amp; HN"]
         B5["5. US Stock &amp; Crypto"]
-        B6["6. CN &amp; HK Stock"]
     end
 
     subgraph Shared["shared/ Runtime &amp; Ops Layer"]
@@ -46,9 +44,8 @@ flowchart LR
     S1 --> B1
     S2 --> B4
     S3 --> B5
-    S4 --> B6
     B1 & B2 & B3 & B4 <--> L
-    B1 & B2 & B3 & B4 & B5 & B6 --> U
+    B1 & B2 & B3 & B4 & B5 --> U
     U --> F
     U --> N --> ND
     H -.-> Bots
@@ -66,8 +63,7 @@ Click any module below to inspect its dedicated **workflow diagram, data sources
 | 🐦 **X Hotspot Bot** | Daily `09:00` (Stage 2/3) | 48h Latent Space `[AINews]` full Twitter Recap + Reddit Recap (12 AI subreddits) + Techmeme cross-check; extracts top X debates & hands-on Reddit feedback with primary links. | [Folder](./x-hotspot-bot/) · [Workflow README](./x-hotspot-bot/README.md) |
 | 🛠️ **AI Builder Bot** | Daily `09:00` (Stage 3/3) | Public X List direct fetch via `twitterapi.io` (zero browser/cookie risk) + full X Article & external blog extraction; filters prior stages' posts. | [Folder](./ai-builder-bot/) · [Workflow README](./ai-builder-bot/README.md) |
 | 🐙 **GitHub & HN Bot** | Daily `09:30` | GitHub Trending (Mon–Sat Daily / Sun Weekly) with README extraction + Hacker News Top 8 (Firebase + Algolia) + top comments & 30-day memory. | [Folder](./github-hn-bot/) · [Workflow README](./github-hn-bot/README.md) |
-| 🗽 **US Stock & Crypto Bot** | Tue–Sat `10:00` | US close (CNBC 11 GICS sectors + 28 watchlist + MA5/MA20 bias) + 24h Crypto (CoinGecko + Fear & Greed) + 5 RSS feeds + optional Exa catalyst verification. | [Folder](./us%20stock%20bot/) · [Workflow README](./us%20stock%20bot/README.md) |
-| 📈 **CN & HK Stock Bot** | Mon–Fri `09:00` / `12:05` / `16:15` | A-Share & HK Premarket / Midday fallback / Close dual-channel reports (Tencent Quotes, Sina sectors & 7x24 telegraph, MA bias, Exa enrichment). | [Folder](./cn-hk-stock-bot/) · [Workflow README](./cn-hk-stock-bot/README.md) |
+| 🗽 **US Stock & Crypto Bot** | Tue–Sat `10:00` | Cross-asset US close (4 indices, US10Y, VIX, DXY, Gold, Brent, SOX, HYG, MA/RSI/Bollinger %B) + 24h Crypto + Nasdaq Earnings/Macro Calendar + custom stratified watchlist + optional Exa catalyst verification. | [Folder](./us%20stock%20bot/) · [Workflow README](./us%20stock%20bot/README.md) |
 | ⚙️ **Shared Runtime & Ops** | Always-on layer | `bot_utils.py`, `notion_archive.py`, `notion_reconcile.py`, `*_base.sh` wrappers, `scheduled-tasks/` `SKILL.md` specs, and 45+ offline unit tests. | [Folder](./shared/) · [Architecture README](./shared/README.md) |
 
 ---
@@ -95,13 +91,13 @@ daily-bots/
 ├── .env.example                   # Environment configuration template
 ├── .github/workflows/ci.yml       # Automated syntax + unit test CI
 ├── docs/
+│   ├── tv-dashboard.html          # Interactive TradingView Notion widget (GitHub Pages)
 │   └── launchd-env.plist.example  # Optional macOS LaunchAgent template
 ├── AI Daily News Bot/             # Stage 1: Global AI industry briefing
 ├── x-hotspot-bot/                 # Stage 2: X & Reddit AI community debates
 ├── ai-builder-bot/                # Stage 3: Curated AI Builders X List
 ├── github-hn-bot/                 # GitHub Trending + Hacker News Top 8
-├── us stock bot/                  # US Equities Close + 24h Crypto Dashboard
-├── cn-hk-stock-bot/               # A-Share & Hong Kong 3-session briefings
+├── us stock bot/                  # US Equities Close + 24h Crypto + Custom Watchlist
 └── shared/                        # Core Python utilities, Notion sync, shell bases, SKILL.md & tests
 ```
 
@@ -147,14 +143,14 @@ For full automated scheduling with an AI agent, point your scheduler at the spec
 
 | Variable | Required By | Description |
 | :--- | :--- | :--- |
-| `FEISHU_WEBHOOK` | AI Daily, X Hotspot, AI Builder, GitHub & HN, US Stock | Feishu (Lark) custom bot webhook URL |
-| `FEISHU_SECRET` | Optional (all above) | Feishu webhook HMAC signing secret |
-| `FEISHU_WEBHOOK_CN` / `FEISHU_WEBHOOK_HK` | CN & HK Stock | Separate Feishu webhooks for A-Share and HK channels |
+| `FEISHU_WEBHOOK` | All bots | Feishu (Lark) custom bot webhook URL |
+| `FEISHU_SECRET` | Optional (all bots) | Feishu webhook HMAC signing secret |
 | `TWITTERAPI_IO_KEY` | AI Builder | API key from [twitterapi.io](https://twitterapi.io/) for public X List fetching |
 | `X_LIST_ID` | AI Builder | Numeric X List ID or full `https://x.com/i/lists/<id>` URL |
 | `NOTION_ARCHIVE_API_KEY` | Optional (all bots) | Notion Internal Integration token for daily archiving |
 | `NOTION_ARCHIVE_DATABASE_ID` | Optional (all bots) | Target Notion database ID |
-| `EXA_API_KEY` / `ENABLE_EXA_ENRICH` | Optional (US & CN/HK Stock) | Set `ENABLE_EXA_ENRICH=1` to verify uncovered stock catalysts via Exa |
+| `WATCHLIST_FILE` | Optional (US Stock & Crypto) | Custom path to private stratified `watchlist.json` |
+| `EXA_API_KEY` / `ENABLE_EXA_ENRICH` | Optional (US Stock & Crypto) | Set `ENABLE_EXA_ENRICH=1` to verify uncovered stock catalysts via Exa |
 | `EXA_AGENT_EFFORT` | Optional (Exa) | Fixed effort tier: `minimal` / `low` / `medium` (default) / `high` |
 | `COINGECKO_API_KEY` / `CMC_API_KEY` | Optional (US Stock & Crypto) | Optional keys for higher crypto quote / Fear & Greed rate limits |
 | `HTTP_PROXY` / `HTTPS_PROXY` | Optional (all bots) | Local proxy URL if direct outbound network access is restricted |
