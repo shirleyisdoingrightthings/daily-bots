@@ -87,16 +87,27 @@ CN_INDICES = [
 # 仅对 5 大主指数 + 中证1000 做 255 日量化技术诊断（控制并发与信息密度）
 MA_TARGET_INDICES = ("sh000001", "sz399001", "sz399006", "sh000688", "sh000300", "sh000852")
 
-# 国债利率代理与国家队/平准基金宽基 ETF 成交额代理
+# 国债利率代理与国家队/宽基 ETF 成交额及折溢价代理（沪深300采用四大龙头 ETF 合计，消除单只偏差）
 CN_BOND_ETFS = [
     ("sh511260", "10年国债ETF"),
     ("sh511090", "30年国债ETF"),
+]
+CN_CSI300_ETFS = [
+    ("sh510300", "沪深300ETF华泰柏瑞"),
+    ("sh510310", "沪深300ETF易方达"),
+    ("sh510330", "沪深300ETF华夏"),
+    ("sz159919", "沪深300ETF嘉实"),
 ]
 CN_BROAD_ETFS = [
     ("sh510300", "沪深300ETF"),
     ("sh510050", "上证50ETF"),
     ("sh512100", "中证1000ETF"),
     ("sh588000", "科创50ETF"),
+]
+CN_ETF_INDEX_PAIRS = [
+    ("sh510300", "sh000300", "沪深300ETF"),
+    ("sh512100", "sh000852", "中证1000ETF"),
+    ("sh588000", "sh000688", "科创50ETF"),
 ]
 
 # 2. A股 16 大高纯度机构主线板块池（96 只核心龙头样本，彻底拆分银行/券商、海外算力/国产半导体、整车/光伏）
@@ -217,6 +228,23 @@ def _session_draft_path(session_mode: str) -> Path:
     if p.exists():
         return p
     return DRAFT_CN
+
+
+_CN_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def _fmt_cn_weekday(dt: datetime) -> str:
+    return _CN_WEEKDAYS[dt.weekday()]
+
+
+def _next_cn_trading_day(ref_dt: datetime) -> datetime:
+    """结合周末与 _CN_HOLIDAYS 向后推算下一个真实 A 股交易日（周五自动映射至下周一/节后首日）。"""
+    cur = ref_dt + timedelta(days=1)
+    for _ in range(15):
+        if cur.weekday() < 5 and cur.strftime("%Y-%m-%d") not in _CN_HOLIDAYS:
+            return cur
+        cur += timedelta(days=1)
+    return ref_dt + timedelta(days=1)
 
 
 def _prev_cn_trading_day(ref_dt: datetime) -> datetime:
@@ -451,14 +479,72 @@ def fetch_eastmoney_breadth_and_limits(trade_date_compact: str) -> dict[str, Any
     return res
 
 
-def fetch_eastmoney_sectors_top3() -> dict[str, list[dict[str, Any]]] | None:
-    """抓取东方财富行业板块真实领涨(po=1)与领跌(po=0)排行（强过滤成分股 >= 8 且成交额 >= 50 亿、剔除垃圾伪行业），作为盘外题材补充。"""
+def fetch_eastmoney_turnover_history() -> dict[str, float]:
+    """通过东财 push2his 拉取最近 25 个交易日沪深两市（上证+深证）精确人民币成交额（亿元），用于计算真实前日环比与 20 日成交额均比。"""
     hdrs = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
+    by_market: dict[str, dict[str, float]] = {}
+    for secid in ("1.000001", "0.399001"):
+        u = (
+            f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
+            f"?secid={secid}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57"
+            "&klt=101&fqt=0&end=20500101&lmt=25"
+        )
+        for attempt in range(2):
+            try:
+                r = DIRECT_SESSION.get(u, headers=hdrs, timeout=8)
+                r.raise_for_status()
+                kl = ((r.json() or {}).get("data") or {}).get("klines") or []
+                mp: dict[str, float] = {}
+                for row in kl:
+                    parts = str(row).split(",")
+                    if len(parts) >= 7:
+                        amt_yi = _safe_float(parts[6]) / 1e8
+                        if amt_yi > 0:
+                            mp[parts[0].strip()] = amt_yi
+                by_market[secid] = mp
+                break
+            except Exception as exc:
+                if attempt == 1:
+                    print(f"[WARN] 东财两市历史成交额({secid})抓取失败: {exc}", file=sys.stderr)
+                else:
+                    time.sleep(0.4)
+    sh_mp = by_market.get("1.000001") or {}
+    sz_mp = by_market.get("0.399001") or {}
+    common_dates = sorted(set(sh_mp.keys()) & set(sz_mp.keys()))
+    return {d: round(sh_mp[d] + sz_mp[d], 1) for d in common_dates}
+
+
+def _industry_family_key(name: str) -> str:
+    """将东财细分行业归并至大类家族，避免 银行 / 银行Ⅱ / 股份制银行Ⅲ / 城商行Ⅲ 同屏刷榜。"""
+    clean = re.sub(r"[ⅠⅡⅢⅣⅤ1-3]+$", "", name.strip())
+    for fam, kws in (
+        ("银行", ("银行", "农商行", "城商行", "股份制银行", "国有大型银行")),
+        ("半导体", ("半导体", "集成电路", "芯片", "分立器件")),
+        ("光通信", ("通信设备", "光通信", "元件", "印制电路板")),
+        ("煤炭", ("煤炭", "焦炭")),
+        ("券商", ("证券", "多元金融")),
+        ("保险", ("保险",)),
+        ("电力", ("电力", "水电", "火电", "核电")),
+        ("电池", ("电池", "能源金属", "光伏")),
+        ("白酒", ("白酒", "酿酒")),
+        ("汽车", ("乘用车", "商用车", "汽车")),
+    ):
+        if any(k in clean for k in kws):
+            return fam
+    return clean[:4]
+
+
+def fetch_eastmoney_sectors_top3(
+    exclude_families: set[str] | None = None,
+) -> dict[str, list[dict[str, Any]]] | None:
+    """抓取东方财富行业板块真实领涨(po=1)与领跌(po=0)排行：过滤成分<8与成交<50亿伪行业、按大类家族去重，并优先返回 16 大主线 Top 3 未覆盖的真盘外行业。"""
+    hdrs = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
+    excl = exclude_families or set()
 
     def _query_side(po: int, want_negative: bool) -> list[dict[str, Any]]:
         u = (
             "https://push2.eastmoney.com/api/qt/clist/get"
-            f"?pn=1&pz=40&po={po}&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:2+f:!50"
+            f"?pn=1&pz=60&po={po}&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:2+f:!50"
             "&fields=f12,f14,f3,f6,f104,f105"
         )
         for attempt in range(2):
@@ -466,7 +552,8 @@ def fetch_eastmoney_sectors_top3() -> dict[str, list[dict[str, Any]]] | None:
                 r = DIRECT_SESSION.get(u, headers=hdrs, timeout=8)
                 r.raise_for_status()
                 diff = ((r.json() or {}).get("data") or {}).get("diff") or []
-                out_list = []
+                non_overlap, overlap = [], []
+                seen_fams: set[str] = set()
                 for row in diff:
                     if not isinstance(row, dict):
                         continue
@@ -482,7 +569,11 @@ def fetch_eastmoney_sectors_top3() -> dict[str, list[dict[str, Any]]] | None:
                         continue
                     if want_negative and pct >= 0:
                         continue
-                    out_list.append({
+                    fam = _industry_family_key(name)
+                    if fam in seen_fams:
+                        continue
+                    seen_fams.add(fam)
+                    item = {
                         "code": row.get("f12", ""),
                         "name": name,
                         "pct": pct,
@@ -490,10 +581,12 @@ def fetch_eastmoney_sectors_top3() -> dict[str, list[dict[str, Any]]] | None:
                         "up": up_n,
                         "down": dn_n,
                         "stocks": [],
-                    })
-                    if len(out_list) >= 3:
-                        break
-                return out_list
+                    }
+                    if fam in excl:
+                        overlap.append(item)
+                    else:
+                        non_overlap.append(item)
+                return (non_overlap + overlap)[:3]
             except Exception as exc:
                 if attempt == 1:
                     print(f"[WARN] 东财行业榜(po={po})抓取失败: {exc}", file=sys.stderr)
@@ -709,7 +802,19 @@ def fetch_ma_trend_detail(
             pos200 = "年线上方" if cur >= ma200 else "跌破年线"
             parts.append(f"MA200={ma200:.2f} ({d200:+.1f}%/{pos200})")
         if hv20 is not None:
-            parts.append(f"HV20={hv20:.1f}%")
+            sigma_1d = cur * (hv20 / 100.0) / math.sqrt(252.0)
+            parts.append(f"HV20={hv20:.1f}%(1σ日波±{sigma_1d:.0f}点/0.5σ±{sigma_1d * 0.5:.0f})")
+
+        # 当日阳/阴线实体半柱位 (open+close)/2，作为长阳次日防洗盘结构防守锚
+        live_open = _safe_float((live_quote or {}).get("open"))
+        bar_open_cur = (
+            live_open
+            if (not strict_prior_close and live_open > 0 and live_date_compact == today_compact)
+            else (_safe_float(last_bar[1]) if len(last_bar) >= 5 else 0.0)
+        )
+        if bar_open_cur > 0 and cur > 0:
+            half_bar = (bar_open_cur + cur) / 2.0
+            parts.append(f"实体半柱={half_bar:.1f}")
 
         # CLV 严格保证与 cur 处于同一交易日
         if appended_today:
@@ -1345,6 +1450,7 @@ def run_fetch(session_mode: str) -> int:
     all_codes = (
         [c for c, _ in CN_INDICES]
         + [c for c, _ in CN_BOND_ETFS]
+        + [c for c, _ in CN_CSI300_ETFS]
         + [c for c, _ in CN_BROAD_ETFS]
         + cn_pool_codes
         + [c for c, _ in US_MAPPING]
@@ -1373,18 +1479,25 @@ def run_fetch(session_mode: str) -> int:
     elapsed_mins = _elapsed_cn_trading_minutes(now) if sh_date == today_compact else 240
     is_close_intraday = bool(session_mode == "close" and sh_date == today_compact and now.hour < 15)
 
-    # 并行抓取：新浪跨资产/期指 + OKX BTC 24h + 东财宽度/涨跌停 + 东财行业榜 + 6 大核心指数 255 日量化技术
+    cn_pool_sectors = compute_pool_sectors_top3(CN_SECTOR_POOL, quotes)
+    # 收集 16 大主线今日 Top 3 涨跌已覆盖的行业家族，东财行业补充优先输出真盘外异动
+    top_pool_fams: set[str] = set()
+    for _sec in cn_pool_sectors["gainers"] + cn_pool_sectors["losers"]:
+        top_pool_fams.add(_industry_family_key(_sec["name"]))
+
+    # 并行抓取：新浪跨资产/期指 + OKX BTC 24h + 东财宽度/涨跌停 + 东财行业榜(去重) + 东财25日精确两市成交额 + 6大指数255日技术
     trade_date_for_em = (
         _prev_cn_trading_day(now).strftime("%Y%m%d")
         if is_premarket_intraday
         else (sh_date or today_compact)
     )
     ma_detail_map: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=9) as pool:
         fut_macro = pool.submit(fetch_sina_macro_and_futures)
         fut_btc = pool.submit(fetch_btc_realtime)
         fut_em_br = pool.submit(fetch_eastmoney_breadth_and_limits, trade_date_for_em)
-        fut_em_sec = pool.submit(fetch_eastmoney_sectors_top3)
+        fut_em_sec = pool.submit(fetch_eastmoney_sectors_top3, top_pool_fams)
+        fut_em_turn = pool.submit(fetch_eastmoney_turnover_history)
         ma_futs = {
             c: pool.submit(
                 fetch_ma_trend_detail,
@@ -1401,10 +1514,10 @@ def run_fetch(session_mode: str) -> int:
         btc_rt = fut_btc.result()
         em_breadth = fut_em_br.result()
         em_sectors = fut_em_sec.result()
+        em_turnover_hist = fut_em_turn.result()
         for c, fut in ma_futs.items():
             ma_detail_map[c] = fut.result()
 
-    cn_pool_sectors = compute_pool_sectors_top3(CN_SECTOR_POOL, quotes)
     telegraph = fetch_sina_telegraph(limit=35, session_mode=session_mode, now_dt=now)
 
     exa_catalyst_block = ""
@@ -1446,22 +1559,36 @@ def run_fetch(session_mode: str) -> int:
         else (f"{sh_date[:4]}-{sh_date[4:6]}-{sh_date[6:8]}" if len(sh_date) == 8 else today_str)
     ) or today_str
 
-    prev_mem_amt = 0.0
-    for row in reversed(mem_cn):
-        if row.get("date") and row["date"] < effective_trade_date:
-            if row.get("turnover_yi"):
-                prev_mem_amt = _safe_float(row["turnover_yi"])
-                break
-            m_amt = re.search(r"([\d,.]+)", str(row.get("turnover") or ""))
-            if m_amt:
-                prev_mem_amt = _safe_float(m_amt.group(1).replace(",", ""))
-                break
+    # 优先使用东财 25 日精确人民币成交额计算前日环比 + 20 日均额比（首日无 memory 也能精准输出，彻底杜绝拿成交量 RVOL 拼凑）
+    prev_amt_yi = 0.0
+    turnover_20d_rvol_str = ""
+    hist_prior_dates = [d for d in sorted(em_turnover_hist.keys()) if d < effective_trade_date]
+    if hist_prior_dates:
+        prev_amt_yi = em_turnover_hist[hist_prior_dates[-1]]
+        recent_20 = [em_turnover_hist[d] for d in hist_prior_dates[-20:] if em_turnover_hist[d] > 0]
+        if len(recent_20) >= 10 and cn_total_amt > 0 and not is_premarket_intraday and not is_close_intraday:
+            avg20_amt = sum(recent_20) / len(recent_20)
+            if avg20_amt > 0:
+                turnover_20d_rvol_str = f" · 较20日均额({avg20_amt:,.0f}亿) {cn_total_amt / avg20_amt:.2f}x"
+
+    if prev_amt_yi <= 0:
+        for row in reversed(mem_cn):
+            if row.get("date") and row["date"] < effective_trade_date:
+                if row.get("turnover_yi"):
+                    prev_amt_yi = _safe_float(row["turnover_yi"])
+                    break
+                m_amt = re.search(r"([\d,.]+)", str(row.get("turnover") or ""))
+                if m_amt:
+                    prev_amt_yi = _safe_float(m_amt.group(1).replace(",", ""))
+                    break
 
     amt_delta_str = ""
-    if prev_mem_amt > 0 and not is_premarket_intraday and not is_close_intraday:
-        diff_yi = cn_total_amt - prev_mem_amt
-        diff_pct = diff_yi / prev_mem_amt * 100.0
-        amt_delta_str = f"（较前日 {diff_yi:+,.1f} 亿 / {diff_pct:+.1f}%）"
+    if prev_amt_yi > 0 and not is_premarket_intraday and not is_close_intraday:
+        diff_yi = cn_total_amt - prev_amt_yi
+        diff_pct = diff_yi / prev_amt_yi * 100.0
+        amt_delta_str = f"（较前日 {diff_yi:+,.1f} 亿 / {diff_pct:+.1f}%{turnover_20d_rvol_str}）"
+    elif turnover_20d_rvol_str:
+        amt_delta_str = f"（{turnover_20d_rvol_str.lstrip(' ·')}）"
 
     # 16 大主线与 96 样本统计（剔除停牌）
     active_pool_quotes = [
@@ -1505,10 +1632,13 @@ def run_fetch(session_mode: str) -> int:
             basis_parts.append(f"{lbl} {fq['last']:.1f} ({tag} {diff_pt:+.1f}点/{diff_pct:+.2f}%)")
 
     now_hhmm = now.strftime("%H:%M BJT")
+    next_td = _next_cn_trading_day(now)
+    next_td_str = f"{next_td.strftime('%Y-%m-%d')}（{_fmt_cn_weekday(next_td)}）"
     out: list[str] = [
         f"=== FETCH_{session_mode.upper()}_OK ===",
         "=== CONTEXT_BEGIN ===",
-        f"今天日期：{today_str}",
+        f"今天日期：{today_str}（{_fmt_cn_weekday(now)}）",
+        f"下个交易日：{next_td_str}",
         f"场次模式：{session_label}（{session_mode}）",
         f"A股最近已收盘交易日：{effective_trade_date}",
     ]
@@ -1571,14 +1701,28 @@ def run_fetch(session_mode: str) -> int:
                 prev_close_txt,
             ])
     else:
+        # 收盘模式同样检测昨夜美股是否休市，防止成稿把感恩节前旧盘误称作“隔夜美股”二次计价
+        close_us_holiday_warn = ""
+        expected_us_back = 3 if now.weekday() == 0 else 1
+        expected_us_dt = (now - timedelta(days=expected_us_back)).strftime("%Y-%m-%d")
+        m_close_inx = re.search(r"(\d{4})-?(\d{2})-?(\d{2})", us_inx_dt or "")
+        if m_close_inx:
+            inx_iso = f"{m_close_inx.group(1)}-{m_close_inx.group(2)}-{m_close_inx.group(3)}"
+            if inx_iso < expected_us_dt:
+                close_us_holiday_warn = (
+                    f"⚠️ 隔夜美股休市提示：昨夜（{expected_us_dt}）美股无新增收盘，下方美股报价为 {inx_iso} 旧收盘（已于前一日消化），"
+                    "严禁称作“隔夜美股”或作为今日走出独立行情的对比基准！"
+                )
         out.extend([
             "",
             "==========================================",
-            f"【一、🌍 实时跨资产锚与隔夜海外参照（抓取于 {now_hhmm}）】",
+            f"【一、🌍 实时跨资产锚与海外参照（抓取于 {now_hhmm}）】",
             "==========================================",
         ])
         if live_macro_bits:
             out.append("- 实时跨资产先导锚：" + " | ".join(live_macro_bits))
+        if close_us_holiday_warn:
+            out.append(close_us_holiday_warn)
         for code, label in US_MAPPING:
             q = quotes.get(code)
             if q:
@@ -1611,10 +1755,26 @@ def run_fetch(session_mode: str) -> int:
         f"{lbl} {quotes[c]['last']:.3f} ({quotes[c]['pct_str']})"
         for c, lbl in CN_BOND_ETFS if quotes.get(c) and quotes[c].get("last", 0) > 0
     )
-    broad_etf_str = " | ".join(
-        f"{lbl} {quotes[c]['pct_str']} (成交 {quotes[c]['amount_yi']:.1f}亿)"
-        for c, lbl in CN_BROAD_ETFS if quotes.get(c) and quotes[c].get("last", 0) > 0
-    )
+    # 沪深 300 宽基 ETF 扩充为四大龙头合计，消除单只 510300 偏差；并自动监测宽基 ETF 相对指数日内超额（折溢价套利信号）
+    csi300_etf_amt = sum(quotes[c]["amount_yi"] for c, _ in CN_CSI300_ETFS if quotes.get(c) and quotes[c].get("last", 0) > 0)
+    etf_parts: list[str] = []
+    if csi300_etf_amt > 0 and quotes.get("sh510300"):
+        etf_parts.append(f"沪深300四龙头ETF {quotes['sh510300']['pct_str']} (合计成交 {csi300_etf_amt:.1f}亿)")
+    for c, lbl in CN_BROAD_ETFS[1:]:
+        if quotes.get(c) and quotes[c].get("last", 0) > 0:
+            etf_parts.append(f"{lbl} {quotes[c]['pct_str']} (成交 {quotes[c]['amount_yi']:.1f}亿)")
+    broad_etf_str = " | ".join(etf_parts)
+
+    etf_arb_alerts: list[str] = []
+    for etf_c, idx_c, lbl in CN_ETF_INDEX_PAIRS:
+        eq = quotes.get(etf_c)
+        iq = quotes.get(idx_c)
+        if eq and iq and eq.get("last", 0) > 0 and iq.get("last", 0) > 0:
+            sp = eq["pct"] - iq["pct"]
+            if sp >= 0.80:
+                etf_arb_alerts.append(f"⚠️ {lbl}相对指数显著溢价 {sp:+.2f}%（ETF {eq['pct_str']} vs 指数 {iq['pct_str']}，留意{next_td_str}开盘 AP 申购套利机械抛压）")
+            elif sp <= -0.80:
+                etf_arb_alerts.append(f"⚠️ {lbl}相对指数显著折价 {sp:+.2f}%（ETF {eq['pct_str']} vs 指数 {iq['pct_str']}，留意{next_td_str}开盘 AP 赎回套利承接）")
 
     out.extend([
         "",
@@ -1635,7 +1795,9 @@ def run_fetch(session_mode: str) -> int:
     if basis_parts:
         out.append("- 股指期货主力基差：" + " | ".join(basis_parts))
     if broad_etf_str:
-        out.append(f"- 国家队/宽基 ETF 成交额代理：{broad_etf_str}")
+        out.append(f"- 宽基 ETF 成交额代理（含国家队核心标的）：{broad_etf_str}")
+    if etf_arb_alerts:
+        out.append("- 宽基 ETF 场内折溢价异动监测：" + " | ".join(etf_arb_alerts))
 
     for code, label in CN_INDICES:
         q = quotes.get(code)

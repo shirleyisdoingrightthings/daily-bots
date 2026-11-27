@@ -66,8 +66,8 @@ flowchart LR
 | 🛠️ **AI Builder 日报** | 每日 `09:00`（`ai-daily` 第 3/3 棒） | 通过 `twitterapi.io` 直连抓取公开自建 X List（零浏览器/Cookie 封号风险）+ 自动拉取 X Article 长文与外链博客正文；自动过滤前序已播原推。 | [目录](./ai-builder-bot/) · [工作流文档](./ai-builder-bot/README.md) |
 | 🐙 **GitHub & HN 早报** | 每日 `09:30` | GitHub Trending（周一至周六日榜 / 周日周榜）+ README 自动抓读 + Hacker News Top 8（Firebase + Algolia 热评融合）及 30 天跨天在榜记忆。 | [目录](./github-hn-bot/) · [工作流文档](./github-hn-bot/README.md) |
 | 🗽 **美股与加密日报** | 周一至周六 `09:05`（第 1/2 棒） | 买方量化美股收盘（日内振幅/CLV/RVOL、2Y/10Y/2s10s、VIX/VIX3M/VRP、均衡 30 股宽度、久期中性 HYG-IEI、220 日 MA50/MA200/HV20/Z-score）+ 24h 加密（含永续资金费率与 OI）+ 收盘日宏观实际值、NYSE 休市提醒与未来 5 日日程 + 自定义分层自选股 + Exa 核查 + Notion 折叠交互图。 | [目录](./us%20stock%20bot/) · [工作流文档](./us%20stock%20bot/README.md) |
-| 🇨🇳 **A 股智能决策日报** | 周一至周五 `09:05–09:30`（第 2/2 棒）& `16:15` | 纯 A 股开盘前瞻（紧接美股收盘 09:30 前完成，融合前日 A 股收盘复盘、盘后至盘前政策电报与刚生成的美股日报正稿）+ 16:15 收盘复盘（220 日 MA50/MA200/RSI/布林/CLV/RVOL/HV20/Z-score）。 | [目录](./a-share-bot/) · [工作流文档](./a-share-bot/README.md) |
-| ⚙️ **共享运行时与运维层** | 底层常驻 | `bot_utils.py`、`notion_archive.py`、`notion_reconcile.py`、`*_base.sh` 统一入口、`scheduled-tasks/` `SKILL.md` 调度规范及 50+ 离线单元测试。 | [目录](./shared/) · [架构说明](./shared/README.md) |
+| 🇨🇳 **A 股智能决策日报** | 周一至周五 `09:05–09:24`（第 2/2 棒）& `16:15` | 买方量化纯 A 股开盘前瞻与收盘复盘：10 大宽基与大小盘/成长红利风格差、交易所级零重叠真实涨跌与涨停/连板/封板率、东财精确 25 日两市成交额环比与 20 日均额比、255 日 `MA20/50/200 · HV20(1σ/0.5σ) · Z_vol · 实体半柱防守 · CLV · RVOL · RSI · 布林%B`、24h 实时 `富时A50 / USDCNH / 金油 / BTC / IF·IC·IM基差`、沪深 300 四龙头 ETF 合计与宽基 ETF 场内折溢价套利告警、16 大高纯度机构主线 + 去重东财盘外行业、双场次硬隔离与美股休市防二次计价。 | [目录](./a-share-bot/) · [工作流文档](./a-share-bot/README.md) |
+| ⚙️ **共享运行时与运维层** | 底层常驻 | `bot_utils.py`、`notion_archive.py`、`notion_reconcile.py`、`*_base.sh` 统一入口、`scheduled-tasks/` `SKILL.md` 调度规范及 65+ 离线单元测试。 | [目录](./shared/) · [架构说明](./shared/README.md) |
 
 ---
 

@@ -100,6 +100,8 @@ class TestAShareQuantMathAndHolidayCrossCheck(unittest.TestCase):
                 intraday_minutes=120,
             )
             self.assertIn("Z_vol=", res_intraday["text"])
+            self.assertIn("1σ日波±", res_intraday["text"])
+            self.assertIn("实体半柱=", res_intraday["text"])
             self.assertIn("RVOL=1.20x(折算全天)", res_intraday["text"])
 
             # strict_prior_close=True must strip today's 2026-11-27 bar!
@@ -266,6 +268,43 @@ class TestAShareTelegraphExaAndNotion(unittest.TestCase):
         )
         us_summ = na.extract_summary(us_md, "🗽 美股与加密")
         self.assertIn("12-01 BHP、盘后 ★MRVL、12-02 盘后 ★CRM", us_summ)
+
+    def test_next_trading_day_industry_family_dedup_and_turnover_history(self):
+        # Friday 2026-11-27 -> Monday 2026-11-30
+        fri = datetime(2026, 11, 27, 16, 15)
+        nxt = asr._next_cn_trading_day(fri)
+        self.assertEqual(nxt.strftime("%Y-%m-%d"), "2026-11-30")
+        self.assertEqual(asr._fmt_cn_weekday(fri), "周五")
+        self.assertEqual(asr._fmt_cn_weekday(nxt), "周一")
+        # National Day 2026-09-30 -> 2026-10-08
+        self.assertEqual(asr._next_cn_trading_day(datetime(2026, 9, 30)).strftime("%Y-%m-%d"), "2026-10-08")
+
+        # Industry family dedup
+        self.assertEqual(asr._industry_family_key("城商行Ⅲ"), "银行")
+        self.assertEqual(asr._industry_family_key("股份制银行Ⅲ"), "银行")
+        self.assertEqual(asr._industry_family_key("银行Ⅱ"), "银行")
+        self.assertEqual(asr._industry_family_key("半导体设备"), "半导体")
+        self.assertEqual(asr._industry_family_key("集成电路制造"), "半导体")
+
+        # EastMoney 2-market RMB turnover aggregation
+        fake_sh = {"data": {"klines": ["2026-11-26,3490,3476,3497,3455,100,613330000000", "2026-11-27,3482,3606,3610,3467,200,929780000000"]}}
+        fake_sz = {"data": {"klines": ["2026-11-26,10184,10084,10235,9979,100,704040000000", "2026-11-27,10121,10814,10814,10075,200,1070020000000"]}}
+        calls = [fake_sh, fake_sz]
+
+        class _R:
+            def __init__(self, payload):
+                self._p = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._p
+
+        with patch.object(asr.DIRECT_SESSION, "get", side_effect=[_R(calls[0]), _R(calls[1])]):
+            hist = asr.fetch_eastmoney_turnover_history()
+        self.assertAlmostEqual(hist["2026-11-26"], 13173.7, places=1)
+        self.assertAlmostEqual(hist["2026-11-27"], 19998.0, places=1)
 
     def test_shell_scripts_syntax_and_auto_repair_session_filter(self):
         for sh in ("claude_report.sh", "health_check.sh", "auto_repair.sh"):
