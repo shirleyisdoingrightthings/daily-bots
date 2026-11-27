@@ -6,9 +6,13 @@ BOT_ID="cn-hk-stock-bot"
 SCRIPT="a_share_report.py"
 USAGE_MSG="Usage: claude_report.sh {fetch [premarket|close] | send [premarket|close]}"
 EXTRA_ARGS=()
+SESS_ARG="${2:-}"
+if [ "$SESS_ARG" = "--session" ] && [ -n "${3:-}" ]; then
+    SESS_ARG="$3"
+fi
 if [ "${1:-}" = "fetch" ]; then
-    EXTRA_ARGS=(--session "${2:-close}")
-elif [ -n "${2:-}" ]; then
-    EXTRA_ARGS=(--session "$2")
+    EXTRA_ARGS=(--session "${SESS_ARG:-close}")
+elif [ -n "$SESS_ARG" ]; then
+    EXTRA_ARGS=(--session "$SESS_ARG")
 fi
 source "$DIR/../shared/report_base.sh"

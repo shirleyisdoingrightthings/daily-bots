@@ -47,16 +47,16 @@ bash "a-share-bot/claude_report.sh" fetch premarket
 按 stdout 标记决定：
 - `=== SKIP_ALREADY_RAN ===`：今日盘前已推送 → 记「已跳过」，进入汇报。
 - `=== SKIP_NON_TRADING_DAY ===`：周六/非交易日 → 记「周末非交易日，已跳过」，进入汇报。
-- `=== SKIP_EXPIRED ===`：已超过 09:45 开盘前瞻有效窗口 → 记「已过盘前窗口，自动跳过」，进入汇报。
+- `=== SKIP_EXPIRED ===`：已超过 09:24 开盘前瞻有效窗口（已进入 09:25 集合竞价/开盘时段）→ 记「已过盘前窗口，自动跳过」，进入汇报。
 - `=== SKIP_NO_DATA ===`：行情抓取失败 → 记「数据缺失未推送」，进入汇报。
 - `=== FETCH_PREMARKET_OK ===`：并行用 `read_file` 读取 `a-share-bot/logs/last_context.txt` 与 `a-share-bot/prompt_premarket.md`，进入步骤 2。
 
 ### 步骤 2 — 写稿（严格遵循 `a-share-bot/prompt_premarket.md`）
-1. 严格对齐美股与加密日报的顶部指标卡 + 量化锚点 + 三维看点 + 早盘决策仪表盘结构，融合：
-   - **前一日 A 股收盘复盘**（归档 + State Store 记忆 + 220 日 MA50/MA200/RSI/布林 %B）；
-   - **昨日 15:00 收盘后至今日开盘前的国内宏观政策与行业电报**；
-   - **今早刚发出的《美股收盘 & 加密行情日报》核心数据与海外映射**（跨资产数字 100% 一致）。
-2. 使用 `write_file`（`Overwrite: true`）将纯正文写入 `a-share-bot/logs/report_cn.txt`。
+1. 严格对齐买方量化交易台结构（结论前置 + 255 日量化锚点 + T+1 集合竞价与首半小时执行框架 + 三大核心看点），融合：
+   - **前一日 A 股收盘复盘**（归档 + State Store 记忆 + 255 日 MA20/50/200 · HV20 · Z_vol · CLV · RVOL · RSI · 布林 %B）；
+   - **上一交易日 15:00 收盘后至今日 09:24 前的国内宏观政策与行业电报**；
+   - **实时跨资产先导锚（富时 A50 / 离岸人民币 USDCNH / 伦敦金 / 布油 / BTC）与今早美股日报核心映射**（遇美股休市严格执行防二次计价规则）。
+2. 使用 `write_file`（`Overwrite: true`）将纯正文写入 `a-share-bot/logs/report_cn_premarket.txt`。
 
 ### 步骤 3 — 发送与核对
 ```bash

@@ -57,11 +57,17 @@ drafts_fresh() {
     return 0
 }
 
-# 重跑发送环节；今天出现 [OK] 视为成功。
+# 重跑发送环节；若配置了 SESSION_FILTER（双场次 Bot），透传场次并仅认对应场次的 [OK]，防止早盘 [OK] 掩盖收盘 [FAIL]。
 rerun() {
-    log "重跑：bash claude_report.sh send"
-    bash "$DIR/claude_report.sh" send >>"$REPAIR_LOG" 2>&1
-    grep -q "$TODAY.*\[OK\]" "$RUN_LOG" 2>/dev/null
+    if [ -n "${SESSION_FILTER:-}" ]; then
+        log "重跑：bash claude_report.sh send $SESSION_FILTER"
+        bash "$DIR/claude_report.sh" send "$SESSION_FILTER" >>"$REPAIR_LOG" 2>&1
+        grep -qE "^$TODAY.*\[OK\].*\($SESSION_FILTER\)" "$RUN_LOG" 2>/dev/null
+    else
+        log "重跑：bash claude_report.sh send"
+        bash "$DIR/claude_report.sh" send >>"$REPAIR_LOG" 2>&1
+        grep -q "$TODAY.*\[OK\]" "$RUN_LOG" 2>/dev/null
+    fi
 }
 
 # 瞬时错误判定（网络/超时/代理/限流等可重试类）

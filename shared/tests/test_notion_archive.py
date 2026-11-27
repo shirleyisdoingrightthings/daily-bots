@@ -641,8 +641,8 @@ class TestExtractSummaryBySource(unittest.TestCase):
         rows = tables[0]["table"]["children"]
         self.assertEqual(len(rows), 5)
         overseas_cell = "".join(rt["text"]["content"] for rt in rows[1]["table_row"]["cells"][1])
-        self.assertIn("① 美股指数：", overseas_cell)
-        self.assertIn("\n② 中概资产：", overseas_cell)
+        self.assertIn("① 中国资产与汇率：", overseas_cell)
+        self.assertIn("\n② 美股与产业链：", overseas_cell)
         self.assertIn("\n③ 利率与跨资产：", overseas_cell)
         tech_cell = "".join(rt["text"]["content"] for rt in rows[3]["table_row"]["cells"][1])
         self.assertIn("① 上证：", tech_cell)
@@ -652,7 +652,8 @@ class TestExtractSummaryBySource(unittest.TestCase):
         summary = na.extract_summary(cn_pre, source="🇨🇳 A股", report_type="开盘前瞻")
         self.assertTrue(summary.startswith("① 早盘信号灯：🟡 震荡分化\n② 海外映射："))
         self.assertIn("\n③ 前日收盘：", summary)
-        self.assertIn("\n④ 盘前看点：前日 A 股收盘复盘与主线延续性 ｜ 收盘后至开盘前宏观政策与行业催化 ｜ 海外市场与产业链映射", summary)
+        self.assertIn("\n④ 盘前核心：", summary)
+        self.assertNotIn("前日 A 股收盘复盘与主线延续性", summary)
         self.assertEqual(na.build_clean_title("🇨🇳 A股", "2026-11-27", "开盘前瞻"), "2026-11-27 A股开盘前瞻")
 
     def test_us_quant_upgraded_fields_and_signal_regime_parsing(self):

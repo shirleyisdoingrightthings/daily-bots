@@ -542,25 +542,36 @@ def _extract_us_market_brief(market_text: str) -> str:
 
         ev_short = ""
         if events_line:
+            def _expand_dated_items(raw_seg: str, strip_pat: str) -> list[str]:
+                out_items: list[str] = []
+                last_dt = ""
+                for tok in re.split(r"\s*[|、]\s*", raw_seg):
+                    t = re.sub(strip_pat, "", tok).strip()
+                    if not t:
+                        continue
+                    m_dt = re.match(r"^(\d{1,2}-\d{1,2})\s+(.+)$", t)
+                    if m_dt:
+                        last_dt = m_dt.group(1)
+                        out_items.append(t)
+                    elif last_dt:
+                        out_items.append(f"{last_dt} {t}")
+                    else:
+                        out_items.append(t)
+                return _sort_dated_events(out_items)
+
             earn_m = re.search(r"财报预告[:：]\s*(.+?)(?=\s*\|\s*宏观日程[:：]|$)", events_line)
             macro_m = re.search(r"宏观日程[:：]\s*(.+?)(?=\s*\|\s*财报预告[:：]|$)", events_line)
             ev_dated: list[tuple[tuple[int, int], str]] = []
             if macro_m:
                 m_raw = macro_m.group(1).strip()
                 if m_raw and "暂无" not in m_raw and "无重磅" not in m_raw:
-                    m_items = _sort_dated_events([
-                        re.sub(r"\s*[\(（][^()（）]{1,28}[\)）]", "", x).strip()
-                        for x in re.split(r"\s*[|、]\s*", m_raw) if x.strip()
-                    ])
+                    m_items = _expand_dated_items(m_raw, r"\s*[\(（][^()（）]{1,28}[\)）]")
                     if m_items:
                         ev_dated.append((_earliest_mmdd(m_items[0]), _merge_same_day_events(m_items[:3])))
             if earn_m:
                 e_raw = earn_m.group(1).strip()
                 if e_raw and "暂无" not in e_raw:
-                    e_items = _sort_dated_events([
-                        re.sub(r"\s*[\(（]\$[\d.,]+[BMT][\)）]", "", x).strip()
-                        for x in re.split(r"\s*[|、]\s*", e_raw) if x.strip()
-                    ])
+                    e_items = _expand_dated_items(e_raw, r"\s*[\(（]\$[\d.,]+[BMT][\)）]")
                     if e_items:
                         star_e = [x for x in e_items if "★" in x]
                         non_star_e = [x for x in e_items if "★" not in x]
@@ -625,15 +636,15 @@ def _extract_summary_bullets(section_text: str) -> list[str]:
 
 def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
     """从稿件中抽取 30 秒速览或完整结构化要点（金融市场报告首部直出信号灯，保证绝不半句截断）"""
-    # 0.9 独立 A 股（🇨🇳 A股，已剥离港股）：对齐美股圆圈序号 ①②③④ 分行 30 秒速览
+    # 0.9 独立 A 股（🇨🇳 A股，已剥离港股）：对齐美股圆圈序号 ①②③④ 分行 30 秒速览（按完整分句累加，绝不半数截断）
     if "A股" in source and "港股" not in source:
         head_lines = "\n".join(l.strip() for l in text.splitlines()[:4] if l.strip())
-        is_pre = (report_type == "开盘前瞻") or (report_type != "收盘复盘" and "A股开盘前瞻" in head_lines)
+        is_pre = (report_type == "开盘前瞻") or (report_type != "收盘复盘" and bool(re.search(r"A\s*股开盘前瞻", head_lines)))
         plain_lines = [re.sub(r"^#{1,3}\s*", "", _strip_tags_plain(l)).strip() for l in text.splitlines()]
         plain_lines = [l for l in plain_lines if l]
         sig_cn = extract_market_signal(text, source=source)
-        overseas_line, prev_or_idx_line, width_line, vol_line, ev_line = "", "", "", "", ""
-        watch_heads, gainers, losers = [], [], []
+        overseas_line, prev_or_idx_line, width_line, vol_line, ev_line, trend_line = "", "", "", "", "", ""
+        watch_bullets, core_points, gainers, losers = [], [], [], []
         mode_sec = ""
         for line in plain_lines:
             clean_l = re.sub(r"^(?:[\U0001F1E6-\U0001F1FF]{2}|[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\s])+", "", line).strip()
@@ -643,44 +654,76 @@ def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
                 prev_or_idx_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
             elif line.startswith("🧭") and re.search(r"[:：]", clean_l):
                 width_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
+            elif line.startswith("📐") and re.search(r"[:：]", clean_l):
+                trend_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
             elif line.startswith("💰") and re.search(r"[:：]", clean_l):
                 vol_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
             elif line.startswith("📅") and re.search(r"[:：]", clean_l):
                 ev_line = re.split(r"[:：]", clean_l, maxsplit=1)[1].strip()
             elif line.startswith("⚡"):
                 mode_sec = "watch"
+            elif line.startswith("🔭"):
+                mode_sec = "narrative"
+            elif line.startswith("🔥") and "❄️" in line:
+                mode_sec = "combined_gl"
             elif line.startswith("🔥"):
                 mode_sec = "gain"
             elif line.startswith("❄️"):
                 mode_sec = "loss"
-            elif line.startswith(("🔭", "🎯")):
+            elif line.startswith("🎯"):
                 mode_sec = ""
-            elif mode_sec == "watch" and re.match(r"^\d+\.\s+", line):
-                watch_heads.append(re.sub(r"^\d+\.\s+", "", line).split("：", 1)[0].strip())
+            elif mode_sec == "narrative" and re.match(r"^\d+\.\s+", line) and len(core_points) < 2:
+                sent = re.split(r"[。；;]", re.sub(r"^\d+\.\s+", "", line).strip(), maxsplit=1)[0].strip()
+                if sent:
+                    core_points.append(sent)
+            elif mode_sec == "watch" and re.match(r"^[·•-]\s*", line) and len(watch_bullets) < 3:
+                sent = re.split(r"[。；;]", re.sub(r"^[·•-]\s*", "", line).strip(), maxsplit=1)[0].strip()
+                if sent:
+                    watch_bullets.append(sent)
+            elif mode_sec == "combined_gl" and re.match(r"^(\d+)\.\s+", line):
+                num_i = int(re.match(r"^(\d+)\.", line).group(1))
+                sec_head = re.sub(r"^\d+\.\s+", "", line).split("：", 1)[0].split("—", 1)[0].strip()
+                if num_i <= 3 and len(gainers) < 3:
+                    gainers.append(sec_head)
+                elif num_i >= 4 and len(losers) < 3:
+                    losers.append(sec_head)
             elif mode_sec == "gain" and re.match(r"^\d+\.\s+", line) and len(gainers) < 3:
-                gainers.append(re.sub(r"^\d+\.\s+", "", line).strip())
+                gainers.append(re.sub(r"^\d+\.\s+", "", line).split("：", 1)[0].split("—", 1)[0].strip())
             elif mode_sec == "loss" and re.match(r"^\d+\.\s+", line) and len(losers) < 3:
-                losers.append(re.sub(r"^\d+\.\s+", "", line).strip())
+                losers.append(re.sub(r"^\d+\.\s+", "", line).split("：", 1)[0].split("—", 1)[0].strip())
+
+        def _budget_join(raw_pipe: str, budget: int = 165) -> str:
+            items = [p.strip() for p in raw_pipe.split("|") if p.strip()]
+            picked: list[str] = []
+            cur_len = 0
+            for it in items:
+                add_len = len(it) + (3 if picked else 0)
+                if picked and cur_len + add_len > budget:
+                    break
+                picked.append(it)
+                cur_len += add_len
+            return " ｜ ".join(picked)
 
         segs: list[str] = []
         if sig_cn:
             segs.append(f"{'早盘信号灯' if is_pre else '信号灯'}：{sig_cn}")
         if is_pre:
             if overseas_line:
-                segs.append("海外映射：" + " ｜ ".join(p.strip() for p in overseas_line.split("|") if p.strip())[:160])
+                segs.append("海外映射：" + _budget_join(overseas_line, 165))
             if prev_or_idx_line:
-                segs.append("前日收盘：" + " ｜ ".join(p.strip() for p in prev_or_idx_line.split("|") if p.strip())[:160])
-            if watch_heads:
-                segs.append("盘前看点：" + " ｜ ".join(watch_heads[:3]))
-            if ev_line and "暂无" not in ev_line:
-                segs.append(f"盘前事件：{ev_line[:110]}")
+                segs.append("前日收盘：" + _budget_join(prev_or_idx_line, 165))
+            if core_points or watch_bullets:
+                pts = core_points if core_points else watch_bullets
+                segs.append("盘前核心：" + _budget_join(" | ".join(pts[:2]), 180))
+            if ev_line and not (ev_line.startswith("今日暂无") and "|" not in ev_line and "｜" not in ev_line):
+                segs.append("盘前事件：" + _budget_join(ev_line, 120))
         else:
             if prev_or_idx_line:
-                segs.append("核心指数：" + " ｜ ".join(p.strip() for p in prev_or_idx_line.split("|") if p.strip())[:160])
+                segs.append("核心指数：" + _budget_join(prev_or_idx_line, 165))
             if vol_line or width_line:
-                wv = " ｜ ".join(x for x in (vol_line.split("—", 1)[0].strip(), width_line.split("—", 1)[0].strip()) if x)
-                if wv:
-                    segs.append(f"量能与宽度：{wv[:150]}")
+                wv_parts = [x for x in (vol_line.split("—", 1)[0].strip(), width_line.split("—", 1)[0].strip()) if x]
+                if wv_parts:
+                    segs.append("量能与宽度：" + _budget_join(" | ".join(wv_parts), 160))
             if gainers or losers:
                 gl = []
                 if gainers:
@@ -688,6 +731,8 @@ def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
                 if losers:
                     gl.append("领跌 " + "、".join(losers))
                 segs.append("板块轮动：" + " ｜ ".join(gl))
+            if ev_line and not (ev_line.startswith("暂无") and "|" not in ev_line):
+                segs.append("近期日程：" + _budget_join(ev_line, 110))
         if segs:
             return add_cjk_spacing("\n".join(f"{_circled(i)} {s}" for i, s in enumerate(segs)))
 
@@ -828,7 +873,7 @@ def _classify_signal_line(s: str) -> str | None:
         return min(emoji_hits, key=lambda x: x[0])[1]
 
     head = re.split(r"\s*[—–]\s*", s, maxsplit=1)[0]
-    if "偏多" in head or "积极进攻" in head:
+    if "偏多" in head or "积极进攻" in head or "高开进攻" in head or "进攻" in head:
         return "🟢 偏多"
     if "震荡" in head or "分化" in head or "观望" in head:
         return "🟡 震荡分化"
@@ -1205,17 +1250,17 @@ def _format_a_share_metric_cell(label: str, val: str) -> str:
         if len(parts) >= 4:
             eq, cn_ext, macro = [], [], []
             for p in parts:
-                if any(k in p for k in ("中概", "KWEB", "FXI", "阿里", "拼多多", "京东")):
+                if any(k in p for k in ("A50", "富时", "人民币", "USDCNH", "中概", "KWEB", "FXI", "阿里", "拼多多", "京东")):
                     cn_ext.append(p)
-                elif any(k in p for k in ("美债", "VIX", "美元", "伦敦金", "黄金", "原油", "布油", "比特币", "BTC")):
+                elif any(k in p for k in ("美债", "国债", "VIX", "美元", "伦敦金", "黄金", "原油", "布油", "夜盘", "比特币", "BTC")):
                     macro.append(p)
                 else:
                     eq.append(p)
             lines = []
-            if eq:
-                lines.append("美股指数：" + " | ".join(eq))
             if cn_ext:
-                lines.append("中概资产：" + " | ".join(cn_ext))
+                lines.append("中国资产与汇率：" + " | ".join(cn_ext))
+            if eq:
+                lines.append("美股与产业链：" + " | ".join(eq))
             if macro:
                 lines.append("利率与跨资产：" + " | ".join(macro))
             if len(lines) >= 2:
@@ -1226,7 +1271,7 @@ def _format_a_share_metric_cell(label: str, val: str) -> str:
         if len(parts) >= 4:
             idx_p, extra_p = [], []
             for p in parts:
-                if any(k in p for k in ("成交", "主线", "宽度")) or re.search(r"\d+\s*涨", p):
+                if any(k in p for k in ("成交", "主线", "宽度", "涨停", "风格差", "大小盘", "成长红利", "国家队", "ETF")) or re.search(r"\d+\s*涨", p):
                     extra_p.append(p)
                 else:
                     idx_p.append(p)
@@ -1243,7 +1288,7 @@ def _format_a_share_metric_cell(label: str, val: str) -> str:
         parts = [p.strip() for p in head.split("|") if p.strip()]
         lines = []
         for p in parts:
-            m_idx = re.match(r"^(上证(?:指数)?|深证(?:成指)?|创业板(?:指)?|科创\s*50|沪深\s*300)\s+(.+)$", p)
+            m_idx = re.match(r"^(上证(?:指数)?|深证(?:成指)?|创业板(?:指)?|科创\s*50|沪深\s*300|中证\s*500|中证\s*1000|国证\s*2000|中证红利)\s+(.+)$", p)
             if m_idx:
                 lines.append(f"{m_idx.group(1)}：{m_idx.group(2)}")
             else:
@@ -1253,7 +1298,12 @@ def _format_a_share_metric_cell(label: str, val: str) -> str:
         if len(lines) >= 2:
             return _num_lines(lines)
 
-    if "市场宽度" in label or "两市量能" in label:
+    if "宏观" in label or "事件" in label or "日程" in label:
+        parts = [p.strip() for p in val.split("|") if p.strip()]
+        if len(parts) >= 2:
+            return _num_lines(parts)
+
+    if "市场宽度" in label or "两市量能" in label or "宽度与情绪" in label or "量能与资金" in label:
         if "—" in val:
             head, diag = val.split("—", 1)
             return _num_lines([head.strip(), f"诊断：{diag.strip()}"])
@@ -1281,7 +1331,7 @@ def _split_metric_row(raw_line: str) -> tuple[str, str] | None:
     plain = _strip_tags_plain(raw_line).lstrip("·•-* ").strip()
     if not plain or len(plain) < 6 or not plain.startswith(_METRIC_PREFIXES):
         return None
-    if re.match(r"^(?:📊\s*美股收盘|🇨🇳\s*A股|🇭🇰\s*港股)", plain):
+    if re.match(r"^(?:📊\s*美股收盘|🇨🇳\s*A\s*股|🇭🇰\s*港股)", plain):
         return None
 
     m_plain = re.match(r"^(.{2,28}?)\s*(?:：|(?<!\d):(?!\d)|—|–)\s*(.+)$", plain)
@@ -1353,7 +1403,7 @@ def convert_to_blocks(
             return True
         return bool(
             re.match(
-                r"^(?:🌅\s*|☀️\s*)?(?:📊\s*美股收盘|📋\s*(?:AI\s*产业日报|美股要闻)|🐙\s*GitHub|🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠️?\s*AI\s*Builder|🇨🇳\s*A股(?:开盘前瞻|早盘总结|午间复盘|收盘复盘)|🇭🇰\s*港股(?:开盘前瞻|早盘总结|午间复盘|收盘复盘))",
+                r"^(?:🌅\s*|☀️\s*)?(?:📊\s*美股收盘|📋\s*(?:AI\s*产业日报|美股要闻)|🐙\s*GitHub|🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠️?\s*AI\s*Builder|🇨🇳\s*A\s*股(?:开盘前瞻|早盘总结|午间复盘|收盘复盘)|🇭🇰\s*港股(?:开盘前瞻|早盘总结|午间复盘|收盘复盘))",
                 p_no_b,
             )
             and ((raw_l.startswith("<b>") and raw_l.endswith("</b>")) or raw_l.startswith(("📋", "📊", "🌅", "☀️", "🇨🇳", "🇭🇰")))
@@ -1654,7 +1704,7 @@ def convert_to_blocks(
         _H2_PREFIXES = ("🚀", "🔥", "❄️", "⚡", "🔭", "🎯", "📰", "📎", "🗣️", "一、", "二、", "三、", "四、")
         if line.startswith("<b>") and line.endswith("</b>") and line.count("<b>") == 1 and any(plain_no_b.startswith(p) for p in _H2_PREFIXES):
             if is_cn_hk or (is_us and not in_us_news):
-                if plain_no_b.startswith(("🔥", "❄️")):
+                if plain_no_b.startswith(("🔥", "❄️")) or (is_cn_hk and plain_no_b.startswith("⚡") and "看点" in plain_no_b):
                     in_sector_section = True
                 elif plain_no_b.startswith(("🔭", "🎯", "⚡")):
                     in_sector_section = False

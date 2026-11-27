@@ -507,20 +507,20 @@ def html_to_lark_md(text: str) -> list:
             "🔥 今日领涨", "🔥 早盘领涨", "🔥 领涨", "🔥 持续霸榜",
             "❄️ 今日领跌", "❄️ 早盘领跌", "❄️ 领跌",
             "⚡ 焦点异动",
-            "🔭 盘面核心叙事", "🔭 盘面核心定性", "🔭 早盘核心叙事", "🔭 核心叙事",
-            "🎯 决策仪表盘", "🎯 交易台风控", "🎯 早盘决策仪表盘", "🎯 港股早盘决策仪表盘", "🎯 午间决策仪表盘",
+            "🔭 盘面核心叙事", "🔭 盘面核心定性", "🔭 盘前核心定性", "🔭 早盘核心叙事", "🔭 核心叙事",
+            "🎯 决策仪表盘", "🎯 交易台风控", "🎯 早盘交易台风控", "🎯 早盘决策仪表盘", "🎯 港股早盘决策仪表盘", "🎯 午间决策仪表盘",
             "🍰 AI 自选股明细",
             "⚡ 30秒速览", "📋 30秒速览",
             "🚀 一、", "🚀 二、", "🔥 一、", "🔥 二、", "📰 一、", "📰 二、", "▍",
-            "⚡ 早盘三大", "⚡ 开盘前瞻三大", "⚡ 今早港股", "⚡ 本周 5 件事",
+            "⚡ 早盘三大", "⚡ 开盘前瞻三大", "⚡ 今早港股", "⚡ 本周 5 件事", "⚡ 盘外题材补充",
         )
         _HEADER_METRICS = (
             "📊 **核心指数", "📈 **核心指数", "📊 核心指数", "📈 核心指数",
             "📊 **前日 A 股收盘", "📊 前日 A 股收盘", "📊 **前日A股收盘", "📊 前日A股收盘",
-            "🧭 **市场宽度", "🧭 市场宽度", "🧭 **宽度与信用", "🧭 宽度与信用",
+            "🧭 **市场宽度", "🧭 市场宽度", "🧭 **宽度与信用", "🧭 宽度与信用", "🧭 **宽度与情绪", "🧭 宽度与情绪",
             "📐 **趋势与乖离", "📐 趋势与乖离", "📐 **趋势与波动", "📐 趋势与波动",
             "📐 **量化技术锚点", "📐 量化技术锚点",
-            "💰 **两市量能", "💰 两市量能", "💰 **早盘半日量能", "💰 早盘半日量能",
+            "💰 **两市量能", "💰 两市量能", "💰 **量能与资金", "💰 量能与资金", "💰 **早盘半日量能", "💰 早盘半日量能",
             "🌍 **海外市场映射", "🌍 海外市场映射",
             "🌍 **外围与流动性", "🌍 外围与流动性", "🌍 **隔夜外围", "🌍 隔夜外围", "🌍 **隔夜映射兑现", "🌍 隔夜映射兑现",
             "📐 **前日收盘", "📐 前日收盘", "📐 **前日港股", "📐 前日港股",
@@ -529,6 +529,7 @@ def html_to_lark_md(text: str) -> list:
             "🪙 **加密", "🪙 加密",
             "🧭 **加密情绪", "🧭 加密情绪",
             "📅 **Financial Events", "📅 Financial Events", "📅 **盘前宏观与事件", "📅 盘前宏观与事件",
+            "📅 **近期宏观与日程", "📅 近期宏观与日程", "📅 **宏观与日程", "📅 宏观与日程",
             "🍰 **AI 自选股", "🍰 AI 自选股",
         )
         _ITEM_INTERNAL_PREFIXES = (
@@ -1704,27 +1705,50 @@ def exa_agent_verify_catalysts(
         f"{e.get('name', '')}({e.get('symbol', '')} {e.get('pct_change', '')})"
         for e in batch
     )
-    query = (
-        f"Verify whether there is a concrete, verifiable company-specific news catalyst explaining the stock price movement "
-        f"for each listed company in input.data around trading date {session_date} ({market_label}, within +/- 36 hours). "
-        f"Companies to check: {entity_desc}. "
-        f"Prioritize authoritative financial reports, earnings releases & earnings call transcripts, "
-        f"SEC/HKEX/exchange filings (8-K/6-K/10-Q), credit rating agency actions (S&P/Moody's/Fitch CreditWatch) or CDS spread spikes / bond debt concerns, "
-        f"guidance revisions, analyst upgrades/downgrades, M&A/divestitures, share offerings/buybacks, regulatory/legal actions, "
-        f"or major contracts/product launches. Ignore routine small 10b5-1 insider sales (<$5M for mega-caps) and generic broad-market sector selloffs."
-    )
-    system_prompt = (
-        "You are a strict financial fact-verification agent. Evaluate ONLY the companies in input.data "
-        f"for news published around {session_date} (within 36 hours). "
-        "Use verdict='confirmed' ONLY when an authoritative financial news report, exchange filing (SEC/HKEX/SSE/SZSE), "
-        "credit rating/CDS alert, earnings release/transcript, or broker research report directly explains the SPECIFIC company's move, "
-        "and write catalyst_summary in concise Simplified Chinese (<= 110 Chinese characters) including concrete "
-        "numbers/dates/entities from the source. "
-        "Use verdict='absent' when you found ONLY broad-market or generic sector moves (e.g., 'tech stocks fell on inflation/AI worries' with no company-specific news) "
-        "or routine immaterial 10b5-1 executive sales. "
-        "Use verdict='cannot_verify' when sources are inaccessible or inconclusive. "
-        "NEVER fabricate numbers, rumors, or outdated news from prior weeks. Leave optional fields null when verdict != 'confirmed'."
-    )
+    is_a_share_market = ("A股" in market_label or "中国" in market_label)
+    if is_a_share_market:
+        query = (
+            f"Verify whether there is a concrete, verifiable company-specific announcement or authoritative news catalyst "
+            f"explaining the China A-share stock price movement for each listed company in input.data around trading date "
+            f"{session_date} ({market_label}, within +/- 36 hours). Companies to check: {entity_desc}. "
+            f"Prioritize ONLY official exchange filings (cninfo.com.cn / sse.com.cn / szse.cn), official investor Q&A platforms "
+            f"(irm.cninfo.com.cn / sns.sseinfo.com), and tier-1 licensed Chinese financial media "
+            f"(cls.cn, stcn.com, cs.com.cn, cnstock.com, yicai.com, caixin.com, eastmoney.com official notices). "
+            f"STRICTLY IGNORE unofficial third-party scraper/Q&A mirror sites (e.g. igu888.com, stockask, guba, xueqiu user posts, baijiahao, sohu) "
+            f"and generic broad-market sector moves."
+        )
+        system_prompt = (
+            "You are a strict China A-share financial fact-verification agent. Evaluate ONLY the companies in input.data "
+            f"for authoritative filings or tier-1 media reports published around {session_date} (within 36 hours). "
+            "Use verdict='confirmed' ONLY when an official exchange filing (CNINFO/SSE/SZSE), official irm/sseinfo disclosure, "
+            "or tier-1 Chinese financial outlet (CLS, STCN, CS, CNStock, Yicai, Caixin) directly explains the SPECIFIC company's move, "
+            "and write catalyst_summary in concise Simplified Chinese (<= 110 Chinese characters) with concrete numbers/dates/entities. "
+            "NEVER cite third-party Q&A scraper sites (igu888, stockask), retail forums (guba, xueqiu), or unverified social posts — return verdict='absent' if only those exist. "
+            "Use verdict='absent' for generic sector/index moves without company-specific news. "
+            "Use verdict='cannot_verify' when sources are inaccessible or inconclusive. Leave optional fields null when verdict != 'confirmed'."
+        )
+    else:
+        query = (
+            f"Verify whether there is a concrete, verifiable company-specific news catalyst explaining the stock price movement "
+            f"for each listed company in input.data around trading date {session_date} ({market_label}, within +/- 36 hours). "
+            f"Companies to check: {entity_desc}. "
+            f"Prioritize authoritative financial reports, earnings releases & earnings call transcripts, "
+            f"SEC/HKEX/exchange filings (8-K/6-K/10-Q), credit rating agency actions (S&P/Moody's/Fitch CreditWatch) or CDS spread spikes / bond debt concerns, "
+            f"guidance revisions, analyst upgrades/downgrades, M&A/divestitures, share offerings/buybacks, regulatory/legal actions, "
+            f"or major contracts/product launches. Ignore routine small 10b5-1 insider sales (<$5M for mega-caps) and generic broad-market sector selloffs."
+        )
+        system_prompt = (
+            "You are a strict financial fact-verification agent. Evaluate ONLY the companies in input.data "
+            f"for news published around {session_date} (within 36 hours). "
+            "Use verdict='confirmed' ONLY when an authoritative financial news report, exchange filing (SEC/HKEX/SSE/SZSE), "
+            "credit rating/CDS alert, earnings release/transcript, or broker research report directly explains the SPECIFIC company's move, "
+            "and write catalyst_summary in concise Simplified Chinese (<= 110 Chinese characters) including concrete "
+            "numbers/dates/entities from the source. "
+            "Use verdict='absent' when you found ONLY broad-market or generic sector moves (e.g., 'tech stocks fell on inflation/AI worries' with no company-specific news) "
+            "or routine immaterial 10b5-1 executive sales. "
+            "Use verdict='cannot_verify' when sources are inaccessible or inconclusive. "
+            "NEVER fabricate numbers, rumors, or outdated news from prior weeks. Leave optional fields null when verdict != 'confirmed'."
+        )
 
     payload = {
         "query": query,
@@ -1816,11 +1840,19 @@ def exa_agent_verify_catalysts(
     meta_by_sym = {
         str(e.get("symbol") or "").upper(): e for e in batch if e.get("symbol")
     }
+    _UNTRUSTED_EXA_URL_RE = re.compile(
+        r"(?:igu888\.com|stockask|guba\.eastmoney\.com|xueqiu\.com|baijiahao\.baidu\.com|"
+        r"sohu\.com|163\.com/dy/|analystmarkets\.com|newser\.ai|newser\.com)",
+        re.IGNORECASE,
+    )
     confirmed: list[dict] = []
     for item in raw_items:
         if not isinstance(item, dict):
             continue
         if item.get("verdict") != "confirmed":
+            continue
+        src_url = str(item.get("source_url") or "").strip()
+        if src_url and _UNTRUSTED_EXA_URL_RE.search(src_url):
             continue
         summary = _ARTICLE_WS_RE.sub(" ", str(item.get("catalyst_summary") or "").strip())
         if len(summary) < 8:
@@ -1842,7 +1874,7 @@ def exa_agent_verify_catalysts(
             "catalyst_type": str(item.get("catalyst_type") or "other").strip(),
             "catalyst_summary": summary,
             "source_title": str(item.get("source_title") or "").strip(),
-            "source_url": str(item.get("source_url") or "").strip(),
+            "source_url": src_url,
         })
 
     print(
