@@ -2,7 +2,7 @@
 
 > [← Back to Daily Bots Root README](../README.md)
 
-**Stage 3 of 3 in the daily `09:00 CST` AI intelligence pipeline.** Directly monitors a curated public X List of frontline AI engineers, researchers, and founders via **`twitterapi.io`** (zero browser automation, zero account-ban risk), automatically expands X Articles and external engineering blog links, filters out tweets already covered by Stages 1–2, and publishes deep builder-by-builder takeaways.
+**Stage 2 of 3 in the daily `09:00 CST` AI intelligence pipeline (`🔥 X 热点 & AI Builder`).** Monitors a curated public X List (64+ frontier lab leaders, researchers, and frontline builders) via **`twitterapi.io`** (zero browser automation, zero account-ban risk) using **Hacker News–style high-like & high-reply discussion scoring**, concurrently fetches ad-filtered Relevance top replies (`/twitter/tweet/replies/v2`, capping author self-replies at 1), expands X Articles and external engineering blogs, suppresses `ICYMI`/`Resurfacing`/repeat-URL reposts, and publishes unified X hotspot + builder discussion briefings.
 
 ---
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -104,7 +105,7 @@ class TestSendXLinkedDateForwarding(unittest.TestCase):
                 bot_utils, "datetime", _FakeDatetimeNov14
             ), patch.object(
                 notion_archive, "archive_to_notion", return_value=(True, "https://notion.so/p1")
-            ) as mock_archive:
+            ) as mock_archive, patch.dict(os.environ, {"FORCE_RUN": "1"}):
                 rc = bot_utils.send_x_linked_report(
                     draft,
                     log_file=log_file,
@@ -133,7 +134,7 @@ class TestSendXLinkedDateForwarding(unittest.TestCase):
                 bot_utils, "datetime", _FakeDatetimeNov14
             ), patch.object(
                 notion_archive, "archive_to_notion", return_value=(True, "https://notion.so/p2")
-            ) as mock_archive2:
+            ) as mock_archive2, patch.dict(os.environ, {"FORCE_RUN": "1"}):
                 rc2 = bot_utils.send_x_linked_report(
                     draft,
                     log_file=log_file,
@@ -180,7 +181,9 @@ class TestGithubHnAndAiDailyAlignment(unittest.TestCase):
                 self.gh_mod, "FETCH_META", fetch_meta
             ), patch.object(self.gh_mod, "ARCHIVE_DIR", archive_dir), patch.object(
                 self.gh_mod, "SEEN_HISTORY", seen_history
-            ), patch.object(self.gh_mod, "already_ran_today", return_value=False), patch.object(
+            ), patch.object(self.gh_mod, "FEISHU_WEBHOOK", "https://hook.local"), patch.object(
+                self.gh_mod, "already_ran_today", return_value=False
+            ), patch.object(
                 self.gh_mod, "send_feishu", return_value=1
             ), patch.object(self.gh_mod, "record_seen_history", return_value=1), patch.object(
                 self.gh_mod, "write_log"
@@ -188,7 +191,7 @@ class TestGithubHnAndAiDailyAlignment(unittest.TestCase):
                 self.gh_mod, "datetime", _FakeDatetimeNov14
             ), patch.object(
                 notion_archive, "archive_to_notion", return_value=(True, "https://notion.so/gh1")
-            ) as mock_archive:
+            ) as mock_archive, patch.dict(os.environ, {"FORCE_RUN": "1"}):
                 rc = self.gh_mod.run_send(since_override="weekly")
             self.assertEqual(rc, 0)
             self.assertEqual(mock_archive.call_args.kwargs["report_type"], "周盘点")
@@ -203,7 +206,9 @@ class TestGithubHnAndAiDailyAlignment(unittest.TestCase):
                 self.gh_mod, "FETCH_META", fetch_meta
             ), patch.object(self.gh_mod, "ARCHIVE_DIR", archive_dir), patch.object(
                 self.gh_mod, "SEEN_HISTORY", seen_history
-            ), patch.object(self.gh_mod, "already_ran_today", return_value=False), patch.object(
+            ), patch.object(self.gh_mod, "FEISHU_WEBHOOK", "https://hook.local"), patch.object(
+                self.gh_mod, "already_ran_today", return_value=False
+            ), patch.object(
                 self.gh_mod, "send_feishu", return_value=1
             ), patch.object(self.gh_mod, "record_seen_history", return_value=1), patch.object(
                 self.gh_mod, "write_log"
@@ -211,13 +216,13 @@ class TestGithubHnAndAiDailyAlignment(unittest.TestCase):
                 self.gh_mod, "datetime", _FakeDatetimeSunday
             ), patch.object(
                 notion_archive, "archive_to_notion", return_value=(True, "https://notion.so/gh2")
-            ) as mock_archive2:
+            ) as mock_archive2, patch.dict(os.environ, {"FORCE_RUN": "1"}):
                 rc2 = self.gh_mod.run_send(since_override="daily")
             self.assertEqual(rc2, 0)
             self.assertEqual(mock_archive2.call_args.kwargs["report_type"], "日报")
 
             # No CLI override & no date in heading: recovers both date_str and weekly from fetch_meta
-            draft.write_text('<a href="https://github.com/a/b">a/b</a>', encoding="utf-8")
+            draft.write_text('<b>GitHub Weekly</b>\n<a href="https://github.com/a/b">a/b</a>', encoding="utf-8")
             fetch_meta.write_text(
                 json.dumps({"date_str": "2026-11-09", "metrics": {"since": "weekly"}}),
                 encoding="utf-8",
@@ -230,7 +235,9 @@ class TestGithubHnAndAiDailyAlignment(unittest.TestCase):
                 self.gh_mod, "FETCH_META", fetch_meta
             ), patch.object(self.gh_mod, "ARCHIVE_DIR", archive_dir), patch.object(
                 self.gh_mod, "SEEN_HISTORY", seen_history
-            ), patch.object(self.gh_mod, "already_ran_today", return_value=False), patch.object(
+            ), patch.object(self.gh_mod, "FEISHU_WEBHOOK", "https://hook.local"), patch.object(
+                self.gh_mod, "already_ran_today", return_value=False
+            ), patch.object(
                 self.gh_mod, "send_feishu", return_value=1
             ), patch.object(self.gh_mod, "record_seen_history", return_value=1), patch.object(
                 self.gh_mod, "write_log"
@@ -238,7 +245,7 @@ class TestGithubHnAndAiDailyAlignment(unittest.TestCase):
                 self.gh_mod, "datetime", _FakeDatetimeNov14
             ), patch.object(
                 notion_archive, "archive_to_notion", return_value=(True, "https://notion.so/gh3")
-            ) as mock_archive3:
+            ) as mock_archive3, patch.dict(os.environ, {"FORCE_RUN": "1"}):
                 rc3 = self.gh_mod.run_send()
             self.assertEqual(rc3, 0)
             self.assertEqual(mock_archive3.call_args.kwargs["date_str"], "2026-11-09")
@@ -268,7 +275,9 @@ class TestGithubHnAndAiDailyAlignment(unittest.TestCase):
                 self.daily_mod, "record_daily_ledger"
             ), patch.object(self.daily_mod, "FETCH_META", fetch_meta), patch.object(
                 self.daily_mod, "SENT_URLS", sent_urls
-            ), patch.object(self.daily_mod, "already_ran_today", return_value=False), patch.object(
+            ), patch.object(self.daily_mod, "FEISHU_WEBHOOK", "https://hook.local"), patch.object(
+                self.daily_mod, "already_ran_today", return_value=False
+            ), patch.object(
                 self.daily_mod, "send_report", return_value=1
             ), patch.object(self.daily_mod, "record_sent_urls", return_value=1), patch.object(
                 self.daily_mod, "write_log"
@@ -276,7 +285,7 @@ class TestGithubHnAndAiDailyAlignment(unittest.TestCase):
                 self.daily_mod, "datetime", _FakeDatetimeNov14
             ), patch.object(
                 notion_archive, "archive_to_notion", return_value=(True, "https://notion.so/ai1")
-            ) as mock_archive:
+            ) as mock_archive, patch.dict(os.environ, {"FORCE_RUN": "1"}):
                 rc = self.daily_mod.run_send(draft)
             self.assertEqual(rc, 0)
             self.assertEqual(mock_archive.call_args.kwargs["date_str"], "2026-11-13")

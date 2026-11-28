@@ -24,14 +24,14 @@ flowchart TB
     end
 
     subgraph PyCore["shared/ Python Core"]
-        BU["bot_utils.py<br/>Proxy self-heal · RSS/Fulltext · Dedup<br/>Daily Ledger · Feishu 20KB · Exa Layer"]
+        BU["bot_utils.py<br/>Proxy self-heal · RSS/Fulltext · Atomic Dedup<br/>Daily Ledger · Feishu 20KB · Exa Layer"]
         NA["notion_archive.py<br/>HTML/MD -&gt; Blocks · Idempotent Upsert<br/>Fit-Width Tables · curl Fallback"]
         NR["notion_reconcile.py<br/>Offline archive scanner &amp; backfill"]
     end
 
     subgraph Specs["shared/scheduled-tasks/ &amp; tests/"]
-        SK["4 SKILL.md Agent Orchestration Specs"]
-        TS["4 Offline Unit Test Suites (45+ tests)"]
+        SK["SKILL.md Agent Orchestration Specs"]
+        TS["7 Offline Unit Test Suites (80+ tests)"]
     end
 
     W1 --> RB --> BU
@@ -53,10 +53,10 @@ flowchart TB
 | **`notion_archive.py`** | Converts Feishu/HTML drafts into structured Notion blocks (including automatic 2-column KPI tables with `fit-page-width` sizing), performs idempotent in-place upserts by `(Date, Source, Type)` without breaking page URLs or comments, handles HTTP 429 `Retry-After`, and transparently falls back to `curl` on LibreSSL EOF errors. Configured via `NOTION_ARCHIVE_API_KEY` and `NOTION_ARCHIVE_DATABASE_ID`. |
 | **`notion_reconcile.py`** | Scans local `*/logs/archive/` drafts against `run.jsonl` to find and backfill any reports whose Notion sync previously failed (`--dry-run` supported). |
 | **`report_base.sh`** | Unified entrypoint sourced by all 6 `*/claude_report.sh` wrappers. Loads env vars in priority order: shell env → bot-local `.env` → optional macOS LaunchAgent plist (`BOT_PLIST_PREFIX`) → `shared/.env` → repo-root `.env`. |
-| **`health_check_base.sh` & `auto_repair_base.sh`** | Lightweight post-run audit verifying `[OK]` / `[NO_NEWS]` / `[MISSING]` / `[FAIL]`, checking `notion_ok=false` sync gaps and stale RSS sources, and performing Level-1 non-AI resend when local drafts are fresh (`ENABLE_CLAUDE_REPAIR=0`, `ENABLE_HEADLESS_CATCHUP=0`). |
-| **`ai_chain_health.sh`** | Sequential 10:00 health audit covering `AI Daily News Bot` → `x-hotspot-bot` → `ai-builder-bot` with per-stage timeout guards. |
+| **`health_check_base.sh` & `auto_repair_base.sh`** | Lightweight post-run audit verifying `[OK]` / `[NO_NEWS]` / `[MISSING]` / `[FAIL]`, checking `notion_ok=false` sync gaps and stale RSS sources, and performing Level-1 non-AI resend when local drafts are fresh. |
+| **`ai_chain_health.sh`** | Sequential 10:00 health audit covering `AI Daily News Bot` → `ai-builder-bot` → `github-hn-bot` with per-stage timeout guards. |
 | **[`scheduled-tasks/`](./scheduled-tasks/README.md)** | Version-controlled `SKILL.md` agent scheduling specs for all 6 bots. |
-| **`tests/`** | Fully offline `unittest` suite (`test_exa_enrichment.py`, `test_notion_archive.py`, `test_notion_reconcile.py`, `test_date_and_type_alignment.py`). |
+| **`tests/`** | Fully offline `unittest` suite (`test_ai_daily_pipeline.py`, `test_github_hn_bot.py`, `test_a_share_bot.py`, `test_exa_enrichment.py`, `test_notion_archive.py`, `test_notion_reconcile.py`, `test_date_and_type_alignment.py`). |
 
 ---
 

@@ -12,11 +12,16 @@ NO_NEWS_PATTERN="均未抓到有效条目"
 NO_NEWS_MSG="今天未抓到有效条目，未出稿"
 
 content_check() {
-    local gh_cnt
+    local gh_cnt hn_cnt
     gh_cnt=$(jsonl_field gh_count 99)
     if [ -n "$gh_cnt" ] && [ "$gh_cnt" -lt 3 ] 2>/dev/null; then
         notify WARN "本次 GitHub Trending 仅抓到 ${gh_cnt} 个项目，请检查页面结构"
         echo "[health_check] WARN: gh_count=${gh_cnt}，数量偏低"
+    fi
+    hn_cnt=$(jsonl_field hn_count 99)
+    if [ -n "$hn_cnt" ] && [ "$hn_cnt" -lt 3 ] 2>/dev/null; then
+        notify WARN "本次 Hacker News 仅抓到 ${hn_cnt} 条热帖，请检查 Algolia/Firebase API"
+        echo "[health_check] WARN: hn_count=${hn_cnt}，数量偏低"
     fi
 }
 

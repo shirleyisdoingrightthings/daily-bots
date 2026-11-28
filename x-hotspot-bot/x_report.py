@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (already_ran_today, load_sent_urls, url_key,
                        update_zero_streak, make_logger, make_pending_saver,
                        proxy_ok, emit_fetch_output, send_x_linked_report,
-                       load_daily_ledger, format_ledger_context)
+                       load_daily_ledger, format_ledger_context,
+                       X_POST_RE, redact_secrets)
 
 import sources
 
@@ -72,10 +74,11 @@ def gather() -> tuple:
     """跑所有启用的 provider，返回 (context 文本, metrics, zero_sources)。
     进度打到 stderr，让 fetch 模式的 stdout 只保留干净的 context。"""
     print(f"📡 provider: {', '.join(ENABLED)}（窗口 {WINDOW_H}h）", file=sys.stderr)
-    ledger = load_daily_ledger(exclude_bot="🐦 X 热点播报")
+    ledger = load_daily_ledger(exclude_bots=("🐦 X 热点播报", "🐙 GitHub & HN"))
     seen = load_sent_urls(SENT_URLS) | ledger["urls"]
+    ledger_x_ids = ledger["x_status_ids"]
     lines, metrics, zero = [], {}, []
-    ledger_block = format_ledger_context(exclude_bot="🐦 X 热点播报")
+    ledger_block = format_ledger_context(exclude_bots=("🐦 X 热点播报", "🐙 GitHub & HN"))
     if ledger_block:
         lines.append(ledger_block)
         lines.append("")
@@ -98,12 +101,16 @@ def gather() -> tuple:
                     lines.append("覆盖面：" + " / ".join(iss["outline"]))
                 lines.append("\n[Twitter Recap 正文]")
                 lines.append(iss["recap"])
-                lines.append("\n[原帖排行 · 按被引用次数，非真实互动量]")
+                lines.append("\n[原帖排行 · 优先按 AINews 标注真实互动量，无互动量时按被引用次数]")
                 for i, p in enumerate(iss["posts"], 1):
-                    fresh = "" if url_key(p["url"]) not in seen else "（已播过，勿作为新料）"
+                    m_x = X_POST_RE.search(p["url"])
+                    pid = m_x.group(2) if m_x else ""
+                    is_dup = (url_key(p["url"]) in seen) or (pid and pid in ledger_x_ids)
+                    fresh = "" if not is_dup else "（已播过，勿作为新料）"
                     if not fresh:
                         kept_posts += 1
-                    lines.append(f"{i}. [{p['mentions']} 次] @{p['handle']} {p['url']} {fresh}")
+                    eng_part = f"互动 {p['engagement']} · " if p.get("engagement") else ""
+                    lines.append(f"{i}. [{eng_part}提及 {p['mentions']} 次] @{p['handle']} {p['url']} {fresh}")
                     if p["context"]:
                         lines.append(f"   上下文：{p['context']}")
                 if iss.get("reddit_recap"):
@@ -175,11 +182,7 @@ def run_fetch() -> int:
 
     context, metrics, zero_sources = gather()
 
-    if not context.strip() or ("ainews" in ENABLED and metrics.get("ainews_fresh", 0) == 0):
-        print("=== NO_TOPICS ===")
-        write_log("WARN", f"窗口 {WINDOW_H}h 内没抓到可用素材（上游 AINews 未产出新刊或已播过），未发送")
-        return 0
-
+    # 必须在 NO_TOPICS 提前返回之前更新零产计数，否则主源 ainews 断更时告警永远不可达
     stale = update_zero_streak(ZERO_STREAK, zero_sources, list(ENABLED),
                                threshold=ZERO_STREAK_THRESHOLD)
     streak_now = _load_streak()
@@ -187,6 +190,19 @@ def run_fetch() -> int:
         n = streak_now.get(name, 0)
         flag = f"  ⚠️ 零产（连续 {n} 天）" if name in zero_sources else ""
         print(f"   {name:12s}{flag}", file=sys.stderr)
+
+    if not context.strip() or ("ainews" in ENABLED and metrics.get("ainews_fresh", 0) == 0):
+        out_no = ["=== NO_TOPICS ==="]
+        if stale:
+            out_no.append("=== SOURCE_ALERT ===")
+            for name, n in stale.items():
+                out_no.append(f"{name} 已连续 {n} 天零产，请立即检查 provider 是否失效")
+            out_no.append("=== SOURCE_ALERT_END ===")
+            write_log("WARN", f"上游源连续零产告警（{', '.join(f'{k}:{v}天' for k, v in stale.items())}），未发送")
+        else:
+            write_log("WARN", f"窗口 {WINDOW_H}h 内没抓到可用素材（上游 AINews 未产出新刊或已播过），未发送")
+        emit_fetch_output(out_no, LAST_CONTEXT)
+        return 0
 
     log_summary = (f"原帖 {metrics.get('ainews_posts', 0)} 条"
                    f"（新 {metrics.get('ainews_fresh', 0)}）"
@@ -222,21 +238,28 @@ def run_fetch() -> int:
 
 def run_send(draft_path: Path) -> int:
     # 发送流程与 ai-builder-bot 完全一致，统一在 bot_utils.send_x_linked_report，
-    # 其中含出稿硬闸门：稿件必须带 x.com 原帖直链，否则拒发。
+    # 其中含新鲜度闸门 + 标题身份闸门 + 原帖直链硬闸门。
     return send_x_linked_report(
         draft_path,
         log_file=LOG_FILE, cache_file=CACHE_FILE, fetch_meta=FETCH_META,
         sent_urls=SENT_URLS, webhook=FEISHU_WEBHOOK,
         write_log=write_log, save_pending=save_pending,
-        link_label="原帖")
+        link_label="原帖",
+        source_name="🐦 X 热点播报",
+        expected_title_markers=("X & Reddit", "X 热点"))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="X 热点播报")
+    parser = argparse.ArgumentParser(description="X & Reddit 社区热议")
     parser.add_argument("--mode", choices=["fetch", "send"], required=True,
                         help="fetch=取材并输出 context（零 API）"
                              " / send=发送写好的稿子")
     parser.add_argument("--draft", default=str(DRAFT_FILE),
                         help="send 模式读取的稿件路径")
     args = parser.parse_args()
-    sys.exit(run_fetch() if args.mode == "fetch" else run_send(Path(args.draft)))
+    try:
+        sys.exit(run_fetch() if args.mode == "fetch" else run_send(Path(args.draft)))
+    except Exception:
+        err = redact_secrets(traceback.format_exc().strip().splitlines()[-1])
+        write_log("FAIL", err)
+        raise

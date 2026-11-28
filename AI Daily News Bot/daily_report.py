@@ -23,6 +23,7 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # 共享工具库
 # 从脚本自身位置推导共享层（bot 目录的同级 shared/），
@@ -34,7 +35,10 @@ from bot_utils import (sanitize_html, fetch_rss, parse_entry_date,
                        extract_report_date, archive_and_sync_notion,
                        send_feishu, update_zero_streak,
                        make_logger, make_pending_saver, proxy_ok,
-                       emit_fetch_output, record_daily_ledger)
+                       emit_fetch_output, record_daily_ledger,
+                       format_recent_self_headlines,
+                       validate_draft_freshness_and_identity,
+                       redact_secrets)
 
 LOG_FILE    = Path(__file__).parent / "logs" / "run.log"
 JSONL_FILE  = Path(__file__).parent / "logs" / "run.jsonl"
@@ -136,6 +140,33 @@ TLDR_MAX_PER_ISSUE = 12
 _TLDR_ART_RE = re.compile(r"(?is)<article[^>]*>(.*?)</article>")
 _TLDR_HREF_RE = re.compile(r'(?is)href="([^"]+)"')
 _TLDR_H3_RE = re.compile(r"(?is)<h3[^>]*>(.*?)</h3>")
+_TLDR_READ_TIME_RE = re.compile(
+    r"\s*\(\s*\d+\s*(?:minute|min|hour|hr|second|sec)s?\s+(?:read|watch|listen|form|video)\s*\)\s*$",
+    re.IGNORECASE,
+)
+_TLDR_TRACKING_QS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "ref_src",
+}
+
+
+def _strip_tldr_read_time(title: str) -> str:
+    """剥离 TLDR 标题末尾的 '(13 minute read)' / '(6 hour read)' 等阅读时长后缀。"""
+    return _TLDR_READ_TIME_RE.sub("", (title or "").strip()).strip()
+
+
+def _clean_tldr_link(raw_href: str) -> str:
+    """unescape HTML 实体并仅剥离追踪参数，保留 id=/v= 等有效查询参数。"""
+    u = html.unescape((raw_href or "").strip())
+    if not u.startswith(("http://", "https://")):
+        return ""
+    try:
+        parts = urlsplit(u)
+        qs = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+              if k.lower() not in _TLDR_TRACKING_QS]
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(qs), ""))
+    except Exception:
+        return u
 
 
 def _tldr_text(fragment: str) -> str:
@@ -143,6 +174,21 @@ def _tldr_text(fragment: str) -> str:
     txt = re.sub(r"<[^>]+>", " ", txt)
     txt = html.unescape(txt)
     return re.sub(r"\s+", " ", txt).strip()
+
+
+def _fetch_tldr_page(page_url: str, retries: int = 2) -> str:
+    """带退避重试拉取 TLDR 落地页 HTML（TLDR 贡献 ~75% 有效素材，避免单次网络抖动失明）。"""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(page_url, headers={"User-Agent": _TLDR_UA}, timeout=30)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+    raise last_exc
 
 
 def fetch_tldr() -> list:
@@ -167,27 +213,29 @@ def fetch_tldr() -> list:
             if not page_url:
                 continue
             try:
-                resp = requests.get(page_url, headers={"User-Agent": _TLDR_UA}, timeout=30)
-                resp.raise_for_status()
+                page_html = _fetch_tldr_page(page_url, retries=2)
             except Exception as exc:
                 print(f"  ✗ TLDR 落地页 {page_url} 失败：{exc}", file=sys.stderr)
                 continue
             n = 0
-            for art in _TLDR_ART_RE.findall(resp.text):
+            for art in _TLDR_ART_RE.findall(page_html):
                 h3 = _TLDR_H3_RE.search(art)
                 href = _TLDR_HREF_RE.search(art)
                 if not (h3 and href):
                     continue
-                title = _tldr_text(h3.group(1))
+                raw_title = _tldr_text(h3.group(1))
                 # 广告条目：标题里带 (Sponsor)
-                if not title or "(sponsor)" in title.lower():
+                if not raw_title or "(sponsor)" in raw_title.lower():
                     continue
-                link = href.group(1).split("?")[0]
-                if not link.startswith("http"):
+                title = _strip_tldr_read_time(raw_title)
+                if not title:
+                    continue
+                link = _clean_tldr_link(href.group(1))
+                if not link:
                     continue
                 body = _tldr_text(art)
-                # 摘要 = 去掉标题后的剩余正文
-                snippet = body.replace(title, "", 1).strip()
+                # 摘要 = 去掉原始标题后的剩余正文
+                snippet = body.replace(raw_title, "", 1).strip()
                 e = feedparser.util.FeedParserDict({
                     "title": title,
                     "link": link,
@@ -263,16 +311,15 @@ save_pending = make_pending_saver(CACHE_FILE)
 def build_ai_context(all_entries: list) -> tuple:
     """整理素材，返回 (context, kept_per_source, drop_stats)。
 
-    过滤顺序：标题/URL 缺失 → 单次运行内 URL 去重 → 跨天已播去重 →
-    时间窗（按源，见 RSS_SOURCES 的 window_h）→ 泛科技源的 AI 相关性闸门
-    → 全源的低价值闸门（_LOW_VALUE_RE，促销/评测/会议推广）。"""
+    过滤顺序：标题/URL 缺失 → 单次运行内 url_key 去重 → 跨天已播去重 →
+    时间窗（按源，见 RSS_SOURCES 的 window_h）→ 全源低价值闸门（_LOW_VALUE_RE，促销/评测/会议推广）。"""
     now = datetime.now(timezone.utc)
-    seen_urls: set = set()
+    seen_keys: set = set()
     sent_before    = load_sent_urls(SENT_URLS)
     lines: list = []
 
     kept_per_source: dict = {}
-    drops = {"dup": 0, "already_sent": 0, "stale": 0, "off_topic": 0, "promo": 0}
+    drops = {"dup": 0, "already_sent": 0, "stale": 0, "promo": 0}
 
     picked: list = []   # (title, url, url_lower, snippet)
     for entry in all_entries:
@@ -280,13 +327,13 @@ def build_ai_context(all_entries: list) -> tuple:
         if not title:
             continue
         original_url = getattr(entry, "link", "") or getattr(entry, "id", "")
-        url_lower    = original_url.lower()
-        if not url_lower or url_lower in seen_urls:
+        uk = url_key(original_url)
+        if not uk or uk in seen_keys:
             drops["dup"] += 1
             continue
-        seen_urls.add(url_lower)
+        seen_keys.add(uk)
         # 跨天去重：前几天已经播出去的条目不再重复入选
-        if url_key(original_url) in sent_before:
+        if uk in sent_before:
             drops["already_sent"] += 1
             continue
         # 时间窗按源取，缺省 24h；放宽的源靠上面的跨天去重兜住重复
@@ -302,7 +349,7 @@ def build_ai_context(all_entries: list) -> tuple:
             continue
         src = getattr(entry, "__src", "?")
         kept_per_source[src] = kept_per_source.get(src, 0) + 1
-        picked.append((title, original_url, url_lower, snippet))
+        picked.append((title, original_url, original_url.lower(), snippet))
 
     # best-effort 并发抓正文全文；抓到用正文，失败/被墙/过短则回退 RSS 摘要。
     # 全程零 API、纯 HTTP，抓不到不影响出稿。
@@ -338,7 +385,7 @@ def _proxy_ok() -> bool:
 
 
 def fetch_news() -> tuple:
-    """抓 RSS + 整理去重，返回 (ai_context, rss_fetched, entry_count, zero_sources, source_stats)。
+    """抓 RSS + 整理去重，返回 (ai_context, rss_fetched, entry_count, zero_sources, source_stats, stale_sources)。
     进度打到 stderr，让 fetch 模式的 stdout 只保留干净的 context。"""
     print("📡 抓取 RSS 源...", file=sys.stderr)
     all_entries = []
@@ -350,20 +397,18 @@ def fetch_news() -> tuple:
     tldr_entries = fetch_tldr()
     for e in tldr_entries:
         e["__src"] = "tldr.tech"
-        e["__general"] = False        # 已人工精选，不再过 AI 相关性闸门
         e["__window_h"] = TLDR_WINDOW_H
     all_entries.extend(tldr_entries)
     fetched_counts["tldr.tech"] = len(tldr_entries)
 
     for src in RSS_SOURCES:
-        feed_url, limit, is_general = src[:3]
+        feed_url, limit = src[0], src[1]
         window_h = src[3] if len(src) > 3 else DEFAULT_WINDOW_H
         entries = fetch_rss(feed_url, limit)
         domain  = _source_label(feed_url)
-        # 给条目打上来源标记，供后续统计"过滤后每个源还剩几条"与相关性闸门判定
+        # 给条目打上来源标记，供后续统计"过滤后每个源还剩几条"
         for e in entries:
             e["__src"]      = domain
-            e["__general"]  = is_general
             e["__window_h"] = window_h
         all_entries.extend(entries)
         fetched_counts[domain] = fetched_counts.get(domain, 0) + len(entries)
@@ -386,7 +431,7 @@ def fetch_news() -> tuple:
                                        threshold=ZERO_STREAK_THRESHOLD)
 
     print(f"   过滤明细：重复 {drops['dup']} · 已播过 {drops['already_sent']} · "
-          f"超时效窗 {drops['stale']} · 非 AI {drops['off_topic']} · "
+          f"超时效窗 {drops['stale']} · "
           f"促销/评测 {drops['promo']} → 保留 {entry_count}",
           file=sys.stderr)
     streak_now = _load_streak()
@@ -420,8 +465,16 @@ def run_fetch() -> int:
     ai_context, rss_fetched, entry_count, zero_sources, source_stats, stale_sources = fetch_news()
 
     if not ai_context:
-        print("=== NO_NEWS ===")
-        write_log("WARN", "过去24小时无有效新闻，未发送")
+        out_no = ["=== NO_NEWS ==="]
+        if stale_sources:
+            out_no.append("=== SOURCE_ALERT ===")
+            for d, n in stale_sources.items():
+                out_no.append(f"{d} 已连续 {n} 天零产，建议从 RSS_SOURCES 移除或更换")
+            out_no.append("=== SOURCE_ALERT_END ===")
+            write_log("WARN", f"过去24小时无有效新闻（且存在连续零产源：{', '.join(stale_sources)}），未发送")
+        else:
+            write_log("WARN", "过去24小时无有效新闻，未发送")
+        emit_fetch_output(out_no, LAST_CONTEXT)
         return 0
 
     # 写边车：OK 日志摘要 + metrics，供 send 模式回填（保持 health_check 监控存活）
@@ -442,6 +495,10 @@ def run_fetch() -> int:
         encoding="utf-8",
     )
 
+    # 注入过去 3 天本栏目已播标题，拦住 TLDR 隔日换 URL 重播同一事件
+    recent_self = format_recent_self_headlines("🤖 AI 产业日报", days=3, date_str=today)
+    full_context = f"{recent_self}\n\n{ai_context}" if recent_self else ai_context
+
     # stdout 只输出结构化标记 + context，供定时任务稳定解析。
     # 先攒成一个列表再一次性交给 emit_fetch_output，顺带落盘 logs/last_context.txt。
     out = ["=== FETCH_OK ===",
@@ -455,7 +512,7 @@ def run_fetch() -> int:
         for d, n in stale_sources.items():
             out.append(f"{d} 已连续 {n} 天零产，建议从 RSS_SOURCES 移除或更换")
         out.append("=== SOURCE_ALERT_END ===")
-    out += ["=== CONTEXT_BEGIN ===", ai_context, "=== CONTEXT_END ==="]
+    out += ["=== CONTEXT_BEGIN ===", full_context, "=== CONTEXT_END ==="]
     emit_fetch_output(out, LAST_CONTEXT)
     return 0
 
@@ -480,12 +537,30 @@ def run_send(draft_path: Path) -> int:
     # 飞书的富文本结构；清洗保证正文里的裸 < > & 不会被后面的标签解析吃掉。
     report = sanitize_html(report)
 
+    ok_gate, gate_err = validate_draft_freshness_and_identity(
+        draft_path,
+        report,
+        fetch_meta_path=FETCH_META,
+        webhook=FEISHU_WEBHOOK,
+        expected_title_markers=("AI 产业日报", "AI产业日报"),
+        require_hrefs=True,
+    )
+    if not ok_gate:
+        write_log("FAIL", gate_err)
+        return 1
+
     # P2: 先持久化缓存，防止推送失败时内容丢失
     # 这里不再做代理预检：飞书直连可达，推送阶段本来就不需要翻墙代理。
     # （Telegram 时代代理一挂当天就整个不播，现在只有抓取阶段依赖它。）
     save_pending([report])
     print("📨 推送到飞书...", file=sys.stderr)
-    sent = send_report(report)
+    try:
+        sent = send_report(report)
+    except Exception as exc:
+        err = redact_secrets(f"飞书推送失败：{exc}")
+        write_log("FAIL", err)
+        print(f"  ✗ {err}", file=sys.stderr)
+        return 1
     print(f"  ✓ 推送成功（{sent} 条）", file=sys.stderr)
     CACHE_FILE.unlink(missing_ok=True)
 
@@ -547,6 +622,6 @@ if __name__ == "__main__":
         else:
             sys.exit(run_send(parsed.file))
     except Exception:
-        err = traceback.format_exc().strip().splitlines()[-1]
+        err = redact_secrets(traceback.format_exc().strip().splitlines()[-1])
         write_log("FAIL", err)
         raise

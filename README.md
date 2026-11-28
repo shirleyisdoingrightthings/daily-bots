@@ -6,7 +6,7 @@
 
 🌐 **English** | [简体中文](./README.zh-CN.md)
 
-A production-tested monorepo of **6 modular automated intelligence bots** (organized into **4 scheduled pipelines**: Morning AI Daily 3-in-1, US Close → A-Share Premarket, GitHub & Hacker News, and A-Share Close Review) + a **shared runtime & ops layer** that collect, deduplicate, verify, and publish daily briefings across **AI Industry News, X & Reddit Debates, AI Builders, GitHub & Hacker News, US Equities & Crypto, and China A-Shares** to **Feishu (Lark) Card 2.0** and **Notion**.
+A production-tested monorepo of **5 active modular automated intelligence bots** (organized into **3 scheduled pipelines**: Morning AI Daily 3-in-1, US Close → A-Share Premarket, and A-Share Close Review; plus archived `x-hotspot-bot`) + a **shared runtime & ops layer** that collect, deduplicate, verify, and publish daily briefings across **AI Industry News, X Hotspots & AI Builders (Pure X List), GitHub & Hacker News, US Equities & Crypto, and China A-Shares** to **Feishu (Lark) Card 2.0** and **Notion**.
 
 > **Zero LLM Vendor Lock-In**: Every Python script (`*_report.py`) performs deterministic `fetch`, deduplication, sanitization, Feishu delivery, and Notion archiving with zero hardcoded LLM SDK calls. AI editorial drafting is cleanly decoupled into Markdown prompts (`prompt*.md`) and agent workflow specs (`shared/scheduled-tasks/*/SKILL.md`), so you can run it with any coding/automation agent or LLM of your choice.
 
@@ -19,20 +19,18 @@ flowchart LR
     subgraph Sched["Scheduled AI Agents (Asia/Shanghai)"]
         S1["09:00 Daily (ai-daily)<br/>AI 3-in-1 Sequential Pipeline"]
         S2["09:05 Mon-Sat<br/>US Close -> A-Share Premarket"]
-        S3["09:30 Daily<br/>GitHub &amp; Hacker News"]
         S4["16:15 Mon-Fri<br/>A-Share Close Review"]
     end
 
-    subgraph Bots["6 Modular Bots (fetch -&gt; Agent Draft -&gt; send)"]
+    subgraph Bots["5 Active Bots (fetch -&gt; Agent Draft -&gt; send)"]
         direction TB
-        B1["1. AI Daily News"] --> B2["2. X &amp; Reddit Hotspot"] --> B3["3. AI Builder"]
-        B4["4. GitHub &amp; HN"]
-        B5["5. US Stock &amp; Crypto"] --> B6["6. A-Share Premarket &amp; Close"]
+        B1["1. AI Daily News"] --> B3["2. X Hotspots &amp; AI Builder (Pure X List)"] --> B4["3. GitHub &amp; HN"]
+        B5["4. US Stock &amp; Crypto"] --> B6["5. A-Share Premarket &amp; Close"]
     end
 
     subgraph Shared["shared/ Runtime &amp; Ops Layer"]
-        U["bot_utils.py<br/>Fetch / Dedup / Feishu / Exa"]
-        L["daily_topic_ledger.json<br/>Cross-Bot Daily Dedup"]
+        U["bot_utils.py<br/>Fetch / Atomic Dedup / Feishu / Exa"]
+        L["daily_topic_ledger.json<br/>Cross-Bot Locked Daily Dedup"]
         N["notion_archive.py<br/>Idempotent Upsert &amp; Tables"]
         H["health_check_base.sh<br/>Status Audit &amp; Level-1 Resend"]
     end
@@ -44,10 +42,9 @@ flowchart LR
 
     S1 --> B1
     S2 --> B5
-    S3 --> B4
     S4 --> B6
-    B1 & B2 & B3 & B4 & B5 <--> L
-    B1 & B2 & B3 & B4 & B5 & B6 --> U
+    B1 & B3 & B4 & B5 <--> L
+    B1 & B3 & B4 & B5 & B6 --> U
     U --> F
     U --> N --> ND
     H -.-> Bots
@@ -61,20 +58,20 @@ Click any module below to inspect its dedicated **workflow diagram, data sources
 
 | Module | Schedule (CST) | Coverage & Core Workflow | Workflow Docs |
 | :--- | :--- | :--- | :--- |
-| 🤖 **AI Daily News Bot** | Daily `09:00` (`ai-daily` 1/3) | Global AI models, infra, policy & robotics via TLDR + 6 vertical RSS feeds with full-text extraction; seeds the cross-bot daily ledger. | [Folder](./AI%20Daily%20News%20Bot/) · [Workflow README](./AI%20Daily%20News%20Bot/README.md) |
-| 🐦 **X & Reddit Hotspot Bot** | Daily `09:00` (`ai-daily` 2/3) | 48h Latent Space `[AINews]` full Twitter Recap + Reddit Recap (12 AI subreddits) + Techmeme cross-check; extracts top X debates & hands-on Reddit feedback with primary links. | [Folder](./x-hotspot-bot/) · [Workflow README](./x-hotspot-bot/README.md) |
-| 🛠️ **AI Builder Bot** | Daily `09:00` (`ai-daily` 3/3) | Public X List direct fetch via `twitterapi.io` (zero browser/cookie risk) + full X Article & external blog extraction; filters prior stages' posts. | [Folder](./ai-builder-bot/) · [Workflow README](./ai-builder-bot/README.md) |
-| 🐙 **GitHub & HN Bot** | Daily `09:30` | GitHub Trending (Mon–Sat Daily / Sun Weekly) with README extraction + Hacker News Top 8 (Firebase + Algolia) + top comments & 30-day memory. | [Folder](./github-hn-bot/) · [Workflow README](./github-hn-bot/README.md) |
+| 🤖 **AI Daily News Bot** | Daily `09:00` (`ai-daily` 1/3) | Global AI models, infra, policy & robotics via TLDR (retry + read-time strip) + 6 vertical RSS feeds with full-text extraction; concise Chinese headlines + bold-lead facts + 3-day self-dedup; seeds the cross-bot daily ledger. | [Folder](./AI%20Daily%20News%20Bot/) · [Workflow README](./AI%20Daily%20News%20Bot/README.md) |
+| 🔥 **X Hotspots & AI Builder Bot** | Daily `09:00` (`ai-daily` 2/3) | Unified pure curated X List via `twitterapi.io` (`ai-builder-bot/`): HN-style high-like & high-reply discussion scoring (`likes + replies×12 + RT×3 + quotes×8`), concurrent ad-filtered Relevance top replies (author self-reply capped at 1), X Article/blog expansion, & ICYMI/ext-URL suppression. | [Folder](./ai-builder-bot/) · [Workflow README](./ai-builder-bot/README.md) |
+| 🐙 **GitHub & HN Bot** | Daily `09:00` (`ai-daily` 3/3) | Unfrozen GitHub Trending (full-page fresh-first discovery + Python/TS fallback + compact recurring toggle) & Hacker News Top 8 (parallel Firebase + Algolia + top comments + Stages 1–2 ledger backfill). | [Folder](./github-hn-bot/) · [Workflow README](./github-hn-bot/README.md) |
 | 🗽 **US Stock & Crypto Bot** | Mon–Sat `09:05` (Stage 1/2) | Buy-side quant US close (intraday CLV/RVOL, US2Y/10Y/2s10s, VIX/VIX3M/VRP, balanced 30-stock breadth, duration-neutral HYG-IEI, 220d MA50/MA200/HV20/Z-score) + 24h Crypto with perp funding/OI + today macro actuals, NYSE holiday alerts & 5-day calendar + custom watchlist + Exa verification + auto Notion chart toggle. | [Folder](./us%20stock%20bot/) · [Workflow README](./us%20stock%20bot/README.md) |
 | 🇨🇳 **A-Share Stock Bot** | Mon–Fri `09:05–09:24` (Stage 2/2) & `16:15` | Buy-side A-share quant premarket & close: 10 broad/style indices (`CSI1000-CSI300` & `ChiNext-Dividend` spreads), zero-overlap exchange breadth & limit-up/down counts, EastMoney exact 25d RMB turnover delta & 20d avg ratio, 255d `MA20/50/200 · HV20(1σ/0.5σ) · Z_vol · half-bar defense · CLV · RVOL · RSI · %B`, live `FTSE A50 / USDCNH / Gold / Brent / BTC / IF·IC·IM basis`, 4-ETF CSI300 aggregate + ETF premium/discount arbitrage alerts, 16 pure institutional themes + deduplicated EastMoney industry supplement, strict session isolation & US holiday anti-double-counting. | [Folder](./a-share-bot/) · [Workflow README](./a-share-bot/README.md) |
-| ⚙️ **Shared Runtime & Ops** | Always-on layer | `bot_utils.py`, `notion_archive.py`, `notion_reconcile.py`, `*_base.sh` wrappers, `scheduled-tasks/` `SKILL.md` specs, and 65+ offline unit tests. | [Folder](./shared/) · [Architecture README](./shared/README.md) |
+| ⚙️ **Shared Runtime & Ops** | Always-on layer | `bot_utils.py`, `notion_archive.py`, `notion_reconcile.py`, `*_base.sh` wrappers, `scheduled-tasks/` `SKILL.md` specs, and 80+ offline unit tests. | [Folder](./shared/) · [Architecture README](./shared/README.md) |
+| 🗄️ **X Hotspot Bot (Archived)** | Retired `2026-11-28` | Legacy Latent Space `[AINews]` + Reddit parser kept for reference; superseded by unified pure X List `ai-builder-bot/`. | [Folder](./x-hotspot-bot/) · [README](./x-hotspot-bot/README.md) |
 
 ---
 
 ## Key Engineering Highlights
 
-- **Strict Fetch / Draft / Send Separation**: Running `claude_report.sh fetch` writes a clean, deterministic context snapshot to `logs/last_context.txt`; an AI agent drafts against `prompt*.md` into `logs/report_draft.txt`; `claude_report.sh send` validates hard gates, pushes to Feishu, archives to Notion, and updates dedup state.
-- **Cross-Bot Daily Topic Ledger (`daily_topic_ledger.json`)**: The 09:00 AI pipeline runs strictly in sequence (`AI Daily News → X Hotspot → AI Builder`), followed by `GitHub & HN` at 09:30. Each stage records published URLs, topics, and `x.com` status IDs so downstream bots avoid repeating identical news.
+- **Strict Fetch / Draft / Send Separation + Freshness Gates**: Running `claude_report.sh fetch` writes a clean, deterministic context snapshot to `logs/last_context.txt`; an AI agent drafts against `prompt*.md` into `logs/report_draft.txt`; `claude_report.sh send` enforces stale-draft mtime/date/identity gates, redacts secrets on error, pushes to Feishu, archives to Notion, and updates atomic locked dedup state.
+- **Zero-Race Cross-Bot Daily Topic Ledger (`daily_topic_ledger.json`)**: The 09:00 AI pipeline runs strictly in sequence (`1. AI Daily News → 2. X Hotspots & AI Builder → 3. GitHub & HN`) with `fcntl.flock` + `os.replace` atomic writes, eliminating wake-up races while normalizing `x.com`/`twitter.com`, HN `?id=`, and Reddit URLs.
 - **Anti-Hallucination Exa Enrichment (Optional, Equity Bots Only)**: For stock movers without RSS/telegraph coverage, `shared/bot_utils.py` batches up to 6 movers into a single Exa Agent check using a strict 3-state schema (`confirmed` / `absent` / `cannot_verify`)—only `confirmed` catalysts enter the context.
 - **Resilient Feishu Card 2.0 Delivery**: Controlled HTML whitelist (`<b>` and `<a href>` only), automatic balanced pagination under Feishu's ~20KB payload ceiling with `(n/N)` headers, and partial-send caching (`pending_messages.json`) for zero duplicate resend on retry.
 - **Idempotent Notion Archiving & Auto Fit-Width Tables**: Upserts by `(Date, Source, Type)` in place (preserving page URL & comments), converts dense market KPIs into 2-column Notion tables with automatic `fit-page-width` column sizing, falls back cleanly to `curl` on LibreSSL EOF errors, and ships with `shared/notion_reconcile.py` for offline backfill.

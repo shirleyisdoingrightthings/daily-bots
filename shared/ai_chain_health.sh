@@ -1,8 +1,8 @@
 #!/bin/bash
-# ai_chain_health.sh — AI 三合一流水线（产业日报 → X 热点 → AI Builder）串行体检
+# ai_chain_health.sh — AI 三合一流水线（产业日报 → X 热点 & AI Builder → GitHub & HN）串行体检
 #
-# 三个 Bot 共用同一个飞书 webhook 且由 Antigravity Sidecar `ai-daily`
-# 在每天 09:00 串行执行，本脚本在每日 10:00 按相同顺序串行做轻量化健康检查。
+# 三个 Bot 由 Antigravity Sidecar `ai-daily` 在每天 09:00 按顺序串行执行，
+# 本脚本在每日 10:00 按相同顺序串行做轻量化健康检查。
 
 set -u
 
@@ -10,8 +10,8 @@ BOTS_DIR="${BOTS_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 CHAIN=(
     "AI Daily News Bot"
-    "x-hotspot-bot"
     "ai-builder-bot"
+    "github-hn-bot"
 )
 
 BLOCK_TIMEOUT=${BLOCK_TIMEOUT:-300}

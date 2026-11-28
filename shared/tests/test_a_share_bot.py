@@ -48,6 +48,7 @@ class TestAShareTimeWindowsAndIsolation(unittest.TestCase):
             )
             with patch.object(asr, "BASE", tdir), \
                  patch.object(asr, "LOG_FILE", logs / "run.log"), \
+                 patch.object(asr, "write_log", lambda *a, **kw: None), \
                  patch.object(asr, "FETCH_META", logs / "fetch_meta.json"), \
                  patch.object(asr, "DRAFT_CN", logs / "report_cn.txt"), \
                  patch.object(asr, "FEISHU_WEBHOOK_CN", ""), \
@@ -57,6 +58,7 @@ class TestAShareTimeWindowsAndIsolation(unittest.TestCase):
 
             with patch.object(asr, "BASE", tdir), \
                  patch.object(asr, "LOG_FILE", logs / "run.log"), \
+                 patch.object(asr, "write_log", lambda *a, **kw: None), \
                  patch.object(asr, "FETCH_META", logs / "fetch_meta.json"), \
                  patch.object(asr, "DRAFT_CN", logs / "report_cn.txt"), \
                  patch.dict(os.environ, {"FEISHU_WEBHOOK_CN": "https://example.test/hook", "FORCE_RUN": "1"}):

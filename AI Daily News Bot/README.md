@@ -2,7 +2,7 @@
 
 > [← Back to Daily Bots Root README](../README.md)
 
-**Stage 1 of 3 in the daily `09:00 CST` AI intelligence pipeline.** Collects the past 24–48 hours of global AI models, compute infrastructure, policy, robotics, and commercial milestones, produces a fact-dense Chinese briefing, pushes to Feishu, archives to Notion, and seeds the cross-bot daily topic ledger for downstream bots.
+**Stage 1 of 3 in the daily `09:00 CST` AI intelligence pipeline.** Collects the past 24–48 hours of global AI models, compute infrastructure, policy, robotics, and commercial milestones, produces a fact-dense Chinese briefing (concise Chinese headlines + bold-lead facts + 3-day self-dedup), pushes to Feishu, archives to Notion, and seeds the cross-bot daily topic ledger for downstream bots.
 
 ---
 
@@ -63,6 +63,6 @@ bash "AI Daily News Bot/health_check.sh"
 ## Key Files & Environment Variables
 
 - `daily_report.py` — Deterministic fetch, filter, deliver, and ledger writer
-- `prompt.md` — Editorial spec (5-star to 3-star ordering, 30-second overview, single-paragraph dense `The Details`, controlled HTML tags)
+- `prompt.md` — Editorial spec (5-star to 3-star ordering, 30-second overview, ≤26-char Chinese headlines, bold-lead facts, 3-day self-dedup, controlled HTML tags)
 - `claude_report.sh` / `health_check.sh` / `auto_repair.sh` — Thin wrappers delegating to `../shared/*_base.sh`
-- **Env Vars**: `FEISHU_WEBHOOK` (required), `FEISHU_SECRET` (optional), `NOTION_ARCHIVE_API_KEY` & `NOTION_ARCHIVE_DATABASE_ID` (optional), `HTTPS_PROXY` (optional).
+- **Env Vars**: `FEISHU_WEBHOOK` (required), `NOTION_ARCHIVE_API_KEY` & `NOTION_ARCHIVE_DATABASE_ID` (optional), `HTTPS_PROXY` (optional).

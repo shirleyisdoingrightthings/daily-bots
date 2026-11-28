@@ -4,11 +4,12 @@ sources.py — GitHub Trending & Hacker News 早报的数据抓取层
 
 包含两个核心数据源：
 1. GitHub Trending（https://github.com/trending?since=daily 或 weekly）
-   - 解析榜单前 10 个仓库（owner/repo、简介、语言、总 Star、总 Fork、今日/本周新增 Star）
-   - 并发拉取各仓库 README 核心段落（自动过滤徽章图片与 HTML 噪音），供写稿模型准确理解项目定位与架构亮点。
-2. Hacker News 热榜 Top 8（Firebase top/best + Algolia 36h/front_page 综合热度分，候选池最多 12 条 + 外链正文 + 顶层高赞评论）
-   - 融合高赞与实时热议，为跨天重复或 09:00 前序 AI 日报已播条目预留候选递补池
-   - 并发抓取外链正文摘要（复用 shared/bot_utils.fetch_article_text）及 HN 评论区前 4 条核心评论。
+   - 解析全页（~25 个）仓库，过滤非 owner/repo 卡片后按新鲜度优先（🆕 未在近 30 天播过的新星优先，
+     全局榜新星不足时自动补抓 Python / TypeScript 趋势榜），彻底根治连续多日全员复读老面孔。
+   - 仅对新上榜仓库并发拉取 README 核心段落（全量剥离 HTML 标签与实体解码），节省请求并提高信息密度。
+2. Hacker News 热榜 Top 8（Firebase top/best + Algolia 36h/front_page 并发拉取 + 综合热度分）
+   - 仅对命中今日前序 AI 日报账本（URL 或 x_status_ids）的条目动态扩容候选池（最多 12 条）
+   - 并发抓取外链正文摘要（复用 shared/bot_utils.fetch_article_text）及按子回复热度重排的顶层评论。
 """
 
 from __future__ import annotations
@@ -24,19 +25,12 @@ from typing import Any
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
-from bot_utils import fetch_article_text
+from bot_utils import X_POST_RE, fetch_article_text
 from bot_utils import url_key as _base_url_key
 
 
 def url_key(url: str) -> str:
-    """去重键。2026-11-10 修复：共享层 url_key 会去掉 query，导致所有
-    news.ycombinator.com/item?id=XXX 讨论串都塌缩成同一个键，任何 HN 帖子都被误判
-    为「重复在榜」。HN 讨论串必须保留 id 参数；其余 URL 沿用共享层归一化规则。"""
-    if not url:
-        return ""
-    m = re.search(r"news\.ycombinator\.com/item\?id=(\d+)", url)
-    if m:
-        return f"https://news.ycombinator.com/item?id={m.group(1)}"
+    """统一复用共享层 url_key（已原生保留 HN ?id=、归一 x.com / https / www.）。"""
     return _base_url_key(url)
 
 
@@ -44,6 +38,9 @@ _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+_HTTP_SESSION = requests.Session()
+_HTTP_SESSION.headers.update({"User-Agent": _UA})
 
 _ARTICLE_RE = re.compile(r'<article\s+class="Box-row"[^>]*>(.*?)</article>', re.DOTALL)
 _H2_LINK_RE = re.compile(r'<h2\s+class="h3\s+lh-condensed"[^>]*>.*?<a\s+[^>]*href="(/[^"]+)"', re.DOTALL)
@@ -54,6 +51,30 @@ _FORKS_RE = re.compile(r'href="/[^/]+/[^/]+/forks"[^>]*>(.*?)</a>', re.DOTALL)
 _PERIOD_STARS_RE = re.compile(r'class="d-inline-block\s+float-sm-right"[^>]*>(.*?)</span>', re.DOTALL)
 _TAG_STRIP_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+_RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _get_with_retry(url: str, *, timeout: int = 25, retries: int = 2) -> requests.Response:
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            resp = _HTTP_SESSION.get(url, timeout=timeout)
+            if resp.status_code in _RETRY_STATUSES and attempt < retries:
+                retry_after = resp.headers.get("Retry-After")
+                delay = int(retry_after) if (retry_after and retry_after.isdigit()) else 2 * (attempt + 1)
+                time.sleep(min(delay, 10))
+                continue
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"GET failed: {url}")
 
 
 def _clean_text(raw: str) -> str:
@@ -64,25 +85,22 @@ def _clean_text(raw: str) -> str:
 
 
 def _clean_readme(md: str, max_chars: int = 1000) -> str:
-    """清洗 README.md，去掉徽章、HTML 块、纯链接行，保留核心文字说明。"""
+    """清洗 README.md，全量剥离 HTML 标签与注释、解码 HTML 实体、去掉徽章与空行。"""
     if not md:
         return ""
-    # 去掉 HTML 注释和常见居中小部件/图片标签
     md = re.sub(r"<!--.*?-->", " ", md, flags=re.DOTALL)
-    md = re.sub(r"<(p|div|table|picture|img|a|br|hr|h[1-6]|span|sup|sub)\b[^>]*>", " ", md, flags=re.IGNORECASE)
-    md = re.sub(r"</(p|div|table|picture|a|h[1-6]|span|sup|sub)>", " ", md, flags=re.IGNORECASE)
+    md = re.sub(r"(?is)<(script|style).*?</\1>", " ", md)
+    md = _TAG_STRIP_RE.sub(" ", md)
+    md = html.unescape(md)
     lines = []
     for raw_line in md.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        # 跳过纯徽章/图片行
-        if line.startswith("[![") or line.startswith("![") or line.startswith("<img"):
+        if line.startswith("[![") or line.startswith("!["):
             continue
-        # 跳过纯分隔线或表格对齐行
         if re.match(r"^[\-\=\|\:\s]+$", line):
             continue
-        # 将 Markdown 链接 [label](url) 简化为 label
         line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
         line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line)
         line = _WS_RE.sub(" ", line).strip()
@@ -99,7 +117,7 @@ def _fetch_repo_readme(repo: str, timeout: int = 8) -> str:
     for filename in ("README.md", "readme.md", "README.rst"):
         url = f"https://raw.githubusercontent.com/{repo}/HEAD/{filename}"
         try:
-            resp = requests.get(url, headers={"User-Agent": _UA}, timeout=timeout)
+            resp = _HTTP_SESSION.get(url, timeout=timeout)
             if resp.status_code == 200 and resp.text:
                 cleaned = _clean_readme(resp.text)
                 if cleaned:
@@ -109,27 +127,25 @@ def _fetch_repo_readme(repo: str, timeout: int = 8) -> str:
     return ""
 
 
-def fetch_github_trending(since: str = "daily", limit: int = 10,
-                          seen_history: dict[str, str] | None = None) -> dict[str, Any]:
-    """抓取 GitHub Trending（daily 或 weekly）并并发补充 README 摘要。"""
-    seen_history = seen_history or {}
-    url = f"https://github.com/trending?since={since}"
-    resp = requests.get(url, headers={"User-Agent": _UA}, timeout=25)
-    resp.raise_for_status()
-    raw_html = resp.text
-
-    articles = _ARTICLE_RE.findall(raw_html)
-    repos: list[dict[str, Any]] = []
-
-    for idx, block in enumerate(articles[:limit], 1):
+def _parse_trending_html(
+    raw_html: str,
+    seen_history: dict[str, str],
+    *,
+    source_tag: str = "",
+) -> list[dict[str, Any]]:
+    """解析单页 GitHub Trending HTML，先过滤非 owner/repo 卡片再连续编号。"""
+    articles = _ARTICLE_RE.findall(raw_html or "")
+    parsed: list[dict[str, Any]] = []
+    rank = 0
+    for block in articles:
         m_link = _H2_LINK_RE.search(block)
         if not m_link:
             continue
         rel_path = m_link.group(1).strip().strip("/")
-        # 过滤掉偶发的 sponsor 卡片或非 owner/repo 路径
         parts = [p.strip() for p in rel_path.split("/") if p.strip()]
-        if len(parts) != 2:
+        if len(parts) != 2 or parts[0].lower() in ("sponsors", "topics", "collections", "orgs", "marketplace", "apps", "features"):
             continue
+        rank += 1
         repo_name = f"{parts[0]}/{parts[1]}"
         repo_url = f"https://github.com/{repo_name}"
 
@@ -150,8 +166,8 @@ def fetch_github_trending(since: str = "daily", limit: int = 10,
 
         prev_date = seen_history.get(url_key(repo_url))
 
-        repos.append({
-            "rank": idx,
+        parsed.append({
+            "rank": rank,
             "repo": repo_name,
             "url": repo_url,
             "description": desc,
@@ -159,45 +175,106 @@ def fetch_github_trending(since: str = "daily", limit: int = 10,
             "total_stars": total_stars,
             "forks": forks,
             "period_stars": period_stars,
-            "prev_date": prev_date,  # 若之前已推送过，记录上次推送日期如 "11月08日"
+            "prev_date": prev_date,
+            "source_tag": source_tag,
             "readme_excerpt": "",
         })
+    return parsed
 
-    # 并发拉取 README 摘要
-    if repos:
+
+def fetch_github_trending(
+    since: str = "daily",
+    limit: int = 10,
+    seen_history: dict[str, str] | None = None,
+    *,
+    min_fresh: int = 5,
+    max_fresh: int = 8,
+) -> dict[str, Any]:
+    """抓取 GitHub Trending（daily 或 weekly）：全页解析 + 新星优先 + 语种分榜自动补盲。
+
+    1) 解析全局 Trending 全部 ~25 个仓库（不再截断前 10）；
+    2) 若全局榜中未在 seen_history 出现的新面孔不足 min_fresh，自动补抓 python / typescript 趋势榜；
+    3) 仅对新上榜仓库并发抓 README，避免浪费带宽重复拉取持续霸榜老面孔。"""
+    seen_history = seen_history or {}
+    url = f"https://github.com/trending?since={since}"
+    resp = _get_with_retry(url, timeout=25, retries=2)
+    main_repos = _parse_trending_html(resp.text, seen_history, source_tag="")
+
+    if not main_repos:
+        print(f"  ⚠️ GitHub Trending 解析到 0 个仓库（疑似反爬或 DOM 改版）：{url}", file=sys.stderr)
+        return {
+            "since": since,
+            "url": url,
+            "repos": [],
+            "fresh_repos": [],
+            "recurring_repos": [],
+            "raw_count": 0,
+        }
+
+    seen_repo_names = {r["repo"].lower() for r in main_repos}
+    fresh_repos = [r for r in main_repos if not r.get("prev_date")]
+    recurring_repos = [r for r in main_repos[:limit] if r.get("prev_date")]
+
+    # 全局榜新星不足时，自动补抓 Python / TypeScript 趋势榜挖掘新面孔
+    if len(fresh_repos) < min_fresh:
+        for lang_slug, tag in (("python", "Python 趋势补盲"), ("typescript", "TypeScript 趋势补盲")):
+            if len(fresh_repos) >= max_fresh:
+                break
+            sub_url = f"https://github.com/trending/{lang_slug}?since={since}"
+            try:
+                sub_resp = _get_with_retry(sub_url, timeout=20, retries=1)
+                sub_repos = _parse_trending_html(sub_resp.text, seen_history, source_tag=tag)
+                for sr in sub_repos:
+                    rk = sr["repo"].lower()
+                    if rk in seen_repo_names or sr.get("prev_date"):
+                        continue
+                    seen_repo_names.add(rk)
+                    fresh_repos.append(sr)
+                    if len(fresh_repos) >= max_fresh:
+                        break
+            except Exception as exc:
+                print(f"  [WARN] GitHub 补盲分榜 {lang_slug} 抓取失败：{exc}", file=sys.stderr)
+
+    fresh_repos = fresh_repos[:max_fresh]
+    for idx, r in enumerate(fresh_repos, 1):
+        r["rank"] = idx
+
+    # 仅对新面孔并发拉取 README（若当天实在一个新面孔都没有，才兜底拉取前 3 个熟面孔）
+    readme_targets = fresh_repos if fresh_repos else recurring_repos[:3]
+    if readme_targets:
         with ThreadPoolExecutor(max_workers=5) as pool:
-            futs = [(r, pool.submit(_fetch_repo_readme, r["repo"])) for r in repos]
+            futs = [(r, pool.submit(_fetch_repo_readme, r["repo"])) for r in readme_targets]
             for r, fut in futs:
                 try:
                     r["readme_excerpt"] = fut.result(timeout=12)
                 except Exception:
                     r["readme_excerpt"] = ""
 
+    combined = fresh_repos + recurring_repos
     return {
         "since": since,
         "url": url,
-        "repos": repos,
-        "raw_count": len(articles),
+        "repos": combined,
+        "fresh_repos": fresh_repos,
+        "recurring_repos": recurring_repos,
+        "raw_count": len(main_repos),
     }
 
 
 def _fetch_hn_item_details(item: dict[str, Any]) -> None:
-    """补充单条 HN 帖子的外链正文摘要 + 评论区高赞前 4 条核心观点。"""
+    """补充单条 HN 帖子的外链正文摘要 + 按子回复热度重排的前 4 条核心评论。"""
     oid = item["id"]
     ext_url = item.get("url", "")
 
-    # 1. 抓外链正文摘要（若是外部链接）
     if ext_url and not ext_url.startswith("https://news.ycombinator.com"):
         try:
             item["article_excerpt"] = fetch_article_text(ext_url, timeout=8, max_chars=1000, min_chars=120)
         except Exception:
             item["article_excerpt"] = ""
 
-    # 2. 抓 Algolia items/{id} 的顶层评论与正文（Ask HN / Show HN）
     try:
-        resp = requests.get(
+        resp = _HTTP_SESSION.get(
             f"https://hn.algolia.com/api/v1/items/{oid}",
-            headers={"User-Agent": _UA},
             timeout=10,
         )
         if resp.status_code == 200:
@@ -205,119 +282,138 @@ def _fetch_hn_item_details(item: dict[str, Any]) -> None:
             if not item.get("article_excerpt") and data.get("text"):
                 item["article_excerpt"] = _clean_text(data.get("text", ""))[:1000]
             children = data.get("children") or []
-            comments: list[str] = []
-            # Algolia 的顶层 children 默认按 HN 热度排列，取有实质内容的前 4 条
-            for ch in children:
+            scored_comments: list[tuple[int, int, str]] = []
+            for idx, ch in enumerate(children):
                 c_text = _clean_text(ch.get("text") or "")
                 author = ch.get("author") or "anon"
-                if len(c_text) >= 50:
-                    # 统计子回复数以辅助衡量讨论热度
-                    sub_replies = len(ch.get("children") or [])
-                    reply_tag = f"（{sub_replies} 条追评）" if sub_replies else ""
-                    comments.append(f"@{author}{reply_tag}：{c_text[:360]}")
-                if len(comments) >= 4:
-                    break
-            item["top_comments"] = comments
+                if len(c_text) < 50:
+                    continue
+                sub_replies = len(ch.get("children") or [])
+                reply_tag = f"（{sub_replies} 条追评）" if sub_replies else ""
+                # 综合排序：有追评的争议/高互动评论优先，其次保持原始靠前位置
+                weight = sub_replies * 100 + min(len(c_text), 300) // 10 - idx * 3
+                scored_comments.append((weight, idx, f"@{author}{reply_tag}：{c_text[:360]}"))
+            scored_comments.sort(key=lambda x: (-x[0], x[1]))
+            item["top_comments"] = [c[2] for c in scored_comments[:4]]
     except Exception:
         pass
 
 
-def fetch_hn_top8(window_h: int = 36, limit: int = 8,
-                  seen_history: dict[str, str] | None = None,
-                  today_ledger_urls: set[str] | None = None) -> dict[str, Any]:
-    """融合 Hacker News 的 Best（高分精选榜）与 Top（实时首页高讨论热榜），取综合热度前 8 名。"""
+def fetch_hn_top8(
+    window_h: int = 36,
+    limit: int = 8,
+    seen_history: dict[str, str] | None = None,
+    today_ledger_urls: set[str] | None = None,
+    today_ledger_x_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """并发融合 Hacker News 的 Best（高分精选榜）与 Top（实时首页高讨论热榜），取综合热度前 8 名。"""
     seen_history = seen_history or {}
     today_ledger_urls = today_ledger_urls or set()
+    today_ledger_x_ids = today_ledger_x_ids or set()
     cutoff = int(time.time()) - window_h * 3600
 
-    # 1. 先从 HN 官方 Firebase API 获取实时 Top 榜前 25 名与 Best 榜前 25 名的 ID 集合，标记榜单属性
     top_ids: set[str] = set()
     best_ids: set[str] = set()
-    try:
-        r_top = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=8)
-        if r_top.status_code == 200:
-            top_ids = {str(x) for x in (r_top.json() or [])[:25]}
-    except Exception:
-        pass
-    try:
-        r_best = requests.get("https://hacker-news.firebaseio.com/v0/beststories.json", timeout=8)
-        if r_best.status_code == 200:
-            best_ids = {str(x) for x in (r_best.json() or [])[:25]}
-    except Exception:
-        pass
+    algolia_hits: list[dict[str, Any]] = []
+
+    def _get_json(u: str, to: int):
+        r = _HTTP_SESSION.get(u, timeout=to)
+        r.raise_for_status()
+        return r.json()
+
+    api_tasks = {
+        "top": ("https://hacker-news.firebaseio.com/v0/topstories.json", 8),
+        "best": ("https://hacker-news.firebaseio.com/v0/beststories.json", 8),
+        "story": (f"https://hn.algolia.com/api/v1/search?tags=story&numericFilters=created_at_i>{cutoff}&hitsPerPage=30", 15),
+        "front": ("https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30", 15),
+    }
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {k: pool.submit(_get_json, u, to) for k, (u, to) in api_tasks.items()}
+        for k, fut in futs.items():
+            try:
+                data = fut.result(timeout=16)
+                if k == "top" and isinstance(data, list):
+                    top_ids = {str(x) for x in data[:25]}
+                elif k == "best" and isinstance(data, list):
+                    best_ids = {str(x) for x in data[:25]}
+                elif isinstance(data, dict):
+                    algolia_hits.extend(data.get("hits") or [])
+            except Exception as exc:
+                print(f"[sources] HN API 请求异常 ({k}): {exc}", file=sys.stderr)
 
     by_id: dict[str, dict[str, Any]] = {}
+    for h in algolia_hits:
+        oid = str(h.get("objectID") or "")
+        if not oid:
+            continue
+        created_i = int(h.get("created_at_i") or 0)
+        if created_i and created_i < int(time.time()) - 48 * 3600:
+            continue
+        pts = int(h.get("points") or 0)
+        n_comments = int(h.get("num_comments") or 0)
+        if oid not in by_id or pts > by_id[oid]["points"]:
+            hn_url = f"https://news.ycombinator.com/item?id={oid}"
+            ext_url = h.get("url") or hn_url
+            prev_date = (
+                seen_history.get(url_key(hn_url))
+                or seen_history.get(url_key(ext_url))
+            )
+            m_x = X_POST_RE.search(ext_url or "")
+            x_id_hit = bool(m_x and m_x.group(2) in today_ledger_x_ids)
+            in_today_ledger = (
+                url_key(ext_url) in today_ledger_urls
+                or url_key(hn_url) in today_ledger_urls
+                or x_id_hit
+            )
+            badges = []
+            if oid in best_ids:
+                badges.append("Best高赞")
+            if oid in top_ids:
+                badges.append("Top实时热议")
+            badge_str = "/".join(badges) if badges else "24h热榜"
 
-    urls = [
-        f"https://hn.algolia.com/api/v1/search?tags=story&numericFilters=created_at_i>{cutoff}&hitsPerPage=30",
-        "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30",
-    ]
-    for api_url in urls:
-        try:
-            resp = requests.get(api_url, headers={"User-Agent": _UA}, timeout=15)
-            resp.raise_for_status()
-            hits = resp.json().get("hits") or []
-            for h in hits:
-                oid = str(h.get("objectID") or "")
-                if not oid:
-                    continue
-                created_i = int(h.get("created_at_i") or 0)
-                if created_i and created_i < int(time.time()) - 48 * 3600:
-                    continue
-                pts = int(h.get("points") or 0)
-                n_comments = int(h.get("num_comments") or 0)
-                if oid not in by_id or pts > by_id[oid]["points"]:
-                    hn_url = f"https://news.ycombinator.com/item?id={oid}"
-                    ext_url = h.get("url") or hn_url
-                    prev_date = (
-                        seen_history.get(url_key(hn_url))
-                        or seen_history.get(url_key(ext_url))
-                    )
-                    in_today_ledger = (
-                        url_key(ext_url) in today_ledger_urls
-                        or url_key(hn_url) in today_ledger_urls
-                    )
-                    # 标记来自 Best 还是 Top 实时热议
-                    badges = []
-                    if oid in best_ids:
-                        badges.append("Best高赞")
-                    if oid in top_ids:
-                        badges.append("Top实时热议")
-                    badge_str = "/".join(badges) if badges else "24h热榜"
+            heat_score = pts + int(n_comments * 1.2) + (80 if oid in top_ids else 0) + (60 if oid in best_ids else 0)
 
-                    # 综合热度分：兼顾 Points 与 评论讨论激烈度（让 Top 榜高讨论度新帖也能入选）
-                    heat_score = pts + int(n_comments * 1.2) + (80 if oid in top_ids else 0) + (60 if oid in best_ids else 0)
+            by_id[oid] = {
+                "id": oid,
+                "title": (h.get("title") or "").strip(),
+                "url": ext_url,
+                "hn_url": hn_url,
+                "points": pts,
+                "num_comments": n_comments,
+                "badge": badge_str,
+                "heat_score": heat_score,
+                "author": h.get("author") or "",
+                "created_at": h.get("created_at") or "",
+                "prev_date": prev_date,
+                "in_today_ledger": in_today_ledger,
+                "article_excerpt": "",
+                "top_comments": [],
+            }
 
-                    by_id[oid] = {
-                        "id": oid,
-                        "title": (h.get("title") or "").strip(),
-                        "url": ext_url,
-                        "hn_url": hn_url,
-                        "points": pts,
-                        "num_comments": n_comments,
-                        "badge": badge_str,
-                        "heat_score": heat_score,
-                        "author": h.get("author") or "",
-                        "created_at": h.get("created_at") or "",
-                        "prev_date": prev_date,
-                        "in_today_ledger": in_today_ledger,
-                        "article_excerpt": "",
-                        "top_comments": [],
-                    }
-        except Exception as exc:
-            print(f"[sources] HN API 请求异常 ({api_url}): {exc}", file=sys.stderr)
+    # 外链去重：同一篇文章被二次提交上 HN 时只保留热度最高的那一条讨论串
+    deduped: list[dict[str, Any]] = []
+    seen_ext_keys: set[str] = set()
+    for it in sorted(by_id.values(), key=lambda x: x["heat_score"], reverse=True):
+        ek = url_key(it["url"])
+        if ek and not ek.startswith("https://news.ycombinator.com/item") and ek in seen_ext_keys:
+            continue
+        if ek:
+            seen_ext_keys.add(ek)
+        deduped.append(it)
 
-    sorted_items = sorted(by_id.values(), key=lambda x: x["heat_score"], reverse=True)
-    overlap_cnt = sum(1 for it in sorted_items[:limit] if it.get("prev_date") or it.get("in_today_ledger"))
-    fetch_cap = min(limit + overlap_cnt, 12)
-    top_items = sorted_items[:fetch_cap]
+    # 仅对命中今日前序 AI 账本的条目扩容递补候选池（跨天重复项保留名次不递补）
+    ledger_overlap_cnt = sum(1 for it in deduped[:limit] if it.get("in_today_ledger"))
+    fetch_cap = min(limit + ledger_overlap_cnt, 12)
+    top_items = deduped[:fetch_cap]
 
     if top_items:
         with ThreadPoolExecutor(max_workers=6) as pool:
             futs = [pool.submit(_fetch_hn_item_details, item) for item in top_items]
             for fut in futs:
                 try:
-                    fut.result(timeout=15)
+                    fut.result(timeout=18)
                 except Exception:
                     pass
 

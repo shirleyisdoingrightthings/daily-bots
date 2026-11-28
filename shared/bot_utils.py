@@ -41,12 +41,59 @@ import sys
 import html
 import json
 import time
+import fcntl
+import tempfile
 import functools
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 import feedparser
+
+_SECRET_URL_RE = re.compile(r"(/open-apis/bot/v2/hook/)[A-Za-z0-9_-]+")
+
+
+def redact_secrets(text: str) -> str:
+    """脱敏飞书 Webhook token 等敏感串，防止异常 traceback 写入日志或 changelog。"""
+    if not text:
+        return ""
+    return _SECRET_URL_RE.sub(r"\1***", str(text))
+
+
+def atomic_json_update(path, mutator, *, indent=None):
+    """使用独立 .lock 文件锁 + 临时文件 os.replace 原子更新 JSON 状态文件。
+
+    mutator(data) 接收已读取的 JSON 对象（不存在/损坏时为 {}），返回待写回的新对象。
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = p.parent / f".{p.name}.lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            new_data = mutator(data)
+            payload = json.dumps(new_data, ensure_ascii=False, indent=indent)
+            fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as tmp_fh:
+                    tmp_fh.write(payload)
+                    tmp_fh.flush()
+                    os.fsync(tmp_fh.fileno())
+                os.replace(tmp_name, p)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+            return new_data
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 # ───────────────────────────────────────────────
@@ -136,7 +183,7 @@ def fetch_rss(feed_url: str, limit: int = 10, timeout: int = 30,
             last_exc = exc
             if attempt < retries:
                 time.sleep(3 * (attempt + 1))
-    print(f"[bot_utils] fetch_rss 失败：{feed_url} → {last_exc}")
+    print(f"[bot_utils] fetch_rss 失败：{feed_url} → {last_exc}", file=sys.stderr)
     return []
 
 
@@ -237,21 +284,61 @@ def _article_from_paragraphs(raw_html: str) -> str:
     return " ".join(paras).strip()
 
 
+_ARTICLE_MAX_BYTES = 2 * 1024 * 1024  # 2MB 上限，避免下载巨型 PDF/二进制文件
+_ARTICLE_ALLOWED_CT = ("text/html", "application/xhtml+xml", "text/plain")
+
+
+def _decode_http_bytes(raw_bytes: bytes, content_type: str = "", resp_encoding: str | None = None) -> str:
+    """稳健解码网页字节：优先响应头显式非 ISO-8859-1 编码，其次 UTF-8，最后回退 chardet/apparent。"""
+    if not raw_bytes:
+        return ""
+    m_cs = re.search(r"charset\s*=\s*['\"]?([A-Za-z0-9._-]+)", content_type or "", re.I)
+    if m_cs:
+        enc = m_cs.group(1).strip()
+        try:
+            return raw_bytes.decode(enc)
+        except Exception:
+            pass
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    if resp_encoding and resp_encoding.lower() not in ("iso-8859-1", "latin-1", "latin1"):
+        try:
+            return raw_bytes.decode(resp_encoding, errors="replace")
+        except Exception:
+            pass
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
 def fetch_article_text(url: str, timeout: int = 10,
                        max_chars: int = 1800, min_chars: int = 300) -> str:
-    """best-effort 抓文章正文；失败/被墙/正文过短一律返回 ""（调用方回退 RSS 摘要）。"""
+    """best-effort 抓文章正文；失败/被墙/非 HTML/超大文件/正文过短一律返回 ""（调用方回退 RSS 摘要）。"""
     if not url:
         return ""
     try:
-        resp = requests.get(
+        with requests.get(
             url,
             headers={"User-Agent": _ARTICLE_UA,
                      "Accept-Language": "en-US,en;q=0.9"},
             timeout=timeout,
-        )
-        if resp.status_code != 200:
-            return ""
-        raw = resp.text
+            stream=True,
+        ) as resp:
+            if resp.status_code != 200:
+                return ""
+            ct = (resp.headers.get("Content-Type") or "").lower()
+            if ct and not any(allowed in ct for allowed in _ARTICLE_ALLOWED_CT):
+                return ""
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= _ARTICLE_MAX_BYTES:
+                    break
+            raw = _decode_http_bytes(b"".join(chunks), ct, resp.encoding)
     except Exception:
         return ""
 
@@ -277,16 +364,51 @@ def fetch_article_text(url: str, timeout: int = 10,
 SENT_URLS_KEEP_DAYS = 7
 
 _HREF_RE = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+_URL_KEY_X_RE = re.compile(
+    r"https?://(?:(?:www|mobile)\.)?(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/(\d+)",
+    re.IGNORECASE,
+)
+_URL_KEY_REDDIT_RE = re.compile(
+    r"https?://(?:(?:www|old|new|np)\.)?reddit\.com/r/([A-Za-z0-9_]+)/comments/([A-Za-z0-9]+)",
+    re.IGNORECASE,
+)
 
 
 def url_key(url: str) -> str:
-    """归一化 URL 作为去重键：小写、去 query/fragment、去尾斜杠。
-
-    RSS 里同一篇文章的链接常带 utm_* 参数，且不同源指向同一文章时参数各异，
-    所以只用 scheme+host+path 作为身份。"""
+    """归一化 URL 作为跨源/跨天去重键：
+    - 统一 http → https、小写 host、剥离 www./old./mobile.；
+    - twitter.com ↔ x.com status 统一为 https://x.com/<user>/status/<id>；
+    - Reddit 帖子归一至 https://reddit.com/r/<sub>/comments/<id>；
+    - 保留 HN ?id= 与 YouTube ?v= 等身份参数，其余剥离 query/fragment/尾斜杠。"""
     if not url:
         return ""
-    u = url.strip().split("#", 1)[0].split("?", 1)[0]
+    raw = url.strip()
+    m_x = _URL_KEY_X_RE.search(raw)
+    if m_x:
+        return f"https://x.com/{m_x.group(1).lower()}/status/{m_x.group(2)}"
+    m_rd = _URL_KEY_REDDIT_RE.search(raw)
+    if m_rd:
+        return f"https://reddit.com/r/{m_rd.group(1).lower()}/comments/{m_rd.group(2).lower()}"
+    try:
+        parts = urlsplit(raw)
+        scheme = "https" if parts.scheme.lower() in ("http", "https") else parts.scheme.lower()
+        host = parts.netloc.lower()
+        for prefix in ("www.", "old.", "mobile.", "m."):
+            if host.startswith(prefix):
+                host = host[len(prefix):]
+                break
+        path = parts.path.rstrip("/").lower()
+        qs_keep = []
+        if host == "news.ycombinator.com" and path == "/item":
+            qs_keep = [(k.lower(), v) for k, v in parse_qsl(parts.query) if k.lower() == "id" and v]
+        elif host == "youtube.com" and path == "/watch":
+            qs_keep = [(k.lower(), v) for k, v in parse_qsl(parts.query) if k.lower() == "v" and v]
+        query = urlencode(qs_keep) if qs_keep else ""
+        if scheme and host:
+            return urlunsplit((scheme, host, path, query, ""))
+    except Exception:
+        pass
+    u = raw.split("#", 1)[0].split("?", 1)[0]
     return u.rstrip("/").lower()
 
 
@@ -299,36 +421,38 @@ def load_sent_urls(path, keep_days: int = SENT_URLS_KEEP_DAYS) -> set[str]:
     if not isinstance(data, dict):
         return set()
     cutoff = _days_ago_str(keep_days)
-    return {k for k, d in data.items() if isinstance(d, str) and d >= cutoff}
+    return {url_key(k) for k, d in data.items() if isinstance(d, str) and d >= cutoff and url_key(k)}
 
 
 def record_sent_urls(path, urls, keep_days: int = SENT_URLS_KEEP_DAYS) -> int:
-    """把本次实际推送的 URL 记入档案并裁掉过期条目，返回归档总量。
+    """把本次实际推送的 URL 记入档案并裁掉过期条目，返回归档总量（加锁原子写入）。
 
     写档失败只告警不抛错——去重是增强项，不能让它把已经发成功的流程带崩。"""
     p = Path(path)
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+    today = datetime.now().strftime("%Y-%m-%d")
+    cutoff = _days_ago_str(keep_days)
+
+    def _mutate(data):
         if not isinstance(data, dict):
             data = {}
-    except Exception:
-        data = {}
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    for u in urls:
-        k = url_key(u)
-        if k:
-            data[k] = today
-
-    cutoff = _days_ago_str(keep_days)
-    data = {k: d for k, d in data.items() if isinstance(d, str) and d >= cutoff}
+        cleaned = {}
+        for k, d in data.items():
+            if isinstance(d, str) and d >= cutoff:
+                nk = url_key(k)
+                if nk:
+                    cleaned[nk] = max(cleaned.get(nk, ""), d)
+        for u in urls:
+            k = url_key(u)
+            if k:
+                cleaned[k] = today
+        return cleaned
 
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, ensure_ascii=False, indent=0), encoding="utf-8")
+        saved = atomic_json_update(p, _mutate, indent=0)
+        return len(saved)
     except Exception as e:
-        print(f"[WARN] sent_urls 写入失败: {e}")
-    return len(data)
+        print(f"[WARN] sent_urls 写入失败: {e}", file=sys.stderr)
+        return 0
 
 
 def _days_ago_str(days: int) -> str:
@@ -472,10 +596,17 @@ def html_to_lark_md(text: str) -> list:
     href 只认 http/https，其余（javascript: 之类）连同标签一起降级成纯文本。"""
     lines = []
     for line in (text or "").split("\n"):
-        # 预处理：修复 <b>1. <a href="...">repo</a></b> 结构，避免 <b> 与 <a> 嵌套时链接失去加粗
+        # 预处理 1：修复 <b>1. <a href="...">repo</a></b> 结构，避免 <b> 与 <a> 嵌套时链接失去加粗
         line = re.sub(
             r"<b>(\d+\.)\s*(<a\s+[^>]+>)(?:<b>)?(.*?)(?:</b>)?</a>\s*</b>",
             r"<b>\1</b> \2<b>\3</b></a>",
+            line,
+            flags=re.I,
+        )
+        # 预处理 2：修复无编号的 <b><a href="...">Title</a></b> 结构，保留加粗
+        line = re.sub(
+            r"<b>\s*(<a\s+[^>]+>)(?:<b>)?(.*?)(?:</b>)?</a>\s*</b>",
+            r"\1<b>\2</b></a>",
             line,
             flags=re.I,
         )
@@ -504,9 +635,10 @@ def html_to_lark_md(text: str) -> list:
 
         # 关键防护 3：全局飞书排版美学与防断流引擎（解决大板块间隔、条目归属性与条目内紧凑提行）
         _SECTION_HEADERS = (
-            "🔥 今日领涨", "🔥 早盘领涨", "🔥 领涨", "🔥 持续霸榜",
+            "🔥 今日领涨", "🔥 早盘领涨", "🔥 领涨", "🔥 持续霸榜", "🔁 持续霸榜",
             "❄️ 今日领跌", "❄️ 早盘领跌", "❄️ 领跌",
-            "⚡ 焦点异动",
+            "⚡ 焦点异动", "⚡ 高赞短讯雷达", "⚡ 短讯雷达", "🔧 工程快讯",
+            "🗣️ Reddit 实测与吐槽", "📎 主流媒体同期在报",
             "🔭 盘面核心叙事", "🔭 盘面核心定性", "🔭 盘前核心定性", "🔭 早盘核心叙事", "🔭 核心叙事",
             "🎯 决策仪表盘", "🎯 交易台风控", "🎯 早盘交易台风控", "🎯 早盘决策仪表盘", "🎯 港股早盘决策仪表盘", "🎯 午间决策仪表盘",
             "🍰 AI 自选股明细",
@@ -533,16 +665,16 @@ def html_to_lark_md(text: str) -> list:
             "🍰 **AI 自选股", "🍰 AI 自选股",
         )
         _ITEM_INTERNAL_PREFIXES = (
-            "🏷️", "🛠️", "Original:", "⭐",
+            "🏷️", "🛠️", "👤", "Original:", "⭐",
             "- **它是干嘛的", "- **个人 Build", "- **个人 build",
-            "- **这帖在聊啥", "- **评论区交锋", "- **评论区热议", "- **核心要点",
+            "- **这帖在聊啥", "- **评论区交锋", "- **评论区热议", "- **评论区在吵啥", "- **评论区亮点", "- **工程落地启发", "- **核心要点",
             "- **板块内领涨", "- **板块内涨幅", "- **板块内领跌", "- **板块内跌幅",
             "- **领涨原因", "- **领跌原因", "- **领涨 Top", "- **领跌 Top", "- **驱动催化",
             "- **信号灯状态", "- **信号灯与 Regime", "- **早盘信号灯", "- **午间信号灯",
             "- **⚖️", "- **📏", "- **👀", "- **🚨", "- **💡 分析师", "- **💡 策略师",
         )
         _BREAK_PREFIXES = (
-            "原帖：", "原推：", "长文：", "**素材**：", "📎 **主流媒体", "📈 本周数字", "📄 The Details"
+            "原帖：", "原推：", "长文：", "**素材**：", "**📎 主流媒体", "📈 本周数字", "📄 The Details"
         )
 
         clean_curr = res_line.lstrip("*# ").strip()
@@ -696,22 +828,29 @@ def _feishu_send_card(webhook: str, md: str) -> None:
     # 手动序列化：ensure_ascii=False 让汉字按 UTF-8 占 3 字节而不是 \uXXXX 的 6 字节，
     # 与分页的字节预算保持同一口径
     body = json.dumps(_card_payload(md), ensure_ascii=False).encode("utf-8")
-    resp = _FEISHU_SESSION.post(
-        webhook, data=body,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        timeout=30,
-    )
+    try:
+        resp = _FEISHU_SESSION.post(
+            webhook, data=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise requests.RequestException(redact_secrets(str(exc))) from None
     if not resp.ok:
-        raise requests.RequestException(f"飞书 HTTP {resp.status_code}: {resp.text[:300]}")
+        msg = redact_secrets(f"飞书 HTTP {resp.status_code}: {resp.text[:300]}")
+        # 仅 429 / 5xx 属于瞬时可重试错误；其余 4xx 直接抛 ValueError 避免空耗 30s 重试
+        if resp.status_code == 429 or resp.status_code >= 500:
+            raise requests.RequestException(msg)
+        raise ValueError(msg)
     # 飞书失败时照样返回 HTTP 200，成败只看响应体里的 code/StatusCode
     try:
         data = resp.json()
     except Exception:
-        raise requests.RequestException(f"飞书返回非 JSON：{resp.text[:300]}")
+        raise requests.RequestException(redact_secrets(f"飞书返回非 JSON：{resp.text[:300]}"))
     code = data.get("code", data.get("StatusCode", 0))
     if code not in (0, "0"):
-        msg = data.get("msg") or data.get("StatusMessage") or resp.text[:300]
-        raise requests.RequestException(f"飞书返回错误 code={code}：{msg}")
+        msg = redact_secrets(data.get("msg") or data.get("StatusMessage") or resp.text[:300])
+        raise ValueError(f"飞书返回错误 code={code}：{msg}")
 
 
 def send_feishu(text: str, webhook: str = "") -> int:
@@ -747,29 +886,24 @@ def send_feishu(text: str, webhook: str = "") -> int:
 # 避免两处各加一次导致天数翻倍。
 
 def update_zero_streak(path, zero_sources, all_sources, threshold: int = 3) -> dict:
-    """更新各源连续零产天数，返回达到阈值的 {源: 天数}（建议移除的源）。
+    """更新各源连续零产天数，返回达到阈值的 {源: 天数}（建议移除的源，加锁原子写）。
 
     zero_sources 里的源天数 +1；本次有产出的源清零并移出档案。"""
     p = Path(path)
-    try:
-        streak = json.loads(p.read_text(encoding="utf-8"))
+    zero = set(zero_sources)
+
+    def _mutate(streak):
         if not isinstance(streak, dict):
             streak = {}
-    except Exception:
-        streak = {}
-
-    zero = set(zero_sources)
-    for s in zero:
-        streak[s] = int(streak.get(s, 0)) + 1
-    # 只保留本次仍然零产的源：有产出的清零，已从配置里删掉的也随之消失
-    # （zero_sources 必然是 all_sources 的子集，故一个判断就够）
-    streak = {s: n for s, n in streak.items() if s in zero}
+        for s in zero:
+            streak[s] = int(streak.get(s, 0)) + 1
+        return {s: n for s, n in streak.items() if s in zero}
 
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(streak, ensure_ascii=False), encoding="utf-8")
+        streak = atomic_json_update(p, _mutate)
     except Exception as e:
-        print(f"[WARN] zero_streak 写入失败: {e}")
+        print(f"[WARN] zero_streak 写入失败: {e}", file=sys.stderr)
+        streak = {s: 1 for s in zero}
 
     return {s: n for s, n in sorted(streak.items()) if n >= threshold}
 
@@ -784,8 +918,9 @@ def update_zero_streak(path, zero_sources, all_sources, threshold: int = 3) -> d
 # 策略：先试配置端口；不通则依次探测候选端口，命中即改用并告警。
 # 探测用 gstatic 的 204 端点（轻量、无内容、境外可达性可靠）。
 
-# 探测顺序即优先级：优先 1082，其次 12450（已移除 7897）。
-PROXY_CANDIDATES = ("1082", "12450")
+# 探测顺序即优先级：优先读取 PROXY_CANDIDATES 环境变量（逗号分隔端口），缺省 1082 → 12450。
+_env_proxy_cands = [p.strip() for p in os.getenv("PROXY_CANDIDATES", "").split(",") if p.strip()]
+PROXY_CANDIDATES = tuple(_env_proxy_cands) if _env_proxy_cands else ("1082", "12450")
 _PROBE_URL = "https://www.gstatic.com/generate_204"
 
 
@@ -831,12 +966,12 @@ def resolve_proxy(configured: str | None, candidates=PROXY_CANDIDATES,
         if _probe(alt, timeout):
             switched = (port != cur_port)
             if switched:
-                print(f"[bot_utils] 已按优先级自动选用代理 {alt}（原配置 {configured}）")
+                print(f"[bot_utils] 已按优先级自动选用代理 {alt}（原配置 {configured}）", file=sys.stderr)
             return alt, switched
 
     # 本地代理端口均不通时，尝试 TUN 模式 / 全局直连兜底
     if _probe(None, timeout):
-        print(f"[bot_utils] 本地代理端口（{', '.join(ports_to_try)}）均不通，但直连(TUN模式)可达，已自动切换为直连")
+        print(f"[bot_utils] 本地代理端口（{', '.join(ports_to_try)}）均不通，但直连(TUN模式)可达，已自动切换为直连", file=sys.stderr)
         return "", True
 
     return None, False
@@ -862,13 +997,14 @@ def make_logger(log_file, jsonl_file):
     log_file, jsonl_file = Path(log_file), Path(jsonl_file)
 
     def write_log(status: str, message: str, metrics: dict = None) -> None:
+        safe_msg = redact_secrets(message)
         ts   = datetime.now().strftime("%Y-%m-%d %H:%M")
-        line = f"{ts}  [{status}]  {message}\n"
+        line = f"{ts}  [{status}]  {safe_msg}\n"
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(line)
         print(line, end="")
         if metrics:
-            record = {"ts": ts, "status": status, "msg": message, **metrics}
+            record = {"ts": ts, "status": status, "msg": safe_msg, **metrics}
             with open(jsonl_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -1025,14 +1161,80 @@ def archive_and_sync_notion(
     return meta
 
 
+def validate_draft_freshness_and_identity(
+    draft_path: Path,
+    report_text: str,
+    *,
+    fetch_meta_path: Path | None = None,
+    webhook: str = "",
+    expected_title_markers: tuple[str, ...] = (),
+    require_hrefs: bool = True,
+) -> tuple[bool, str]:
+    """发稿前硬闸门：校验 webhook 非空、草稿新鲜度（mtime >= fetch_meta 且日期匹配）、标题身份与基础链接。
+
+    FORCE_RUN=1 时跳过 mtime 与跨日日期拦截（允许人工重发历史稿），但仍校验 webhook 与内容结构。
+    """
+    hook = (webhook or os.getenv(FEISHU_WEBHOOK_ENV, "")).strip()
+    if not hook.startswith("http"):
+        return False, f"未配置飞书 webhook（环境变量 {FEISHU_WEBHOOK_ENV}），拒绝发送"
+
+    force = os.getenv("FORCE_RUN", "").strip() == "1"
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    meta_date = ""
+
+    if fetch_meta_path and Path(fetch_meta_path).exists():
+        meta_p = Path(fetch_meta_path)
+        try:
+            meta_obj = json.loads(meta_p.read_text(encoding="utf-8"))
+            meta_date = str(meta_obj.get("fetch_date") or meta_obj.get("date_str") or "").strip()
+        except Exception:
+            meta_obj = {}
+        if not force:
+            try:
+                draft_mtime = Path(draft_path).stat().st_mtime
+                meta_mtime = meta_p.stat().st_mtime
+                if draft_mtime + 2.0 < meta_mtime:
+                    return False, (
+                        f"草稿文件未更新（mtime 早于本次 fetch_meta.json），疑似残留旧稿，拒绝重发"
+                    )
+            except OSError:
+                pass
+
+    if not force:
+        doc_date = extract_report_date(report_text)
+        expected_date = meta_date or today_iso
+        if doc_date and expected_date and doc_date != expected_date:
+            return False, f"草稿标题日期（{doc_date}）与本次抓取日期（{expected_date}）不符，疑似旧稿，拒绝发送"
+        if not meta_date:
+            try:
+                draft_day = datetime.fromtimestamp(Path(draft_path).stat().st_mtime).strftime("%Y-%m-%d")
+                if draft_day != today_iso:
+                    return False, f"草稿修改日期为 {draft_day}（非今日 {today_iso}），疑似旧稿，拒绝发送"
+            except OSError:
+                pass
+
+    if expected_title_markers:
+        first_chunk = "\n".join((report_text or "").splitlines()[:5])
+        if not any(m in first_chunk for m in expected_title_markers):
+            return False, f"草稿首部缺少目标栏目身份标识（期望包含 {' / '.join(expected_title_markers)}），拒绝发送"
+
+    if require_hrefs and not extract_hrefs(report_text):
+        return False, "稿件里没有任何 <a href> 链接，拒绝发送"
+
+    return True, ""
+
+
 def send_x_linked_report(draft_path, *, log_file, cache_file, fetch_meta, sent_urls,
                          webhook, write_log, save_pending,
                          link_label: str = "原帖",
+                         source_name: str | None = None,
+                         expected_title_markers: tuple[str, ...] = (),
+                         record_all_hrefs: bool = False,
                          date_str: str | None = None) -> int:
-    """读取 Claude 写好的单份稿件 → 原帖闸门 → 推飞书 → 归档去重 → 写日志。
+    """读取写好的单份稿件 → 新鲜度与原帖闸门 → 推飞书 → 归档去重 → 写日志。
 
-    link_label 只影响日志与 stderr 的措辞（x-hotspot 说「原帖」、builder 说「原推」），
-    不参与任何判定。返回值即进程退出码：0 成功或当天已跑过，1 失败。
+    source_name 显式指定 Notion 信源与账本键名；留空时兼容旧调用回退 link_label。
+    返回值即进程退出码：0 成功或当天已跑过，1 失败。
     """
     t0 = time.time()
 
@@ -1051,6 +1253,18 @@ def send_x_linked_report(draft_path, *, log_file, cache_file, fetch_meta, sent_u
 
     report = sanitize_html(report)
 
+    ok_gate, gate_err = validate_draft_freshness_and_identity(
+        draft_path,
+        report,
+        fetch_meta_path=Path(fetch_meta),
+        webhook=webhook,
+        expected_title_markers=expected_title_markers,
+        require_hrefs=True,
+    )
+    if not ok_gate:
+        write_log("FAIL", gate_err)
+        return 1
+
     # 出稿硬约束：一份没有原帖直链的播报等于二手转述，宁可不发也不发一份只有
     # 转述的。这条闸门是这两个 bot 存在的理由，别为了"至少发出去"而放宽。
     hrefs = extract_hrefs(report)
@@ -1062,7 +1276,13 @@ def send_x_linked_report(draft_path, *, log_file, cache_file, fetch_meta, sent_u
 
     save_pending([report])
     print("📨 推送到飞书...", file=sys.stderr)
-    sent = send_feishu(report, webhook)
+    try:
+        sent = send_feishu(report, webhook)
+    except Exception as exc:
+        err = redact_secrets(f"飞书推送失败：{exc}")
+        write_log("FAIL", err)
+        print(f"  ✗ {err}", file=sys.stderr)
+        return 1
     print(f"  ✓ 推送成功（{sent} 条）", file=sys.stderr)
     Path(cache_file).unlink(missing_ok=True)
 
@@ -1079,22 +1299,23 @@ def send_x_linked_report(draft_path, *, log_file, cache_file, fetch_meta, sent_u
     )
 
     # 自动同步归档到 Notion「每日情报归档与决策看板」数据库，并保留本地日期归档
-    source_name = "🐦 X 热点播报" if link_label == "原帖" else "🛠️ AI Builder"
+    resolved_source = source_name or ("🐦 X 热点播报" if link_label == "原帖" else "🛠️ AI Builder")
     notion_meta = archive_and_sync_notion(
         report,
-        source_name,
+        resolved_source,
         date_str=doc_date,
         archive_dir=draft_path.parent / "archive",
         archive_filename=f"{doc_date}.txt",
     )
     notion_tag = " | Notion ✓" if notion_meta.get("notion_ok") else " | Notion ⚠️"
 
-    # 把 x.com 原帖、reddit.com 原帖以及 fetch_meta 记录的主源期刊链接（issue_urls）
-    # 一并记入去重档案，确保同一期 AINews 或跨天热门 Reddit 帖不会被重复播报。
+    # 把 x.com 原帖、reddit.com 原帖、主源期刊链接（issue_urls）以及可选的全部正文外链
+    # 一并记入去重档案（record_all_hrefs=True 供 AI Builder 拦截同外链 ICYMI 二次转发）。
     reddit_links = [u for u in hrefs if REDDIT_POST_RE.search(u)]
     issue_urls = meta.get("metrics", {}).get("issue_urls", []) or []
-    total = record_sent_urls(sent_urls, x_links + reddit_links + list(issue_urls))
-    record_daily_ledger(source_name, report, hrefs, date_str=doc_date)
+    urls_to_record = (list(hrefs) if record_all_hrefs else (x_links + reddit_links)) + list(issue_urls)
+    total = record_sent_urls(sent_urls, urls_to_record)
+    record_daily_ledger(resolved_source, report, hrefs, date_str=doc_date)
     print(f"  ✓ 已归档 {len(x_links)} 条{link_label}链接"
           f"{f' + {len(reddit_links)} 条 Reddit 链接' if reddit_links else ''}"
           f"{f' + {len(issue_urls)} 条期刊链接' if issue_urls else ''}用于跨天去重（档案共 {total} 条）",
@@ -1114,10 +1335,9 @@ def send_x_linked_report(draft_path, *, log_file, cache_file, fetch_meta, sent_u
 # ───────────────────────────────────────────────
 # 14) 跨 Bot 当日去重账本 (daily_topic_ledger.json)
 # ───────────────────────────────────────────────
-# 服务于 09:00 三合一串行流水线（1. AI 产业日报 → 2. X 热点播报 → 3. AI Builder）
-# 及 09:30（4. GitHub Trending & Hacker News）：
+# 服务于 09:00 四合一串行流水线（1. AI 产业日报 → 2. X & Reddit → 3. AI Builder → 4. GitHub & HN）：
 # 前序 Bot 在 send / archive-only 成功后将当日已播标题、外链 URL、x.com status ID
-# 写入 shared/logs/daily_topic_ledger.json；后序 Bot 在 fetch 阶段自动读取，
+# 原子加锁写入 shared/logs/daily_topic_ledger.json；后序 Bot 在 fetch 阶段自动读取，
 # 实现 URL/推文级硬过滤与标题级上下文提醒。
 
 DAILY_LEDGER_FILE = Path(__file__).resolve().parent / "logs" / "daily_topic_ledger.json"
@@ -1130,22 +1350,26 @@ def extract_report_headlines(report_text: str) -> list[str]:
         return []
     headlines: list[str] = []
     skip_prefixes = (
-        "📋", "🔥", "🛠", "🛠️", "🚀", "⚡", "📎", "🗣️", "素材", "数据来源",
-        "一、", "二、", "今日", "本周",
+        "📋", "🔥", "🛠", "🛠️", "🚀", "⚡", "📎", "🗣️", "🔧", "👤", "素材", "数据来源",
+        "一、", "二、", "今日", "本周", "Original:",
     )
     for raw_line in report_text.splitlines():
         line = raw_line.strip()
         if not line or "<b>" not in line:
             continue
-        if line.startswith(("原推：", "原帖：", "长文：", "- ", "• ")):
+        if line.startswith(("原推：", "原帖：", "长文：", "- ", "• ", "· ")):
             continue
         plain = html.unescape(re.sub(r"<[^>]+>", "", line)).strip()
-        if not plain or len(plain) > 90:
+        if not plain or len(plain) > 180:
             continue
         if any(plain.startswith(p) for p in skip_prefixes):
             continue
-        if re.match(r"^\d+\.\s+\S+", plain) or ("<a href=" in line and "<b>" in line):
-            headlines.append(plain)
+        if (
+            re.match(r"^\d+\.\s+\S+", plain)
+            or re.match(r"^\[r/[A-Za-z0-9_]+\]\s+\S+", plain)
+            or ("<a href=" in line and "<b>" in line)
+        ):
+            headlines.append(plain[:140] + ("…" if len(plain) > 140 else ""))
     return headlines
 
 
@@ -1157,7 +1381,7 @@ def record_daily_ledger(
     date_str: str | None = None,
     ledger_path: Path = DAILY_LEDGER_FILE,
 ) -> None:
-    """将某 Bot 当日已发布/归档的稿件条目与 URL 记入共享当日账本。"""
+    """将某 Bot 当日已发布/归档的稿件条目与 URL 原子加锁记入共享当日账本。"""
     try:
         doc_date = (
             date_str
@@ -1176,29 +1400,22 @@ def record_daily_ledger(
                 x_ids.add(m.group(2))
 
         headlines = extract_report_headlines(report_text)
-
-        data: dict = {}
-        if ledger_path.exists():
-            try:
-                raw = json.loads(ledger_path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    data = raw
-            except Exception:
-                data = {}
-
         cutoff = _days_ago_str(DAILY_LEDGER_KEEP_DAYS)
-        data = {d: v for d, v in data.items() if isinstance(d, str) and d >= cutoff and isinstance(v, dict)}
 
-        day_bucket = data.setdefault(doc_date, {})
-        day_bucket[bot_name] = {
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "headlines": headlines,
-            "urls": sorted(norm_urls),
-            "x_status_ids": sorted(x_ids),
-        }
+        def _mutate(data):
+            if not isinstance(data, dict):
+                data = {}
+            cleaned = {d: v for d, v in data.items() if isinstance(d, str) and d >= cutoff and isinstance(v, dict)}
+            day_bucket = cleaned.setdefault(doc_date, {})
+            day_bucket[bot_name] = {
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "headlines": headlines,
+                "urls": sorted(norm_urls),
+                "x_status_ids": sorted(x_ids),
+            }
+            return cleaned
 
-        ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        ledger_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_json_update(ledger_path, _mutate, indent=2)
     except Exception as e:
         print(f"  [WARN] 写入跨 Bot 账本失败（不影响主流程）: {e}", file=sys.stderr)
 
@@ -1207,6 +1424,7 @@ def load_daily_ledger(
     date_str: str | None = None,
     *,
     exclude_bot: str | None = None,
+    exclude_bots: set[str] | tuple[str, ...] | None = None,
     ledger_path: Path = DAILY_LEDGER_FILE,
 ) -> dict:
     """读取指定日期（默认今天或 REPORT_DATE）前序 Bot 已播出的 URL 集合、X status ID 集合与标题明细。"""
@@ -1224,15 +1442,19 @@ def load_daily_ledger(
     if not isinstance(day_bucket, dict):
         return empty
 
+    excluded = set(exclude_bots or ())
+    if exclude_bot:
+        excluded.add(exclude_bot)
+
     urls: set[str] = set()
     x_ids: set[str] = set()
     entries: list[dict] = []
     for bot_name, info in day_bucket.items():
-        if exclude_bot and bot_name == exclude_bot:
+        if bot_name in excluded:
             continue
         if not isinstance(info, dict):
             continue
-        b_urls = [u for u in (info.get("urls") or []) if isinstance(u, str)]
+        b_urls = [url_key(u) for u in (info.get("urls") or []) if isinstance(u, str) and url_key(u)]
         b_xids = [x for x in (info.get("x_status_ids") or []) if isinstance(x, str)]
         b_heads = [h for h in (info.get("headlines") or []) if isinstance(h, str)]
         urls.update(b_urls)
@@ -1251,10 +1473,16 @@ def format_ledger_context(
     date_str: str | None = None,
     *,
     exclude_bot: str | None = None,
+    exclude_bots: set[str] | tuple[str, ...] | None = None,
     ledger_path: Path = DAILY_LEDGER_FILE,
 ) -> str:
     """生成注入到后序 Bot last_context.txt 顶部的前序已播清单。"""
-    ledger = load_daily_ledger(date_str=date_str, exclude_bot=exclude_bot, ledger_path=ledger_path)
+    ledger = load_daily_ledger(
+        date_str=date_str,
+        exclude_bot=exclude_bot,
+        exclude_bots=exclude_bots,
+        ledger_path=ledger_path,
+    )
     entries = ledger.get("entries") or []
     if not entries:
         return ""
@@ -1262,14 +1490,69 @@ def format_ledger_context(
         "=== TODAY_LEDGER_BEGIN ===",
         f"【今日（{ledger['date']}）前序 Bot 已播账本 —— 写稿时请主动去重】",
         "说明：以下话题与链接已由今日前序 Bot 播报。若本轮素材出现同一事件：",
-        "1) 若无新的核心技术增量或社区正反方交锋，请直接跳过，优先选用其他未播素材；",
-        "2) 若确有本板块独有视角（如 X 热点的正反方吵架、Builder 本人深度长文拆解），只写独有增量，绝不重复复述前序已播的通稿背景。",
+        "1) 若无新的核心技术增量、社区正反方交锋或评论区独到反驳，请直接跳过，优先选用其他未播素材；",
+        "2) 若确有本板块独有视角（如 X 热点的正反方吵架、Builder 评论区一线交锋），只写独有增量，绝不重复复述前序已播的通稿背景。",
     ]
     for item in entries:
         heads = item.get("headlines") or []
         head_str = " ； ".join(heads) if heads else "（无标题明细）"
         lines.append(f"- [{item['bot']}] 已播 {len(heads)} 条：{head_str}")
     lines.append("=== TODAY_LEDGER_END ===")
+    return "\n".join(lines)
+
+
+def load_recent_bot_headlines(
+    bot_name: str,
+    *,
+    days: int = 3,
+    date_str: str | None = None,
+    ledger_path: Path = DAILY_LEDGER_FILE,
+) -> list[tuple[str, list[str]]]:
+    """读取本 Bot 过去 N 天（不含当日）在共享账本里已播过的标题清单，防止隔日换 URL / ICYMI 重复播报。"""
+    if not ledger_path.exists():
+        return []
+    today_iso = date_str or os.getenv("REPORT_DATE") or datetime.now().strftime("%Y-%m-%d")
+    cutoff = _days_ago_str(days)
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: list[tuple[str, list[str]]] = []
+    for d in sorted(data.keys(), reverse=True):
+        if not isinstance(d, str) or d >= today_iso or d < cutoff:
+            continue
+        bucket = data.get(d)
+        if not isinstance(bucket, dict):
+            continue
+        info = bucket.get(bot_name)
+        if isinstance(info, dict):
+            heads = [h for h in (info.get("headlines") or []) if isinstance(h, str) and h.strip()]
+            if heads:
+                out.append((d, heads))
+    return out
+
+
+def format_recent_self_headlines(
+    bot_name: str,
+    *,
+    days: int = 3,
+    date_str: str | None = None,
+    ledger_path: Path = DAILY_LEDGER_FILE,
+) -> str:
+    """将本 Bot 过去 N 天已播标题格式化为上下文提醒块，拦截 TLDR 隔日重推与 ICYMI 冷饭。"""
+    recent = load_recent_bot_headlines(bot_name, days=days, date_str=date_str, ledger_path=ledger_path)
+    if not recent:
+        return ""
+    lines = [
+        "=== RECENT_SELF_HEADLINES_BEGIN ===",
+        f"【本栏目过去 {days} 天已播过的话题 —— 严防换源/ICYMI 隔日自重复】",
+        "规则：若本次素材与下方过去几天已播话题属于同一事件/同一开源发布（例如 TLDR 次日换媒体链接重推，或作者发 ICYMI 二次转发旧发布），且没有实质性新版本、新基准或重大进展，**直接跳过不要再报**；确有重大后续则以「后续：」切入，不复述旧数据。",
+    ]
+    for d, heads in recent:
+        lines.append(f"- {d}：{' ； '.join(heads)}")
+    lines.append("=== RECENT_SELF_HEADLINES_END ===")
     return "\n".join(lines)
 
 

@@ -2,7 +2,7 @@
 
 > [← Back to Daily Bots Root README](../README.md)
 
-**Stage 2 of 3 in the daily `09:00 CST` AI intelligence pipeline.** Tracks the highest-signal AI engineering and product debates across **X (Twitter)** and **12 core AI subreddits** over a **48-hour window**, distills pro/con technical arguments plus hands-on Reddit practitioner feedback, and enforces direct primary `x.com` / `reddit.com` links.
+> **[Retired `2026-11-28`]** Removed from the active `09:00 CST` `ai-daily` pipeline to eliminate Latent Space overlap with the curated X List. X debates, frontline builder discussions, and X Articles are now unified in [`../ai-builder-bot/`](../ai-builder-bot/README.md) (`X 热点 & AI Builder`). This directory is retained for reference and historical archives.
 
 ---
 

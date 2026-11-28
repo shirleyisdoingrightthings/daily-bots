@@ -1,18 +1,18 @@
 ---
 name: ai-daily
-description: 每天 09:00 按 1. AI 产业日报 → 2. X & Reddit 社区热议 → 3. AI Builder 日报 顺序三合一串行抓取、去重、写稿并推送至飞书（允许主模型视负载灵活 Orchestrate）
+description: 每天 09:00 按 1. AI 产业日报 → 2. X 热点 & AI Builder（纯 X List）→ 3. GitHub Trending & Hacker News 顺序三合一串行抓取、跨 Bot 账本去重、写稿并推送至飞书与 Notion
 ---
 
-目标：每天早上 **09:00**，由本任务在**同一个主控会话内**严格按 **`1. AI 产业日报 → 2. X 热点播报 → 3. AI Builder 日报`** 的先后顺序串行完成抓取、写稿、飞书推送与 Notion 归档。紧随其后的 `4. GitHub Trending & Hacker News` 将在 **09:30** 独立运行并读取本任务产出的当日去重账本。
+目标：每天早上 **09:00**，由本任务在**同一个主控会话内**严格按 **`1. AI 产业日报 → 2. X 热点 & AI Builder（纯 X List）→ 3. GitHub Trending & Hacker News`** 的先后顺序三合一串行完成抓取、去重、写稿、飞书推送与 Notion 归档（原 Latent Space `x-hotspot-bot` 已正式退役，X 圈热点与 Builder 实操统一收口至自建 X List）。
 
-- **模型识别与自主 Orchestrate 原则**：主会话直接识别并运行在用户在 Automations 界面为本任务选定的最新模型上（不硬编码模型版本）。主 Agent 拥有**自主 Orchestrate 权**：可根据当天内容复杂度自行决定由当前主模型直接完成，或通过 `invoke_subagent(TypeName="self", Model="flash" / "flash_lite")` 将常规整理、初稿起草等适合轻量化的环节委派给快速响应/轻量化子代理协同处理（若委派子代理写稿，主 Agent 须在 `send` 前完成核心事实、超链接不重不漏与排版把关）。
+- **模型识别与自主 Orchestrate 原则**：主会话直接识别并运行在用户在 Automations 界面为本任务选定的最新模型上（不硬编码模型版本）。主 Agent 拥有**自主 Orchestrate 权**：若第 3 棒上下文偏长，可按需通过 `invoke_subagent(TypeName="self", Model="flash")` 委派独立子会话起草初稿，避免单会话尾段上下文过载；主 Agent 须在 `send` 前完成事实、链接保真与排版把关。
 
-> **⚠️ 为什么严格按 `1. AI 产业日报 → 2. X 热点播报 → 3. AI Builder 日报` 串行执行？**
-> 1. **第 1 棒《AI 产业日报》**：先把过去 24h 主流科技媒体报道的客观行业大事、发布、融资、政策播完，并在 `send` 成功后自动写入共享账本 `shared/logs/daily_topic_ledger.json`。
-> 2. **第 2 棒《X & Reddit 社区热议》**：完整拉取上游 Latent Space `[AINews]` 的 `AI Twitter Recap`（65,000 字符完整预算）与 `AI Reddit Recap`（35,000 字符完整预算，覆盖 12 个核心 AI subreddit），并自动读取第 1 棒已播账本。定稿时**严格过滤掉单次顺带提及的噪音、吹水与次优先级内容**，X 主体只挑讨论中心度最高、存在真正正反技术分歧的 1–4 个焦点议题；文末增设「🗣️ Reddit 实测与吐槽」（精选 1–2 条 X 主体未展开的一线真机实测/量化翻车/工具踩坑争议，附 `reddit.com` 原帖直链与 AINews 活跃度，无独立增量则整块省略）；在 `send` 后将 X 原帖、Reddit 原帖与期刊链接一并写入去重档案与共享账本。
-> 3. **第 3 棒《AI Builder 日报》**：通过 `twitterapi.io`（`TWITTERAPI_IO_KEY`）直连拉取公开自建 X List（自动对 X Article 补调 `/twitter/article` 拉取完整长文正文，并对独立技术博客外链调用 `fetch_article_text` 拉取正文摘要），同时在代码层自动过滤掉第 2 棒《X 热点播报》已用过的 `x.com` 推文。写稿时针对每位 Builder 的具体项目/长文独立成篇深写（每条 3–5 句详实拆解，严禁把两个不同人物/项目硬拼成一条），且遵守超链接“不重不漏”原则。
+> **⚠️ 为什么采用 09:00 三合一串行（极简 + 零重复 + 零唤醒竞态）？**
+> 1. **第 1 棒《AI 产业日报》**：客观事实雷达（≤26 字中文主标题 + 首句加粗核心事实 + 3 日自重复拦截），`send` 原子加锁写入当日共享账本 `shared/logs/daily_topic_ledger.json`。
+> 2. **第 2 棒《X 热点 & AI Builder》**（目录：`ai-builder-bot/`）：纯自建 X List（`twitterapi.io` 直连），按 HN 风格综合讨论热度分（`赞 + 评×12 + 转×3 + 引×8`）排序，并发抓取去广告 Relevance 高赞评论区（单帖作者自评限 1 席）、X Article 全文与外链博客正文，拦截 `ICYMI` 与近 5 天自重复；一站式覆盖 X 全网焦点争论、一线 Builder 实操工具与深度长文。
+> 3. **第 3 棒《GitHub Trending & Hacker News 早报》**：读取前 2 棒完整账本（零唤醒竞态），GitHub 全页新星优先挖掘（全局不足自动补抓 Python/TS 分榜，熟面孔折叠）+ HN Top 8 承接前 2 棒账本自动从 `#9–#12` 递补，且仅记实发条目进 `seen_history.json`。周一至周六出日榜（`=== FETCH_OK ===`），周日出周榜（`=== WEEKLY_OK ===`）。
 
-**时间线**：每天 09:00 触发（主力）→ 10:00 由 `ai-chain-health`（`shared/ai_chain_health.sh`）串行检查运行状态（方案 B：仅核查状态与 `drafts_fresh` 本地重发兜底，不拉起无头 CLI）。
+**时间线**：每天 09:00 触发（主力）→ 10:00 由 `shared/ai_chain_health.sh` 按相同顺序三块串行做轻量化健康检查（仅核查状态与 `drafts_fresh` 本地重发兜底，不拉起无头 CLI）。
 
 > 以下所有路径均相对于本仓库根目录（Antigravity Sidecar 已将工作区设为仓库根目录）；共享层位于 `shared/`。
 
@@ -21,132 +21,84 @@ description: 每天 09:00 按 1. AI 产业日报 → 2. X & Reddit 社区热议 
 2. **防 `$` 变量吞字**：写稿落盘时，必须使用 `write_file`（`Overwrite: true`）写入各 bot 的 `logs/report_draft.txt`，严禁使用 `cat <<EOF` 或 `echo`。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 第一部分（第 1 棒）：AI 产业日报（写 1 稿）
+## 第一部分（第 1 棒）：AI 产业日报
 
-**每日统一出《AI 产业日报》（包括周日，亦按当日客观新闻出日报，不再出周回顾）。**
+**每日统一出《AI 产业日报》（包括周日，不再出周回顾）。**
 
 ### 步骤 1 — 抓取
-执行命令（若遇沙盒配置报错或拦截网络/本地代理 `127.0.0.1:1082`，请使用 `BypassSandbox: true`）：
+执行命令（若遇沙盒配置报错或拦截网络/本地代理，请使用 `BypassSandbox: true`）：
 ```bash
 bash "AI Daily News Bot/claude_report.sh" fetch
 ```
 按 stdout 标记决定：
-- `=== SKIP_ALREADY_RAN ===`：今天已推送过。记「已跳过」，进入第二部分（X 热点播报）。
-- `=== SKIP_PROXY ===`：本地代理不可用。**不要继续**，记「代理不可用未推送」，进入第二部分。
-- `=== NO_NEWS ===`：24 小时无有效新闻。**不要继续**，记「无有效新闻」，进入第二部分。
-- `=== FETCH_OK ===`：使用 `read_file` 读取 `AI Daily News Bot/logs/last_context.txt`，提取 `=== CONTEXT_BEGIN ===` 与 `=== CONTEXT_END ===` 之间内容，进入步骤 2。
+- `=== SKIP_ALREADY_RAN ===` / `=== SKIP_PROXY ===` / `=== NO_NEWS ===`：记录状态并进入第二部分。
+- `=== FETCH_OK ===`：使用 `read_file` 读取 `AI Daily News Bot/logs/last_context.txt` 与 `AI Daily News Bot/prompt.md`，进入步骤 2。
+- 若有 `=== SOURCE_ALERT ===`，原样记下并在最终汇报单列「源健康」。
 
-另外：`=== SOURCE_ALERT ===` 与 `=== SOURCE_ALERT_END ===` 之间若有内容，原样记下并在汇报最后单列一节「源健康」。
+### 步骤 2 — 写稿
+严格按 `AI Daily News Bot/prompt.md` 写稿（≤26 字中文主标题 + 去掉 `📄 The Details：` + 首句加粗核心事实 + 对照 `RECENT_SELF_HEADLINES` 防隔日自重复 + 最多 12 条倒序），用 `write_file`（`Overwrite: true`）写入 `AI Daily News Bot/logs/report_draft.txt`。
 
-### 步骤 2 — 写当日日报（`FETCH_OK` 时）
-1. 使用 `read_file` 读取 `AI Daily News Bot/prompt.md`。
-2. 严格按其全部规则写出完整《AI 产业日报》：
-   - 仅使用 `<b>` 和 `<a href>` 标签，严禁使用 Markdown `**`；
-   - 标题使用 `<b>📋 AI 产业日报 · [今天日期]</b>` 与 `<b>⚡ 30秒速览</b>`；
-   - 「⚡ 30秒速览」下方空一行后接 5 条以「- 」开头的无序列表（无 ⭐、每条 ≤55 字且含具体数字/专名、与正文前 5 条一一对应）；
-   - 正文严格按 5星至3星倒序，**最多入选 12 条**（按 5分 > 4分 > 3分 截断），英文原标题不翻译，每条严格按 `标题 (<a href="..."><b>...</b></a>) → [星级] [标签] → 📄 The Details：` 顺序排版，`📄 The Details：` 后紧接单段高密度连贯叙事（禁止 bullet，禁止叙事段落内部使用冒号）。
-3. 使用 `write_file`（`Overwrite: true`）将纯正文写入 `AI Daily News Bot/logs/report_draft.txt`。
-
-### 步骤 3 — 发送（自动写入当日跨 Bot 账本）
-执行命令（若遇沙盒配置报错或拦截飞书/Notion 网络请求，请使用 `BypassSandbox: true`）：
+### 步骤 3 — 发送与核对
 ```bash
 bash "AI Daily News Bot/claude_report.sh" send
 ```
-
-### 步骤 4 — 核对
-`tail -1 "AI Daily News Bot/logs/run.log"`：末行 `[OK] ...` → 记「已推送成功」；`[FAIL]`/`[WARN]` → 记失败并附该行。
+核对 `tail -1 "AI Daily News Bot/logs/run.log"`。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 第二部分（第 2 棒）：X & Reddit 社区热议（写 1 稿）
-
-本块抓取过去 48 小时 Latent Space `[AINews]` 完整 `AI Twitter Recap`、`AI Reddit Recap`（12 个核心 AI subreddit）与 Techmeme 同期报道，提炼 X 圈真正高优先级的正反方技术/产品分歧，并在文末增设 Reddit 一线实测与吐槽板块。**排在第 1 棒《AI 产业日报》之后运行，自动读取当日账本去重。**
+## 第二部分（第 2 棒）：X 热点 & AI Builder（纯 X List · HN 风格高赞高评）
 
 ### 步骤 1 — 取材
-执行命令（若遇沙盒配置报错或拦截网络/本地代理 `127.0.0.1:1082`，请使用 `BypassSandbox: true`）：
-```bash
-bash "x-hotspot-bot/claude_report.sh" fetch
-```
-按 stdout 标记决定：
-- `=== SKIP_ALREADY_RAN ===`：今天已推送过。记「已跳过」，进入第三部分（AI Builder）。
-- `=== SKIP_PROXY ===`：本地代理不可用。**不要继续**，记「代理不可用未推送」，进入第三部分。
-- `=== NO_TOPICS ===`：48 小时窗口内 Latent Space `[AINews]` 无未播新刊。**不要继续写稿或推送**，直接记「未检测到上游 AINews 新刊，今日跳过推送」，进入第三部分。
-- `=== FETCH_OK ===`：使用 `read_file` 读取 `x-hotspot-bot/logs/last_context.txt`，进入步骤 2。
-
-### 步骤 2 — 筛优去噪与写稿
-1. 使用 `read_file` 读取 `x-hotspot-bot/prompt.md`。
-2. 严格按其全部规则写出完整《X & Reddit 社区热议》：
-   - **完整读取与强力去噪**：通读 `last_context.txt` 中完整抓取的 Latent Space `AI Twitter Recap` 与 `AI Reddit Recap`：
-     - X 主体严格筛选讨论中心度最高（被引用次数多、存在真正正反交锋或第三方实测争议）的 **1–4 个焦点话题**，果断剔除单次提及的边角料、营销吹水与次优先级噪音；
-     - 文末增设 `<b>🗣️ Reddit 实测与吐槽</b>`（精选 **1–2 条** X 主体未展开的一线真机实测、量化/翻车反馈或工具争议，标题格式 `<b>[r/{Subreddit}] {话题标题}</b>`，文末附 `原帖：<a href="{reddit.com 直链}">r/{Subreddit} 原帖</a>（AINews 活跃度 {N}）`；无独立增量或无 Reddit 素材时整块省略不硬凑）；
-   - **承接第 1 棒去重**：对照顶部 `TODAY_LEDGER`，若某事已在第 1 棒《AI 产业日报》播过且无社区正反争论或实测质疑则直接跳过；若有激烈争议则直接切入正反方观点与实测数据，不重复复述新闻背景；
-   - **行内链与文末单条主原帖**：正文中提到的具体争议方/评测方/研究者若素材有对应链接且不同于底部主原帖，随文挂 `<a href="URL">`；每条 X 话题末尾 `原帖：` 行**只选被引用次数最多的那 1 条 `x.com/<user>/status/<id>` 原帖直链**（格式：`原帖：<a href="{x.com 直链}">@{handle}</a>（当天复盘被引用 {N} 次）`，切勿写成点赞数）。
-3. 使用 `write_file`（`Overwrite: true`）将纯正文写入 `x-hotspot-bot/logs/report_draft.txt`。
-
-### 步骤 3 — 发送（自动追加写入当日跨 Bot 账本）
-执行命令（若遇沙盒配置报错或拦截飞书/Notion 网络请求，请使用 `BypassSandbox: true`）：
-```bash
-bash "x-hotspot-bot/claude_report.sh" send
-```
-
-### 步骤 4 — 核对
-`tail -1 "x-hotspot-bot/logs/run.log"`：末行 `[OK] ...` → 记「已推送成功」；其余记失败并附该行。
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## 第三部分（第 3 棒）：AI Builder 日报（写 1 稿）
-
-本块播的是 **自建 X List 上一线 AI builder 本人最近说了什么**（含自动补拉的 X Article 完整长文与外链技术博客正文）。**排在第 1 棒《AI 产业日报》和第 2 棒《X 热点播报》之后运行，自动过滤前序已播原推并避开重复事件。**
-
-### 步骤 1 — 取材
-执行命令（若遇沙盒配置报错或拦截网络/本地代理 `127.0.0.1:1082`，请使用 `BypassSandbox: true`）：
 ```bash
 bash "ai-builder-bot/claude_report.sh" fetch
 ```
 按 stdout 标记决定：
-- `=== SKIP_ALREADY_RAN ===`：今天已推送过。记「已跳过」，进入汇报。
-- `=== SKIP_PROXY ===`：本地代理不可用。**不要继续**，记「代理不可用未推送」。
-- `=== FEED_ERROR ===`：X List 拉取失败或 `TWITTERAPI_IO_KEY` 不可用。**不要继续**，记「素材源不可用未推送」并附错误。
-- `=== NO_TWEETS ===`：X List 过去 24h 窗口内没有新推文。**不要继续**，记「无可用素材」。
-- `=== FETCH_OK ===`：使用 `read_file` 读取 `ai-builder-bot/logs/last_context.txt`，进入步骤 2。
+- `=== SKIP_ALREADY_RAN ===` / `=== SKIP_PROXY ===` / `=== FEED_ERROR ===` / `=== NO_TWEETS ===`：记录状态并进入第三部分。
+- `=== FETCH_OK ===`：使用 `read_file` 读取 `ai-builder-bot/logs/last_context.txt` 与 `ai-builder-bot/prompt.md`，进入步骤 2。
 
-### 步骤 2 — 写稿（独立深写 + 超链接不重不漏）
-1. 使用 `read_file` 读取 `ai-builder-bot/prompt.md`。
-2. 严格按其全部规则写出完整《AI Builder 日报》：
-   - **一人一事独立深写（严禁异事拼盘）**：精选 5–6 条高含金量话题，每条只聚焦 **1 位 Builder 的 1 个具体项目/长文/技术判断**，写足 3–5 句（单条 180–320 字，全篇 1500–2500 字），充分利用 `[X Article 全文摘录]` 与 `[外链正文摘录]` 把具体工程痛点、技术机制、架构设计与核心数字写透；绝不把两个不同人物/项目硬凑成一条！
-   - **超链接“不重不漏”铁律**：
-     1. 底部 `原推：<a href="...">@handle</a>（N 赞）` 已经挂了主推文链接的作者本人，**正文中首次出现只写 `身份 + 姓名（@handle）` 纯文本，绝不重复挂与底部 `原推：` 相同的链接**；
-     2. 正文行内 `<a href>` **只挂不同于底部主原推 URL 的增量链接**（如独立技术博客/论文/仓库外链、同一作者的第 2 条补充推文、或交锋中的第三方推文；且若正文中挂了同一作者的补充推文，底部 `原推：` 只放主推文 1 条，确保上下绝不重复）；
-     3. 严禁单独挂 `x.com/i/article/...` 冗余链接。
-   - **前序去重**：对照顶部 `TODAY_LEDGER`，若某件官宣/融资大事已在第 1 棒或第 2 棒播过且推文无额外一手技术拆解，直接跳过。
-   - 开头第一行如实写明推文实际时间区间；文末注脚格式为 `<b>素材</b>：X List（{builder 数} 位 · {推文数} 条）· 覆盖 {时间区间}`。
-3. 使用 `write_file`（`Overwrite: true`）将纯正文写入 `ai-builder-bot/logs/report_draft.txt`。
+### 步骤 2 — 写稿
+严格按 `ai-builder-bot/prompt.md` 写稿（标题 `<b>🔥 X 热点 & AI Builder · [日期]</b>`；按高赞高评热度筛选 5–7 条、淡日 4–5 条宁缺毋滥；拦截 `ICYMI` 与 `RECENT_SELF_HEADLINES` 冷饭；标题挂主原推直链不重复；每条写透「这帖在聊啥 + 评论区在吵啥 / 评论区亮点与启发」，无评论素材绝不编造；可选文末 `⚡ 短讯雷达`），用 `write_file`（`Overwrite: true`）写入 `ai-builder-bot/logs/report_draft.txt`。
 
-### 步骤 3 — 发送
-执行命令（若遇沙盒配置报错或拦截飞书/Notion 网络请求，请使用 `BypassSandbox: true`）：
+### 步骤 3 — 发送与核对
 ```bash
 bash "ai-builder-bot/claude_report.sh" send
 ```
+核对 `tail -1 "ai-builder-bot/logs/run.log"`。
 
-### 步骤 4 — 核对
-`tail -1 "ai-builder-bot/logs/run.log"`：末行 `[OK] ...` → 记「已推送成功」；其余记失败并附该行。
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## 第三部分（第 3 棒）：GitHub Trending & Hacker News 早报
+
+### 步骤 1 — 抓取
+```bash
+bash "github-hn-bot/claude_report.sh" fetch
+```
+按 stdout 标记决定：
+- `=== SKIP_ALREADY_RAN ===` / `=== SKIP_PROXY ===` / `=== NO_DATA ===`：记录状态并进入汇报。
+- `=== FETCH_OK ===`（周一至周六日榜）或 `=== WEEKLY_OK ===`（周日周榜）：
+  使用 `read_file` 读取 `github-hn-bot/logs/last_context.txt`，并按模式读取 `github-hn-bot/prompt.md`（日榜）或 `github-hn-bot/prompt_weekly.md`（周榜），进入步骤 2。
+
+### 步骤 2 — 写稿
+严格按对应 `prompt.md` / `prompt_weekly.md` 写稿：
+- GitHub 板块：完整展开 `🆕 新上榜项目`（痛点 + 机制 + 对比大白话、敢劝退），将 `🔁 持续霸榜熟面孔` 收拢到文末紧凑折叠区（每条 1 句简述 + `<b>（见 MM月DD日 推送）</b>`）；
+- HN 板块：精选 Top 8，遇到 `🔁 今日 09:00 前序 AI 日报已播` 条目时优先从候选池（#9–#12）递补未播新帖；非争议帖可将 `评论区交锋与避坑` 弹性改名为 `评论区亮点`；
+- 用 `write_file`（`Overwrite: true`）写入 `github-hn-bot/logs/report_draft.txt`。
+
+### 步骤 3 — 发送与核对
+```bash
+bash "github-hn-bot/claude_report.sh" send
+```
+核对 `tail -1 "github-hn-bot/logs/run.log"`。
 
 ━━━━━━━━━━━━━━━
 ## 汇报格式
 
-用中文简要汇报本任务串行执行的三块：
+用中文简要汇报三块执行结果：
 
 ```text
-AI 早间 09:00 三合一流水线（产业日报 → X 热点 → AI Builder）
+AI 早间 09:00 三合一流水线（产业日报 → X 热点 & AI Builder → GitHub & HN）
   · 1. AI 产业日报：{状态}
-  · 2. X 热点播报：{状态}
-  · 3. AI Builder：{状态}
+  · 2. X 热点 & AI Builder：{状态}
+  · 3. GitHub & HN 早报：{状态}
 ```
-
-状态取其一：
-- 已推送成功（附 run.log 末行摘要）
-- 已跳过（今天已推送 / 未检测到上游 AINews 新刊）
-- 未推送（无有效新闻 / 代理不可用 / 素材源不可用，注明哪种）
-- 无可用素材（窗口内没抓到推文）
-- 失败（附原因与日志末行）
 
 若任一块出现 `SOURCE_ALERT`，在状态后单列一节「源健康」原样列出；没有则不提。
 注意：不修改任何脚本或 plist；同一块的 fetch/send 不要重复跑；任一块失败不阻塞下一块。

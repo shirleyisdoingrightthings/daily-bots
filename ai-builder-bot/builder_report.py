@@ -24,6 +24,7 @@ import plistlib
 import re
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -40,7 +41,9 @@ from bot_utils import (already_ran_today, load_sent_urls, url_key,
                        extract_report_date, archive_and_sync_notion,
                        record_sent_urls, fetch_article_text,
                        load_daily_ledger, record_daily_ledger,
-                       format_ledger_context)
+                       format_ledger_context,
+                       format_recent_self_headlines,
+                       redact_secrets)
 
 BASE = Path(__file__).parent
 LOG_FILE = BASE / "logs" / "run.log"
@@ -76,7 +79,7 @@ def _resolve_plist_path() -> Path | None:
 # 每位 builder 最多进多少条，避免高频账号刷屏挤掉其他人
 PER_BUILDER_CAP = int(os.getenv("BUILDER_PER_ACCOUNT_CAP", "4"))
 WINDOW_H = int(os.getenv("BUILDER_WINDOW_H", "24"))
-LIST_SCAN_LIMIT = int(os.getenv("BUILDER_LIST_SCAN_LIMIT", "200"))
+LIST_SCAN_LIMIT = int(os.getenv("BUILDER_LIST_SCAN_LIMIT", "300"))
 INCLUDE_REPLIES = os.getenv("BUILDER_INCLUDE_REPLIES", "0") == "1"
 
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
@@ -96,23 +99,28 @@ def _proxy_ok() -> bool:
     return ok
 
 
+def _load_dotenv_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip().removeprefix("export ").strip()
+            v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
 def _load_plist_env_if_needed() -> None:
-    """直接运行 test-list / archive-only 时从可选的 .env 或 macOS LaunchAgent plist 补全环境变量（不覆盖已存在变量）。"""
+    """直接运行 test-list / archive-only 时补全环境变量，优先级与 report_base.sh 严格一致：
+    shell env > bot/.env > plist > shared/.env > repo/.env。"""
     global _PROXY, FEISHU_WEBHOOK, PER_BUILDER_CAP, WINDOW_H, LIST_SCAN_LIMIT, INCLUDE_REPLIES
-    for env_path in (BASE / ".env", BASE.parent / "shared" / ".env", BASE.parent / ".env"):
-        if env_path.exists():
-            try:
-                for line in env_path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    k = k.strip().removeprefix("export ").strip()
-                    v = v.strip().strip('"').strip("'")
-                    if k and k not in os.environ:
-                        os.environ[k] = v
-            except Exception:
-                pass
+    _load_dotenv_file(BASE / ".env")
     plist_path = _resolve_plist_path()
     if plist_path and plist_path.exists():
         try:
@@ -124,6 +132,8 @@ def _load_plist_env_if_needed() -> None:
                     os.environ[k] = str(v)
         except Exception as exc:
             print(f"[WARN] 读取 plist 环境变量失败: {exc}", file=sys.stderr)
+    _load_dotenv_file(BASE.parent / "shared" / ".env")
+    _load_dotenv_file(BASE.parent / ".env")
     _PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or _PROXY
     FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", FEISHU_WEBHOOK)
     PER_BUILDER_CAP = int(os.getenv("BUILDER_PER_ACCOUNT_CAP", str(PER_BUILDER_CAP)))
@@ -367,6 +377,110 @@ def _twitterapi_get(
     raise RuntimeError("twitterapi.io 请求失败")
 
 
+_ICYMI_RE = re.compile(
+    r"\b(?:icymi|in case you missed it|resurfacing|reposting|bumping this)\b",
+    re.IGNORECASE,
+)
+_TOP_REPLY_FETCH_LIMIT = int(os.getenv("BUILDER_REPLY_THREADS", "12"))
+_TOP_REPLY_MIN_REPLIES = int(os.getenv("BUILDER_MIN_REPLIES_FOR_COMMENTS", "5"))
+_MAX_AUTHOR_SELF_REPLIES = 1  # 单帖作者自评最多占 1 席，强制把其余席位留给外部高赞社区回复
+
+
+def _calc_discussion_heat(row: dict) -> int:
+    """参照 Hacker News 综合热度分，兼顾点赞量与评论区讨论激烈度。
+
+    replies 权重 x12，quotes x8，retweets x3：让高赞高讨论的 builder 讨论帖自然浮到最前；
+    同时对 ICYMI / 7 天内已播外链二次转发做 0.25 折降权，杜绝冷饭霸榜。"""
+    likes = int(row.get("likes") or 0)
+    replies = int(row.get("replies") or 0)
+    retweets = int(row.get("retweets") or 0)
+    quotes = int(row.get("quotes") or 0)
+    score = likes + replies * 12 + retweets * 3 + quotes * 8
+    if row.get("has_article"):
+        score += 180
+    if row.get("is_repeat_ext") or row.get("is_icymi"):
+        score = int(score * 0.25)
+    return score
+
+
+def _fetch_tweet_top_replies(
+    tweet_id: str,
+    root_handle: str,
+    api_key: str,
+    *,
+    max_replies: int = 4,
+) -> list[dict]:
+    """通过 twitterapi.io /twitter/tweet/replies/v2 (Relevance) 拉取高赞/高价值评论区交锋。"""
+    resp = _twitterapi_get(
+        "/twitter/tweet/replies/v2",
+        params={"tweetId": str(tweet_id), "queryType": "Relevance"},
+        api_key=api_key,
+        timeout=18,
+        max_attempts=2,
+    )
+    if resp.status_code >= 400:
+        return []
+    payload = resp.json()
+    raw_replies = (payload.get("tweets") or payload.get("replies") or []) if isinstance(payload, dict) else []
+    cleaned: list[dict] = []
+    seen_ids: set[str] = {str(tweet_id)}
+    for item in raw_replies:
+        if not isinstance(item, dict):
+            continue
+        rid = str(item.get("id") or "").strip()
+        if not rid or rid in seen_ids:
+            continue
+        # 严格拦截 X replies/v2 混入的推广广告与“猜你喜欢”无关推文（它们 isReply=False 或 conversationId 不同）
+        if not item.get("isReply") and not item.get("inReplyToId"):
+            continue
+        conv_id = str(item.get("conversationId") or "").strip()
+        if conv_id and conv_id != str(tweet_id):
+            continue
+        seen_ids.add(rid)
+        author = item.get("author") or {}
+        handle = (author.get("userName") or author.get("username") or "").lstrip("@").strip()
+        if not handle:
+            continue
+        txt = _expand_text_twitterapi(
+            item.get("text") or item.get("fullText") or "",
+            _twitterapi_url_pairs(item),
+        )
+        # 剥掉开头的连续 @mention，衡量真实评论信息量
+        body_no_mentions = re.sub(r"^(?:@[A-Za-z0-9_]+\s+)+", "", txt).strip()
+        if len(body_no_mentions) < 20:
+            continue
+        likes = int(item.get("likeCount") or item.get("favoriteCount") or 0)
+        reps = int(item.get("replyCount") or 0)
+        is_author_self = handle.lower() == (root_handle or "").lower()
+        r_score = likes * 3 + reps * 5 + (60 if is_author_self else 0) + min(len(body_no_mentions), 160) // 4
+        cleaned.append({
+            "handle": handle,
+            "name": (author.get("name") or handle).strip(),
+            "likes": likes,
+            "replies": reps,
+            "is_author": is_author_self,
+            "text": body_no_mentions.replace("\n", " ")[:320],
+            "url": f"https://x.com/{handle}/status/{rid}",
+            "_score": r_score,
+        })
+    cleaned.sort(key=lambda d: (-d["_score"], -d["likes"]))
+    # 防止作者连续自评把 4 个席位全占满（如 274 评热帖被作者自评挤空外部声音）：
+    # 作者追评最多保留 _MAX_AUTHOR_SELF_REPLIES 条，其余强制优先分配给外部高赞回复
+    author_reps = [d for d in cleaned if d["is_author"]][:_MAX_AUTHOR_SELF_REPLIES]
+    other_reps = [d for d in cleaned if not d["is_author"]]
+    picked = author_reps + other_reps[: max(0, max_replies - len(author_reps))]
+    if len(picked) < max_replies:
+        used_urls = {d["url"] for d in picked}
+        for d in cleaned:
+            if d["url"] not in used_urls:
+                picked.append(d)
+                used_urls.add(d["url"])
+            if len(picked) >= max_replies:
+                break
+    picked.sort(key=lambda d: (-d["_score"], -d["likes"]))
+    return [{k: v for k, v in d.items() if k != "_score"} for d in picked[:max_replies]]
+
+
 def _fetch_twitterapi_article(tweet_id: str, api_key: str) -> tuple[str, str]:
     resp = _twitterapi_get(
         "/twitter/article",
@@ -489,24 +603,46 @@ def _fetch_x_list_twitterapi(
             art_has_blocks = bool(art_obj and (art_obj.get("contents") or (isinstance(art_obj.get("contentState"), dict) and art_obj["contentState"].get("blocks"))))
             _, initial_full = _extract_article_text_twitterapi(art_obj) if art_has_blocks else ("", "")
 
-            by_author.setdefault(handle, []).append({
+            formatted_text = _format_tweet_text_twitterapi(t)
+            ext_urls = _extract_ext_urls_twitterapi(t)
+            qt_obj = t.get("quoted_tweet") or t.get("quotedTweet")
+            qt_url = ""
+            if isinstance(qt_obj, dict):
+                q_au = (qt_obj.get("author") or {})
+                q_u = (q_au.get("userName") or q_au.get("username") or "").lstrip("@").strip()
+                q_id = str(qt_obj.get("id") or "").strip()
+                qt_url = (qt_obj.get("url") or qt_obj.get("twitterUrl") or "").strip()
+                if not qt_url and q_u and q_id:
+                    qt_url = f"https://x.com/{q_u}/status/{q_id}"
+            is_repeat_ext = any(url_key(u) in sent_before for u in ext_urls) or bool(
+                qt_url and url_key(qt_url) in sent_before
+            )
+            is_icymi = bool(_ICYMI_RE.search(formatted_text))
+
+            row_obj = {
                 "id": int(t_id) if t_id.isdigit() else t_id,
                 "handle": handle,
                 "name": (author.get("name") or handle).strip(),
                 "bio": (author.get("description") or "").replace("\n", " ").strip()[:80],
                 "url": url,
-                "text": _format_tweet_text_twitterapi(t),
+                "text": formatted_text,
                 "createdAt": (t_date or now).astimezone(timezone.utc).isoformat(),
                 "likes": int(t.get("likeCount") or t.get("favoriteCount") or 0),
                 "retweets": int(t.get("retweetCount") or 0),
                 "replies": int(t.get("replyCount") or 0),
+                "quotes": int(t.get("quoteCount") or 0),
                 "isQuote": bool(t.get("quoted_tweet") or t.get("quotedTweet")),
                 "has_article": has_art,
                 "article_title": art_title,
                 "article_full_text": initial_full[:15000] if art_has_blocks else "",
-                "ext_urls": _extract_ext_urls_twitterapi(t),
+                "ext_urls": ext_urls,
                 "ext_excerpts": [],
-            })
+                "top_replies": [],
+                "is_repeat_ext": is_repeat_ext,
+                "is_icymi": is_icymi,
+            }
+            row_obj["heat_score"] = _calc_discussion_heat(row_obj)
+            by_author.setdefault(handle, []).append(row_obj)
 
         if stop_early:
             break
@@ -521,14 +657,15 @@ def _fetch_x_list_twitterapi(
     rows: list[dict] = []
     dropped_cap = 0
     for handle_rows in by_author.values():
-        handle_rows.sort(key=lambda x: -x["likes"])
+        handle_rows.sort(key=lambda x: (-x["heat_score"], -x["likes"]))
         rows.extend(handle_rows[:PER_BUILDER_CAP])
         if len(handle_rows) > PER_BUILDER_CAP:
             dropped_cap += len(handle_rows) - PER_BUILDER_CAP
-    rows.sort(key=lambda x: -x["likes"])
+    rows.sort(key=lambda x: (-x["heat_score"], -x["likes"]))
 
     enriched_articles = 0
     enriched_blogs = 0
+    enriched_replies = 0
     if enrich_details and rows:
         article_rows = [r for r in rows if r.get("has_article") and not r.get("article_full_text")][:8]
         for r in article_rows:
@@ -542,9 +679,42 @@ def _fetch_x_list_twitterapi(
             except Exception as exc:
                 print(f"  [WARN] 拉取 X Article 详情失败 ({r['url']}): {exc}", file=sys.stderr)
 
+        # 参照 HN 抓取评论区高赞回复：对讨论热度最高、且非冷饭的前 N 条高互动帖并发抓 Relevance 顶层回复
+        # 同时限制单作者最多占 2 个评论抓槽，防止单个高频账号挤出其他高讨论帖
+        reply_candidates: list[dict] = []
+        reply_author_cnt: dict[str, int] = {}
+        for r in rows:
+            if r.get("replies", 0) < _TOP_REPLY_MIN_REPLIES:
+                continue
+            if r.get("is_repeat_ext") or r.get("is_icymi"):
+                continue
+            ah = (r.get("handle") or "").lower()
+            if reply_author_cnt.get(ah, 0) >= 2:
+                continue
+            reply_author_cnt[ah] = reply_author_cnt.get(ah, 0) + 1
+            reply_candidates.append(r)
+            if len(reply_candidates) >= _TOP_REPLY_FETCH_LIMIT:
+                break
+        if reply_candidates:
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                rfuts = [
+                    (r, ex.submit(_fetch_tweet_top_replies, str(r["id"]), r["handle"], api_key))
+                    for r in reply_candidates
+                ]
+                for r, fut in rfuts:
+                    try:
+                        reps = fut.result(timeout=22) or []
+                        if reps:
+                            r["top_replies"] = reps
+                            enriched_replies += 1
+                    except Exception as exc:
+                        print(f"  [WARN] 拉取高赞评论失败 ({r['url']}): {exc}", file=sys.stderr)
+
         ext_tasks: list[tuple[dict, str]] = []
         seen_ext: set[str] = set()
         for r in rows:
+            if r.get("is_repeat_ext"):
+                continue
             for u in r.get("ext_urls") or []:
                 uk = url_key(u)
                 if uk and uk not in seen_ext:
@@ -582,6 +752,7 @@ def _fetch_x_list_twitterapi(
         "dropped_cap": dropped_cap,
         "enriched_articles": enriched_articles,
         "enriched_blogs": enriched_blogs,
+        "enriched_replies": enriched_replies,
         "fetched_at": now,
     }
     return rows, stats
@@ -626,24 +797,39 @@ def _format_context(rows: list[dict], stats: dict) -> str:
         f"【本次可用推文】{len(rows)} 条（活跃 {stats['builders']} 位 builder｜"
         f"共扫描 {stats['scanned']} 条，过滤转推 {stats['dropped_rt']}、回复 {stats['dropped_reply']}、"
         f"超窗 {stats['dropped_old']}、已播/前序去重 {stats['dropped_dup']}、单人上限 {stats['dropped_cap']}｜"
-        f"深抓 X 长文 {stats.get('enriched_articles', 0)} 篇、外链正文 {stats.get('enriched_blogs', 0)} 篇）",
+        f"深抓评论区 {stats.get('enriched_replies', 0)} 帖、X 长文 {stats.get('enriched_articles', 0)} 篇、外链正文 {stats.get('enriched_blogs', 0)} 篇）",
         "",
-        "推文的 赞/转/回 是 X 上的真实互动量，可以照实写。",
+        "排序规则：按综合讨论热度分（赞 + 评×12 + 转×3 + 引×8，参照 HN 高赞高讨论逻辑）由高到低排列；赞/转/回均为 X 真实互动量，可照实写。",
         "",
     ]
 
     for i, x in enumerate(rows, 1):
         when = _iso(x["createdAt"])
         when_s = when.strftime("%m-%d %H:%M UTC") if when else x["createdAt"]
+        flags = []
+        if x["isQuote"]:
+            flags.append("[引用推]")
+        if x.get("has_article"):
+            flags.append("[X长文]")
+        if x.get("is_repeat_ext") or x.get("is_icymi"):
+            flags.append("[⚠️ 疑似 ICYMI 二次转发/外链7天内已播，无新版本或新指标请跳过]")
+        flag_str = ("　" + "　".join(flags)) if flags else ""
         lines.append(f"--- {i}. @{x['handle']}（{x['name']}｜{x['bio']}）")
         lines.append(
             f"[时间] {when_s}"
-            f"　[赞] {x['likes']}　[转] {x['retweets']}　[回] {x['replies']}"
-            + ("　[引用推]" if x["isQuote"] else "")
-            + ("　[X长文]" if x.get("has_article") else "")
+            f"　[热度分] {x.get('heat_score', x['likes'])}"
+            f"　[赞] {x['likes']}　[评] {x['replies']}　[转] {x['retweets']}　[引] {x.get('quotes', 0)}"
+            + flag_str
         )
         lines.append(f"[原推] {x['url']}")
         lines.append(f"[正文] {x['text']}")
+        if x.get("top_replies"):
+            lines.append("[评论区高赞回复与交锋（按 Relevance 精选）]:")
+            for rep in x["top_replies"]:
+                role_tag = " [作者追评]" if rep.get("is_author") else ""
+                lines.append(
+                    f"  * @{rep['handle']}{role_tag}（{rep['likes']} 赞 · {rep['replies']} 评）：{rep['text']}"
+                )
         if x.get("article_full_text"):
             a_title = x.get("article_title") or "X Article"
             lines.append(f"[X Article 全文摘录（《{a_title}》，直接归属上面的 [原推] 链接，正文勿另挂 x.com/i/article 链接）]:")
@@ -664,7 +850,8 @@ def gather() -> tuple[str, dict]:
             "未配置 X_LIST_ID：请在环境变量、.env 或 LaunchAgent plist 中填入 X_LIST_ID"
         )
 
-    ledger = load_daily_ledger(exclude_bot="🛠️ AI Builder")
+    # 显式排除 GitHub & HN（防止手动乱序跑时反向污染第 3 棒）
+    ledger = load_daily_ledger(exclude_bots=("🛠️ AI Builder", "🐙 GitHub & HN"))
     sent_before = load_sent_urls(SENT_URLS) | ledger["urls"]
     rows, stats = _fetch_x_list(
         list_id,
@@ -674,9 +861,15 @@ def gather() -> tuple[str, dict]:
     )
     fetched_at = stats["fetched_at"]
     context = _format_context(rows, stats)
-    ledger_block = format_ledger_context(exclude_bot="🛠️ AI Builder")
+    prefix_blocks = []
+    ledger_block = format_ledger_context(exclude_bots=("🛠️ AI Builder", "🐙 GitHub & HN"))
     if ledger_block:
-        context = f"{ledger_block}\n\n{context}"
+        prefix_blocks.append(ledger_block)
+    recent_self = format_recent_self_headlines("🛠️ AI Builder", days=5)
+    if recent_self:
+        prefix_blocks.append(recent_self)
+    if prefix_blocks:
+        context = "\n\n".join(prefix_blocks) + "\n\n" + context
     metrics = {
         "source_mode": "x_list",
         "list_id": list_id,
@@ -689,6 +882,7 @@ def gather() -> tuple[str, dict]:
         "dropped_cap": stats["dropped_cap"],
         "enriched_articles": stats.get("enriched_articles", 0),
         "enriched_blogs": stats.get("enriched_blogs", 0),
+        "enriched_replies": stats.get("enriched_replies", 0),
         "feed_lag_h": 0.0,
         "feed_generated_at": fetched_at.isoformat(),
     }
@@ -768,7 +962,10 @@ def run_send(draft_path: Path) -> int:
         log_file=LOG_FILE, cache_file=CACHE_FILE, fetch_meta=FETCH_META,
         sent_urls=SENT_URLS, webhook=FEISHU_WEBHOOK,
         write_log=write_log, save_pending=save_pending,
-        link_label="原推")
+        link_label="原推",
+        source_name="🛠️ AI Builder",
+        expected_title_markers=("X 热点 & AI Builder", "AI Builder"),
+        record_all_hrefs=True)
 
 
 # ===== 模式 4：archive-only =====
@@ -827,11 +1024,12 @@ def run_archive_only(draft_path: Path) -> int:
         print(f"=== ARCHIVE_FAIL === {err_msg}", file=sys.stderr)
         return 1
 
-    record_sent_urls(SENT_URLS, x_links)
+    record_sent_urls(SENT_URLS, hrefs)
     record_daily_ledger("🛠️ AI Builder", report, hrefs, date_str=doc_date)
     prefix = f"{meta_summary} | " if meta_summary else ""
     status_line = f"{prefix}Notion 单独归档成功 | Notion ✓ {notion_detail}".strip()
-    write_log("OK", status_line)
+    # 使用 [ARCHIVE] 而非 [OK]，防止凌晨手动补归档误锁次日 09:00 正常 fetch 的 already_ran_today 判定
+    write_log("ARCHIVE", status_line)
     print(f"=== ARCHIVE_OK === {status_line}")
     return 0
 
@@ -842,10 +1040,15 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["fetch", "send", "test-list", "archive-only"], required=True)
     parser.add_argument("--draft", default=str(DRAFT_FILE))
     args = parser.parse_args()
-    if args.mode == "fetch":
-        sys.exit(run_fetch())
-    if args.mode == "test-list":
-        sys.exit(run_test_list())
-    if args.mode == "archive-only":
-        sys.exit(run_archive_only(Path(args.draft)))
-    sys.exit(run_send(Path(args.draft)))
+    try:
+        if args.mode == "fetch":
+            sys.exit(run_fetch())
+        if args.mode == "test-list":
+            sys.exit(run_test_list())
+        if args.mode == "archive-only":
+            sys.exit(run_archive_only(Path(args.draft)))
+        sys.exit(run_send(Path(args.draft)))
+    except Exception:
+        err = redact_secrets(traceback.format_exc().strip().splitlines()[-1])
+        write_log("FAIL", err)
+        raise

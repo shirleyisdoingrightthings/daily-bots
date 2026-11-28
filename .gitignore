@@ -17,6 +17,8 @@ GEMINI.md
 logs/
 **/logs/
 *.log
+changelog.md
+**/changelog.md
 pending_messages.json
 **/pending_messages.json
 

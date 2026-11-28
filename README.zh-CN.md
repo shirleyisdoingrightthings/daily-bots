@@ -6,7 +6,7 @@
 
 🌐 [English](./README.md) | **简体中文**
 
-一个经过生产环境长期验证的 Monorepo，包含 **6 个模块化自动情报机器人**（编排为 **4 条定时流水线**：早间 AI 三合一、美股收盘 → A 股盘前、GitHub & Hacker News、A 股收盘复盘）与一套 **共享运行时及运维层**，每日自动完成抓取、去重、事实核验，并推送至 **飞书（Lark）卡片 2.0** 与 **Notion 知识库**。
+一个经过生产环境长期验证的 Monorepo，包含 **5 个现役模块化自动情报机器人**（编排为 **3 条定时流水线**：早间 AI 三合一、美股收盘 → A 股盘前、A 股收盘复盘；另保留已退役的 `x-hotspot-bot` 归档参考）与一套 **共享运行时及运维层**，每日自动完成抓取、去重、事实核验，并推送至 **飞书（Lark）卡片 2.0** 与 **Notion 知识库**。
 
 > **零大模型厂商锁定（Zero LLM Vendor Lock-In）**：所有 Python 脚本（`*_report.py`）均只负责确定性的 `fetch` 抓取、去重、HTML 清洗、飞书推送与 Notion 归档，不硬编码任何第三方大模型 SDK。AI 写稿完全解耦为 Markdown 规范（`prompt*.md`）与定时调度说明书（`shared/scheduled-tasks/*/SKILL.md`），可自由搭配任意编程/自动化 Agent 与模型运行。
 
@@ -19,19 +19,17 @@ flowchart LR
     subgraph Sched["AI Agent 定时调度（北京时间 Asia/Shanghai）"]
         S1["每日 09:00 (ai-daily)<br/>AI 三合一串行流水线"]
         S2["周一至周六 09:05<br/>美股收盘 -&gt; 09:30 前 A 股开盘前瞻"]
-        S3["每日 09:30<br/>GitHub &amp; Hacker News"]
         S4["周一至周五 16:15<br/>A 股收盘复盘"]
     end
 
-    subgraph Bots["6 个模块化 Bot（fetch -&gt; Agent 写稿 -&gt; send）"]
+    subgraph Bots["5 个现役 Bot（fetch -&gt; Agent 写稿 -&gt; send）"]
         direction TB
-        B1["1. AI 产业日报"] --> B2["2. X &amp; Reddit 社区热议"] --> B3["3. AI Builder 日报"]
-        B4["4. GitHub &amp; HN 早报"]
-        B5["5. 美股与加密日报"] --> B6["6. A 股开盘前瞻与收盘复盘"]
+        B1["1. AI 产业日报"] --> B3["2. X 热点 &amp; AI Builder（纯 X List）"] --> B4["3. GitHub &amp; HN 早报"]
+        B5["4. 美股与加密日报"] --> B6["5. A 股开盘前瞻与收盘复盘"]
     end
 
     subgraph Shared["shared/ 共享运行时与运维层"]
-        U["bot_utils.py<br/>抓取 / 去重 / 飞书 / Exa 核查"]
+        U["bot_utils.py<br/>抓取 / 原子加锁去重 / 飞书 / Exa"]
         L["daily_topic_ledger.json<br/>跨 Bot 当日去重账本"]
         N["notion_archive.py<br/>幂等原位更新 &amp; 自适应表格"]
         H["health_check_base.sh<br/>健康巡检 &amp; 本地草稿兜底重发"]
@@ -44,10 +42,9 @@ flowchart LR
 
     S1 --> B1
     S2 --> B5
-    S3 --> B4
     S4 --> B6
-    B1 & B2 & B3 & B4 & B5 <--> L
-    B1 & B2 & B3 & B4 & B5 & B6 --> U
+    B1 & B3 & B4 & B5 <--> L
+    B1 & B3 & B4 & B5 & B6 --> U
     U --> F
     U --> N --> ND
     H -.-> Bots
@@ -61,20 +58,20 @@ flowchart LR
 
 | 模块 | 定时节奏（北京时间） | 覆盖范围与核心机制 | 工作流文档 |
 | :--- | :--- | :--- | :--- |
-| 🤖 **AI 产业日报** | 每日 `09:00`（`ai-daily` 第 1/3 棒） | TLDR AI + 6 个垂直 AI 媒体 RSS + 正文全文提取，覆盖全球大模型、算力基建、政策与机器人；负责播种当日跨 Bot 去重账本。 | [目录](./AI%20Daily%20News%20Bot/) · [工作流文档](./AI%20Daily%20News%20Bot/README.md) |
-| 🐦 **X & Reddit 社区热议** | 每日 `09:00`（`ai-daily` 第 2/3 棒） | 48 小时窗口，完整提取 Latent Space `[AINews]` 的 Twitter Recap + Reddit Recap（12 个核心 AI subreddit）与 Techmeme 交叉验证；保留正反技术交锋、一线实测吐槽与原帖直链。 | [目录](./x-hotspot-bot/) · [工作流文档](./x-hotspot-bot/README.md) |
-| 🛠️ **AI Builder 日报** | 每日 `09:00`（`ai-daily` 第 3/3 棒） | 通过 `twitterapi.io` 直连抓取公开自建 X List（零浏览器/Cookie 封号风险）+ 自动拉取 X Article 长文与外链博客正文；自动过滤前序已播原推。 | [目录](./ai-builder-bot/) · [工作流文档](./ai-builder-bot/README.md) |
-| 🐙 **GitHub & HN 早报** | 每日 `09:30` | GitHub Trending（周一至周六日榜 / 周日周榜）+ README 自动抓读 + Hacker News Top 8（Firebase + Algolia 热评融合）及 30 天跨天在榜记忆。 | [目录](./github-hn-bot/) · [工作流文档](./github-hn-bot/README.md) |
+| 🤖 **AI 产业日报** | 每日 `09:00`（`ai-daily` 第 1/3 棒） | TLDR（带重试与时长清洗）+ 6 个垂直 AI 媒体 RSS + 正文全文提取；≤26 字中文主标题 + 首句加粗核心事实 + 3 日自重复拦截；负责播种当日跨 Bot 去重账本。 | [目录](./AI%20Daily%20News%20Bot/) · [工作流文档](./AI%20Daily%20News%20Bot/README.md) |
+| 🔥 **X 热点 & AI Builder** | 每日 `09:00`（`ai-daily` 第 2/3 棒） | **纯自建 X List（HN 风格高赞高评）**：通过 `twitterapi.io` 按综合讨论热度分（`赞 + 评×12 + 转×3 + 引×8`）排序，并发抓去广告 Relevance 评论区（单帖作者自评限 1 席）与 X Article/外链正文，拦截 ICYMI 与旧外链冷饭，一站式覆盖 X 焦点争论、一线实操与深度长文。 | [目录](./ai-builder-bot/) · [工作流文档](./ai-builder-bot/README.md) |
+| 🐙 **GitHub & HN 早报** | 每日 `09:00`（`ai-daily` 第 3/3 棒） | GitHub Trending 全页新星优先挖掘（不足自动补抓 Python/TS 分榜，熟面孔收拢折叠）+ Hacker News Top 8（并发 Firebase + Algolia 热评融合，承接前 2 棒账本自动递补）。 | [目录](./github-hn-bot/) · [工作流文档](./github-hn-bot/README.md) |
 | 🗽 **美股与加密日报** | 周一至周六 `09:05`（第 1/2 棒） | 买方量化美股收盘（日内振幅/CLV/RVOL、2Y/10Y/2s10s、VIX/VIX3M/VRP、均衡 30 股宽度、久期中性 HYG-IEI、220 日 MA50/MA200/HV20/Z-score）+ 24h 加密（含永续资金费率与 OI）+ 收盘日宏观实际值、NYSE 休市提醒与未来 5 日日程 + 自定义分层自选股 + Exa 核查 + Notion 折叠交互图。 | [目录](./us%20stock%20bot/) · [工作流文档](./us%20stock%20bot/README.md) |
 | 🇨🇳 **A 股智能决策日报** | 周一至周五 `09:05–09:24`（第 2/2 棒）& `16:15` | 买方量化纯 A 股开盘前瞻与收盘复盘：10 大宽基与大小盘/成长红利风格差、交易所级零重叠真实涨跌与涨停/连板/封板率、东财精确 25 日两市成交额环比与 20 日均额比、255 日 `MA20/50/200 · HV20(1σ/0.5σ) · Z_vol · 实体半柱防守 · CLV · RVOL · RSI · 布林%B`、24h 实时 `富时A50 / USDCNH / 金油 / BTC / IF·IC·IM基差`、沪深 300 四龙头 ETF 合计与宽基 ETF 场内折溢价套利告警、16 大高纯度机构主线 + 去重东财盘外行业、双场次硬隔离与美股休市防二次计价。 | [目录](./a-share-bot/) · [工作流文档](./a-share-bot/README.md) |
-| ⚙️ **共享运行时与运维层** | 底层常驻 | `bot_utils.py`、`notion_archive.py`、`notion_reconcile.py`、`*_base.sh` 统一入口、`scheduled-tasks/` `SKILL.md` 调度规范及 65+ 离线单元测试。 | [目录](./shared/) · [架构说明](./shared/README.md) |
+| ⚙️ **共享运行时与运维层** | 底层常驻 | `bot_utils.py`、`notion_archive.py`、`notion_reconcile.py`、`*_base.sh` 统一入口、`scheduled-tasks/` `SKILL.md` 调度规范及 80+ 离线单元测试。 | [目录](./shared/) · [架构说明](./shared/README.md) |
+| 🗄️ **X 热点播报（已退役）** | `2026-11-28` 退役归档 | 原 Latent Space `[AINews]` + Reddit 解析器仅保留参考，日常已由纯 X List 的 `ai-builder-bot/` 统一替代。 | [目录](./x-hotspot-bot/) · [工作流文档](./x-hotspot-bot/README.md) |
 
 ---
 
 ## 核心工程亮点
 
-- **严格的 `fetch / draft / send` 三段解耦**：运行 `claude_report.sh fetch` 生成确定性的上下文快照并落盘到 `logs/last_context.txt`；AI Agent 按 `prompt*.md` 写稿至 `logs/report_draft.txt`；`claude_report.sh send` 执行硬闸门校验、飞书投递、Notion 归档与去重状态落盘。
-- **跨 Bot 当日去重账本（`daily_topic_ledger.json`）**：早间 09:00 AI 流水线严格串行（`AI 产业日报 → X & Reddit 社区热议 → AI Builder`），随后 09:30 运行 `GitHub & HN`。前序 Bot 推送成功后写入已播 URL、话题标题与 `x.com` / `reddit.com` 原帖链接，下游自动避重。
+- **严格的 `fetch / draft / send` 三段解耦 + 发稿前新鲜度硬闸门**：运行 `claude_report.sh fetch` 生成确定性上下文落盘 `logs/last_context.txt`；AI Agent 按 `prompt*.md` 写稿至 `logs/report_draft.txt`；`claude_report.sh send` 强制校验草稿 mtime/日期/栏目身份与密钥脱敏，执行飞书投递、Notion 归档与原子加锁去重落盘。
+- **零竞态跨 Bot 当日去重账本（`daily_topic_ledger.json`）**：早间 09:00 三合一严格串行（`1. AI 产业日报 → 2. X 热点 & AI Builder → 3. GitHub & HN`），通过 `fcntl.flock` + `os.replace` 原子写与统一 URL 归一化（`x.com`/`twitter.com`、HN `?id=`、Reddit ID）彻底根治休眠唤醒竞态。
 - **防幻觉 Exa 定向补盲（可选，仅限股票类 Bot）**：针对免费 RSS 与快讯未覆盖的领涨领跌异动股，`shared/bot_utils.py` 单次批量核查最多 6 只标的，强制返回三态 Schema（`confirmed` / `absent` / `cannot_verify`），仅放行 `confirmed` 真实催化。
 - **高可靠飞书卡片 2.0 投递**：HTML 白名单清洗（仅保留 `<b>` 与 `<a href>`），严格遵守飞书约 20KB 单卡上限自动均衡分页并附 `(n/N)` 页码，配合 `pending_messages.json` 断点续发避免重复推送。
 - **幂等 Notion 归档与表格自适应宽度**：按 `(Date, Source, Type)` 原位 Upsert（保留页面 URL 与评论），自动将高频金融指标转为 2 列 Notion 表格并触发 `fit-page-width` 列宽适配，遇到 LibreSSL EOF 错误时平滑回退 `curl`，并附带 `shared/notion_reconcile.py` 支持离线漏归档补录。

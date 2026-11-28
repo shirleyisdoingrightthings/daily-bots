@@ -180,37 +180,98 @@ def _condense(section: str, budget: int) -> str:
     return _slice_safe(text, 0, budget)
 
 
+_ENGAGEMENT_LINE_RE = re.compile(
+    r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]+)/status/(\d+)[^\n]{0,120}?[—–-]\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\b"
+)
+
+
+def _parse_engagement_num(num_str: str, unit: str) -> float:
+    try:
+        val = float(num_str)
+    except ValueError:
+        return 0.0
+    u = (unit or "").lower()
+    if u == "k":
+        return val * 1_000.0
+    if u == "m":
+        return val * 1_000_000.0
+    return val
+
+
+def _extract_top_tweet_engagement(section: str) -> dict:
+    """提取 AINews 'Top tweets (by engagement)' 区块里的真实互动量（如 26.3k / 8.4k）。"""
+    plain = _plain(section, preserve_links=True)
+    idx = plain.lower().find("top tweets")
+    if idx < 0:
+        return {}
+    tail = plain[idx:idx + 6000]
+    eng_map = {}
+    for m in _ENGAGEMENT_LINE_RE.finditer(tail):
+        pid = m.group(2)
+        raw_val = f"{m.group(3)}{m.group(4).lower()}"
+        num_val = _parse_engagement_num(m.group(3), m.group(4))
+        if num_val > 0 and (pid not in eng_map or num_val > eng_map[pid][1]):
+            eng_map[pid] = (raw_val, num_val)
+    return eng_map
+
+
 def _rank_posts(section: str, max_posts: int, ctx_chars: int) -> list:
-    """把段落里的原帖按「被引用次数」排序，并带上首次出现处的上下文。
+    """提取段落里的 X 原帖，结合 AINews 自带的真实互动量（Top tweets）与去重后的被引用次数排序。
 
-    **被引用次数就是我们的讨论度代理指标**：一条帖子在同一天的复盘里被反复
-    引用（既出现在 What happened，又出现在 Critical），说明它在这件事的讨论中
-    更居中。这不是真实的点赞/转发数，**写稿时必须如实说明口径，不能写成"最高赞"。**
+    计数在 <a> 标签粒度进行，并合并 Substack 把含下划线 handle 拆成相邻双 <a> 的伪重（如 [@][arohan]），
+    避免同一引用被原样 HTML 正则双计数。
     """
+    eng_map = _extract_top_tweet_engagement(section)
     order, meta = [], {}
-    for m in X_POST_RE.finditer(section):
-        handle, pid = m.group(1), m.group(2)
-        if pid not in meta:
-            meta[pid] = {"handle": handle, "url": f"https://x.com/{handle}/status/{pid}",
-                         "mentions": 0, "idx": len(order)}
-            order.append(pid)
-        meta[pid]["mentions"] += 1
+    prev_pid = None
+    prev_end = -100
 
-    # 用占位符替掉链接再转纯文本，这样才能定位每条帖子周围说了什么。
-    # ⚠️ 必须替换整个 <a> 元素、而不是元素内的 URL 字符串：原帖链接绝大多数
-    # 出现在 href 属性里、锚文本是别的字（"1"、"this post"），只替 URL 的话
-    # 占位符会连同 <a ...> 标签一起被 TAG_RE 吃掉，context 全空。
-    def _mark_anchor(m):
-        href, inner = m.group(1), m.group(2)
+    # 先按 <a> 维度计数，避免 href 与锚文本同时含 URL 或相邻拆链造成双计数
+    def _count_anchor(m):
+        nonlocal prev_pid, prev_end
+        href = html.unescape(m.group(1) or "")
         hit = X_POST_RE.search(href)
         if not hit:
-            return inner
-        return f"{inner} ⟦P{meta[hit.group(2)]['idx']}⟧ "
+            return m.group(2)
+        handle, pid = hit.group(1), hit.group(2)
+        if pid not in meta:
+            eng_str, eng_num = eng_map.get(pid, ("", 0.0))
+            meta[pid] = {
+                "handle": handle,
+                "url": f"https://x.com/{handle}/status/{pid}",
+                "mentions": 0,
+                "engagement": eng_str,
+                "engagement_num": eng_num,
+                "idx": len(order),
+            }
+            order.append(pid)
+        # 相邻两个 <a>（间隔 <= 2 字符）指向同一个 status id（典型为 Substack 拆下划线 handle）只计 1 次
+        if not (pid == prev_pid and m.start() - prev_end <= 2):
+            meta[pid]["mentions"] += 1
+        prev_pid = pid
+        prev_end = m.end()
+        return f"{m.group(2)} ⟦P{meta[pid]['idx']}⟧ "
 
-    marked = ANCHOR_RE.sub(_mark_anchor, section)
-    # 兜底：没包在 <a> 里的裸链接
-    marked = X_POST_RE.sub(
-        lambda m: f" ⟦P{meta[m.group(2)]['idx']}⟧ ", marked)
+    marked = ANCHOR_RE.sub(_count_anchor, section)
+
+    # 兜底：不在 <a> 里的裸链接
+    def _count_bare(m):
+        handle, pid = m.group(1), m.group(2)
+        if pid not in meta:
+            eng_str, eng_num = eng_map.get(pid, ("", 0.0))
+            meta[pid] = {
+                "handle": handle,
+                "url": f"https://x.com/{handle}/status/{pid}",
+                "mentions": 0,
+                "engagement": eng_str,
+                "engagement_num": eng_num,
+                "idx": len(order),
+            }
+            order.append(pid)
+        meta[pid]["mentions"] += 1
+        return f" ⟦P{meta[pid]['idx']}⟧ "
+
+    marked = X_POST_RE.sub(_count_bare, marked)
     text = _plain(marked)
 
     for pid in order:
@@ -224,8 +285,11 @@ def _rank_posts(section: str, max_posts: int, ctx_chars: int) -> list:
         snippet = (text[left:pos] + text[pos + len(token):pos + len(token) + 60])
         info["context"] = re.sub(r"⟦P\d+⟧", "", snippet).strip()
 
-    ranked = sorted(meta.values(), key=lambda d: (-d["mentions"], d["idx"]))
-    return [{k: v for k, v in d.items() if k != "idx"} for d in ranked[:max_posts]]
+    ranked = sorted(
+        meta.values(),
+        key=lambda d: (-d["engagement_num"], -d["mentions"], d["idx"]),
+    )
+    return [{k: v for k, v in d.items() if k not in ("idx", "engagement_num")} for d in ranked[:max_posts]]
 
 
 def _reddit_section(body: str) -> str:
@@ -266,7 +330,29 @@ def _rank_reddit_posts(section: str, max_posts: int = 20, ctx_chars: int = 260) 
     if not section:
         return []
     order, meta = [], {}
-    for m in REDDIT_POST_RE.finditer(section):
+
+    def _count_anchor(m):
+        href = html.unescape(m.group(1) or "")
+        hit = REDDIT_POST_RE.search(href)
+        if not hit:
+            return m.group(2)
+        sub, pid = hit.group(1), hit.group(2).lower()
+        full_url = _clean_url(hit.group(0))
+        if pid not in meta:
+            meta[pid] = {
+                "subreddit": sub,
+                "url": full_url,
+                "mentions": 0,
+                "activity": 0,
+                "idx": len(order),
+            }
+            order.append(pid)
+        meta[pid]["mentions"] += 1
+        return f"{m.group(2)} ⟦R{meta[pid]['idx']}⟧ "
+
+    marked = ANCHOR_RE.sub(_count_anchor, section)
+
+    def _count_bare(m):
         sub, pid = m.group(1), m.group(2).lower()
         full_url = _clean_url(m.group(0))
         if pid not in meta:
@@ -279,20 +365,11 @@ def _rank_reddit_posts(section: str, max_posts: int = 20, ctx_chars: int = 260) 
             }
             order.append(pid)
         meta[pid]["mentions"] += 1
+        return f" ⟦R{meta[pid]['idx']}⟧ "
 
+    marked = REDDIT_POST_RE.sub(_count_bare, marked)
     if not order:
         return []
-
-    def _mark_anchor(m):
-        href, inner = m.group(1), m.group(2)
-        hit = REDDIT_POST_RE.search(href)
-        if not hit:
-            return inner
-        return f"{inner} ⟦R{meta[hit.group(2).lower()]['idx']}⟧ "
-
-    marked = ANCHOR_RE.sub(_mark_anchor, section)
-    marked = REDDIT_POST_RE.sub(
-        lambda m: f" ⟦R{meta[m.group(2).lower()]['idx']}⟧ ", marked)
     text = _plain(marked)
 
     for pid in order:

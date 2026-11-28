@@ -818,13 +818,13 @@ def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
             return add_cjk_spacing("\n".join(bullet_lines))
 
     # 3. X 热点播报 & AI Builder：首段导语 + 编号主题列表（圆圈序号 ①② 格式）
-    if "X 热点" in source or "AI Builder" in source or re.search(r"^(?:#+\s*)?(?:<b>)?(?:🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠\uFE0F?\s*AI\s*Builder)", text.strip()):
+    if "X 热点" in source or "AI Builder" in source or re.search(r"^(?:#+\s*)?(?:<b>)?(?:🔥\s*X(?:\s*&\s*Reddit|\s*热点\s*&\s*AI\s*Builder)?\s*(?:热点|社区热议)?|🛠\uFE0F?\s*AI\s*Builder)", text.strip()):
         plain_lines = [re.sub(r"^#{1,3}\s*", "", _strip_tags_plain(l)).strip() for l in text.splitlines()]
         plain_lines = [l for l in plain_lines if l]
         overview = ""
         topics: list[str] = []
         for line in plain_lines:
-            if re.match(r"^(?:🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠\uFE0F?\s*AI\s*Builder)", line):
+            if re.match(r"^(?:🔥\s*X(?:\s*&\s*Reddit|\s*热点\s*&\s*AI\s*Builder)?|🛠\uFE0F?\s*AI\s*Builder)", line):
                 continue
             if re.match(r"^\d+\.\s+", line) and len(line) <= 100:
                 topics.append(line)
@@ -834,7 +834,7 @@ def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
                 overview = line
         if overview:
             overview = re.sub(
-                r"^这批(?:推文|动态)(?:集中)?(?:发布于|来自|涵盖)\s+[^\n，。]*?(?:\s*[（(][^）)]*[）)])?\s*(?:[，,]|(?<!\d)[：:](?!\d))\s*",
+                r"^这批(?:推文|动态|讨论)(?:集中)?(?:发布于|来自|涵盖)\s+[^\n，。]*?(?:\s*[（(][^）)]*[）)])?\s*(?:[，,]|(?<!\d)[：:](?!\d))\s*",
                 "",
                 overview,
             ).strip()
@@ -845,7 +845,11 @@ def extract_summary(text: str, source: str = "", report_type: str = "") -> str:
             out_lines.append(f"{_circled(len(out_lines))} 本期焦点：" + " ｜ ".join(topics))
         if out_lines:
             res = "\n".join(out_lines)
-            return add_cjk_spacing(res[:1500])
+            if len(res) > 1500:
+                cut = res[:1500]
+                sep_idx = max(cut.rfind(" ｜ "), cut.rfind("。"), cut.rfind("\n"))
+                res = cut[:sep_idx].rstrip(" ｜") if sep_idx >= 300 else cut
+            return add_cjk_spacing(res)
 
     # 4. 兜底：取完整句子，不超过 600 字符，严禁半句截断
     clean = _strip_tags_plain(text).replace("\n", " ")
@@ -940,10 +944,10 @@ def build_clean_title(source: str, date_str: str, report_type: str = "日报") -
         return f"{date_str} A股&港股 {suffix}"
     if "AI 产业日报" in source:
         return f"{date_str} AI 产业日报"
-    if "X 热点" in source:
-        return f"{date_str} X 热点播报"
+    if "X 热点" in source or "X & Reddit" in source:
+        return f"{date_str} X & Reddit 社区热议"
     if "AI Builder" in source:
-        return f"{date_str} AI Builder 日报"
+        return f"{date_str} X 热点 & AI Builder"
     return f"{date_str} {source} {report_type}".strip()
 
 
@@ -975,7 +979,7 @@ def _is_news_headline_line(line: str) -> bool:
         return False
     s_no_hash = re.sub(r"^#{1,3}\s*", "", s).strip()
     plain = re.sub(r"^#{1,3}\s*", "", _strip_tags_plain(s)).strip()
-    if not plain or len(plain) > 120:
+    if not plain or len(plain) > 160:
         return False
     if plain.startswith(("⭐", "📄", "⚡", "📋", "📊", "🌅", "🇨🇳", "🇭🇰", "🐙", "🔥", "❄️", "🔭", "🎯", "📎", "🚀", "📰", "🧭", "📐", "📈", "💰", "🌡", "🪙", "🇺🇸", "🌍", "·", "•", "-", "30秒速览")):
         return False
@@ -990,7 +994,8 @@ def _is_news_headline_line(line: str) -> bool:
 
 def _is_x_builder_topic_heading(line: str, plain_no_b: str) -> bool:
     """判断在 X 热点播报 / AI Builder 中该行是否为分节标题（转为 heading_2）"""
-    plain_clean = re.sub(r"^#{1,3}\s*", "", plain_no_b).strip()
+    # 必须剥离 <a href="..."> 等 HTML 标签后再校验长度，避免长 x.com URL 撑爆 100 字阈值导致首条被误吞
+    plain_clean = re.sub(r"^#{1,3}\s*", "", _strip_tags_plain(line)).strip()
     if not re.match(r"^\d+\.\s+\S", plain_clean) or len(plain_clean) > 100:
         return False
     if line.startswith(("# ", "## ", "### ")):
@@ -1443,7 +1448,7 @@ def convert_to_blocks(
 
         # X 热点播报 & AI Builder：删掉 Notion 正文顶部大标题与开篇导语（页面顶部 30秒速览 属性已完整呈现）
         if is_x_or_builder:
-            if re.match(r"^(?:🔥\s*X(?:\s*&\s*Reddit)?\s*(?:热点|社区热议)|🛠\uFE0F?\s*AI\s*Builder)", plain_clean):
+            if re.match(r"^(?:🔥\s*X(?:\s*&\s*Reddit|\s*热点\s*&\s*AI\s*Builder)?|🛠\uFE0F?\s*AI\s*Builder)", plain_clean):
                 i += 1
                 continue
             is_topic_h2 = _is_x_builder_topic_heading(line, plain_no_b)
@@ -1560,8 +1565,8 @@ def convert_to_blocks(
             i += 1
             continue
 
-        # GitHub & HN：每周周榜 `🔥 持续霸榜` 收拢为可折叠 Toggle 区块
-        if is_gh and plain_clean.startswith("🔥 持续霸榜"):
+        # GitHub & HN：日榜/周榜 `🔥 持续霸榜` / `🔁 持续霸榜` 收拢为可折叠 Toggle 区块
+        if is_gh and (plain_clean.startswith("🔥 持续霸榜") or plain_clean.startswith("🔁 持续霸榜")):
             seen_gh_content = True
             toggle_children: list[dict] = []
             repo_count = 0
@@ -1580,18 +1585,25 @@ def convert_to_blocks(
                 nxt_no_hash = re.sub(r"^#{1,3}\s*", "", nxt).strip()
                 if re.match(r"^(?:<b>|\*\*)?\d+\.(?:</b>|\*\*)?\s*(?:<a\b|\[|<b\b|\*\*)", nxt_no_hash, re.I):
                     repo_count += 1
-                    toggle_children.append(_h_block(3, nxt_no_hash))
+                    # 短仓库名行升为 H3；带长简介（含 —— 或 > 60 字）降级为 bullet 避免超长 H3 污染层级
+                    if len(nxt_clean) > 60 or "——" in nxt_clean:
+                        toggle_children.append(_bullet_block(nxt_no_hash))
+                    else:
+                        toggle_children.append(_h_block(3, nxt_no_hash))
                 else:
                     b_m = re.match(r"^(?:-\s+|[·•●▪]\s*)", nxt)
                     if b_m:
                         item_txt = nxt[b_m.end():].strip()
                         item_plain = _strip_tags_plain(item_txt)
+                        if re.search(r"<a\b[^>]+href=", item_txt, re.I) or "github.com/" in item_txt or "（见 " in item_plain:
+                            repo_count += 1
                         toggle_children.append(_bullet_block(item_txt, color=("gray" if _is_metadata_line(item_plain) else None)))
                     else:
                         toggle_children.append(_p_block(nxt, color=("gray" if _is_metadata_line(nxt_clean) else None)))
                 j += 1
 
-            toggle_title = f"🔥 持续霸榜（本周反复上榜 · 共 {repo_count} 项，点击展开）" if repo_count else plain_clean
+            label_prefix = "🔁 持续霸榜熟面孔" if plain_clean.startswith("🔁") else "🔥 持续霸榜"
+            toggle_title = f"{label_prefix}（共 {repo_count} 项，点击展开）" if repo_count else plain_clean
             blocks.append(_toggle_block(toggle_title, toggle_children[:60]))
             for extra in toggle_children[60:]:
                 blocks.append(extra)
@@ -1700,8 +1712,8 @@ def convert_to_blocks(
             i += 1
             continue
 
-        # HTML 风格板块标题（🚀/🔥/❄️/⚡/🔭/🎯/📰/📎/🗣️/一、/二、/三、 → heading_2）
-        _H2_PREFIXES = ("🚀", "🔥", "❄️", "⚡", "🔭", "🎯", "📰", "📎", "🗣️", "一、", "二、", "三、", "四、")
+        # HTML 风格板块标题（🚀/🔥/❄️/⚡/🔭/🎯/📰/📎/🗣️/🔧/一、/二、/三、 → heading_2）
+        _H2_PREFIXES = ("🚀", "🔥", "❄️", "⚡", "🔭", "🎯", "📰", "📎", "🗣️", "🔧", "一、", "二、", "三、", "四、")
         if line.startswith("<b>") and line.endswith("</b>") and line.count("<b>") == 1 and any(plain_no_b.startswith(p) for p in _H2_PREFIXES):
             if is_cn_hk or (is_us and not in_us_news):
                 if plain_no_b.startswith(("🔥", "❄️")) or (is_cn_hk and plain_no_b.startswith("⚡") and "看点" in plain_no_b):

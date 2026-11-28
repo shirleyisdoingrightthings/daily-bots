@@ -2,7 +2,7 @@
 
 > [← Back to Daily Bots Root README](../README.md)
 
-**Runs daily at `09:30 CST`.** Pairs **GitHub Trending** (Mon–Sat Daily Top 10; Sunday Weekly Top 12 with a "Sustained Trend" spotlight) with **Hacker News Top 8** (blending Firebase `top`/`best` and Algolia 36h/frontpage scores), enriched with repository READMEs, linked article bodies, and top community debate comments—written in plain, builder-oriented language.
+**Stage 3 of 3 in the daily `09:00 CST` `ai-daily` sequential pipeline.** Pairs **GitHub Trending** (full-page fresh-first discovery + Python/TypeScript fallback + compact recurring toggle; Sunday Weekly mode with "Sustained Trend" spotlight) with **Hacker News Top 8** (parallel Firebase `top`/`best` + Algolia 36h/frontpage scores + reply-weighted top comments), reading Stages 1–2 `daily_topic_ledger.json` with zero wake-up race and recording only actually published URLs in `seen_history.json`.
 
 ---
 
@@ -59,4 +59,4 @@ bash github-hn-bot/health_check.sh
 - `sources.py` — GitHub Trending scraper, README fetcher, HN Firebase + Algolia aggregator, comment extractor
 - `github_hn_report.py` — History tagging, ledger cross-check, Feishu push, and Notion archiving (`日报` / `周盘点`)
 - `prompt.md` / `prompt_weekly.md` — Plain-language editorial templates (GitHub: *"What it does"* + *"Personal Build angle"*; HN: *"What it's about"* + *"What comments are debating"*)
-- **Env Vars**: `FEISHU_WEBHOOK` (required), `FEISHU_SECRET` (optional), `NOTION_ARCHIVE_API_KEY` & `NOTION_ARCHIVE_DATABASE_ID` (optional), `HTTPS_PROXY` (optional).
+- **Env Vars**: `FEISHU_WEBHOOK` (required), `NOTION_ARCHIVE_API_KEY` & `NOTION_ARCHIVE_DATABASE_ID` (optional), `HTTPS_PROXY` (optional).
